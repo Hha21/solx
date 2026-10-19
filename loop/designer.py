@@ -211,15 +211,39 @@ class ModalB200:
             self.n += 1
             rid = f"{kind}-{self.n:03d}"
         t0 = time.time()
+        req = dict(id=rid, kind=kind, solution=sol, problem=self.problem, **extra)
         try:
-            res = self.fn.remote(dict(id=rid, kind=kind, solution=sol, problem=self.problem, **extra))
+            res = self.fn.remote(req)
         except Exception as e:
             res = dict(id=rid, kind=kind, error=f"Modal call failed: {type(e).__name__}: {e}")
+            # a network drop stops the ephemeral app ("function ... is stopped"); start a fresh one and retry once
+            if any(m in str(e) for m in ("is stopped", "not running", "hydrated")) and self._restart():
+                try:
+                    res = self.fn.remote(req)
+                except Exception as e2:
+                    res = dict(id=rid, kind=kind, error=f"Modal call failed after restart: {type(e2).__name__}: {e2}")
         with self.lock:      # container time for this call (+5 s overhead); queueing behind other sessions is free
             self.used_s += float(res.get("seconds") or (time.time() - t0)) + 5
         if res.get("gpu") and "B200" not in res["gpu"]:
             res = dict(id=rid, kind=kind, error=f"wrong GPU {res['gpu']!r}; result discarded")
         return res
+
+    def _restart(self):
+        import b200_modal
+        with self.lock:
+            try:
+                self._ctx.__exit__(None, None, None)
+            except Exception:
+                pass
+            try:
+                self._ctx = b200_modal.app.run()
+                self._ctx.__enter__()
+                self.fn = b200_modal.handle
+            except Exception as e:
+                print(f"tool server: Modal app restart failed: {type(e).__name__}: {e}", flush=True)
+                return False
+        print("tool server: the Modal app was stopped; started a new one", flush=True)
+        return True
 
     def wait_alive(self, timeout_s):
         """Time the reference kernel (this also starts and warms the container); returns the GPU name."""
