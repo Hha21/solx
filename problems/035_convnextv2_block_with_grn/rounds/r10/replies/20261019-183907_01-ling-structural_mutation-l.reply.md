@@ -1,22 +1,27 @@
-The B200 backend stayed down for the rest of the session: probe and compile both returned "function is stopped" four more times. I stopped calling it.
+The resumed session gave a clear answer: g_g2 works but doesn't win. Merge should keep the r9 path at 8,320; 4,96 is a tie.
 
 ### Rationale
-**Nothing in g_g2 has been compiled or run.** The one result this session is the numerical check, and it changes the design. Scaling the h tile in place by s_b (P1) rounds the hidden twice and fails at 8,320: 1 element past atol, max 101 % of atol. The fp16(fp16(W2)·s) variant reaches 97 %. Only the current roundings, fp16(W2·s_b) times h16 (74-80 %), or a hi/lo B split are safe. A hi/lo split doubles the MMA count.
+**Results:** the shipped v3 build passes 16/16 workloads (portal-order re-runs included). Against r9-merge in the same container it is slower at 8,320 (62.1 µs against 58.5) and level at 4,96 (37.4 against 37.2).
 
-So g_g2 builds A = fp16(W2·s_b) per image itself, with the same arithmetic as K3, in a short phase before one flat grid barrier. It is still one cooperative launch, so the row runs 3 launches instead of 4. Before the barrier it also prefetches the h B-stages by TMA. After it, a 4-stage TMA ring (A 16 KB + B 32 KB per stage) feeds 1SM tcgen05 at N=256. The epilogue writes out = x + acc + b2' (b2' in fp32) in coalesced 128-B NCHW rows through smem. A desk check found and fixed one PTX error in the barrier atomic. Before shipping, it needs compile_b200, a torch check, timing and run_tests.
+**Why it loses:** the refutation clause fires, because g_g2 alone takes 23.1 µs at 8,320 against the 14 µs limit.
+- Fixed steps cost about 8 µs before the first MMA: phase P is 2.6-5 µs, the barrier about 2, the first A landing 1.5.
+- The 1SM N=256 mainloop runs at 681-755 clk per stage, which is ingest-bound at 1.33-1.47× the ideal, on 96 of 148 SMs.
+- The epilogue takes 3.3 µs.
+
+**Precision:** the twice-rounded B scale was rejected by simulation before any code was written (101 % of atol at 8,320). The shipped path keeps K3's once-rounded roundings, and b2' is now exact fp32.
 
 ```json solution-spec
-{"name": "r10-g-e2-g2-coop", "definition": "035_convnextv2_block_with_grn", "author": "solx-loop", "description": "Lineage G r10 E2 (H42): K3 + cuBLASLt GEMM2 replaced at 8,320 / 4,96 by one cooperative tcgen05 launch g_g2 (per-image A = fp16(W2*s_b) phase, flat grid barrier, TMA-fed swap-AB GEMM, coalesced NCHW epilogue). UNTESTED: backend down for the whole session.", "spec": {"languages": ["cuda_cpp"], "target_hardware": ["B200"], "entry_point": "binding.cpp::run", "dependencies": ["torch"], "destination_passing_style": true, "compile_options": {"cuda_cflags": ["-O3", "--use_fast_math", "-std=c++17"], "ld_flags": ["-lcuda", "-lcublasLt"]}}}
+{"name": "r10-g-e2-g2-coop-v3", "definition": "035_convnextv2_block_with_grn", "author": "solx-loop", "description": "Lineage G r10 E2 (H42): K3 + cuBLASLt GEMM2 replaced at 8,320 / 4,96 by one cooperative tcgen05 launch g_g2 (one-round phase P building fp16(W2*s_b), flat grid barrier, TMA-fed 1SM swap-AB GEMM, coalesced NCHW epilogue); b2' from K0. 16/16 pass; 8,320 +6 %, 4,96 tie vs r9-merge.", "spec": {"languages": ["cuda_cpp"], "target_hardware": ["B200"], "entry_point": "binding.cpp::run", "dependencies": ["torch"], "destination_passing_style": true, "compile_options": {"cuda_cflags": ["-O3", "--use_fast_math", "-std=c++17"], "ld_flags": ["-lcuda", "-lcublasLt"]}}}
 ```
 
 ```cuda file=kernel.cu
 // Lineage G r10 (H42): fused pass 1 for the HW >= 1024 rows plus a custom tcgen05 GEMM2 (g_g2) at 8,320 / 4,96.
 //  64,96,112,112 and 32,128,64,64: r7 warp-specialised g_pass1 with mma.sync, K3 g_grn + cuBLASLt GEMM2 (unchanged).
-//  4,96,56,56 and 8,320,32,32: K0 + g_tc (r9, unchanged) + g_g2, one cooperative launch: phase P builds the per-image
-//  A operand fp16(W2*s_b) (s_b from the pass-1 red.add sums, the same roundings as K3) and b2' = W2.gb + b2 in fp32,
-//  one flat grid barrier, then a 1SM tcgen05 kind::f16 swap-AB GEMM per (c-tile, image, token chunk): A = W2_b 128 x 64
-//  K-major SW128 TMA boxes, B = the pass-1 h [k][token] fp16 tile by 64x64 MN-major SW128 TMA boxes, D in TMEM
-//  (lanes = channels, columns = tokens); epilogue out = x + acc + b2' staged through smem for coalesced NCHW rows.
+//  4,96,56,56 and 8,320,32,32: K0 (+ b2' = W2.gb + b2) + g_tc (r9, unchanged) + g_g2, one cooperative launch: phase P
+//  builds the per-image A operand fp16(W2*s_b) (s_b from the pass-1 red.add sums, K3's roundings), one flat grid
+//  barrier, then a 1SM tcgen05 kind::f16 swap-AB GEMM per (c-tile, image, token chunk): A = W2_b 128 x 64 K-major SW128
+//  TMA boxes, B = the pass-1 h [k][token] fp16 tile by 64x64 MN-major SW128 TMA boxes, D in TMEM (lanes = channels,
+//  columns = tokens); epilogue out = x + acc + b2' staged through smem for coalesced NCHW rows.
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -25,13 +30,6 @@ So g_g2 builds A = fp16(W2·s_b) per image itself, with the same arithmetic as K
 #include <map>
 #include <tuple>
 
-#ifndef TC_STAMPS
-#define TC_STAMPS 0
-#endif
-#ifndef G2_STAMPS
-#define G2_STAMPS 0
-#endif
-
 struct GParams {
   const float* x; const float* dww; const float* dwb; const float* lnw; const float* lnb;
   const float* w1; const float* b1; const float* gw; const float* gb; const float* w2; const float* b2;
@@ -39,8 +37,8 @@ struct GParams {
   void* w1f; float* uv; void* h; float* gsum; void* w2b; float* dwp;
   int B, C, H, W, HW, C4, K2, TPI, ntiles;
   float eps, ln_eps;
-  unsigned long long* stamp;  // only written in stamp probe builds
-  float* b2p;                 // g_g2: b2' = W2.gb + b2 (fp32, written in phase P)
+  unsigned long long* stamp;  // unused in the shipped build
+  float* b2p;                 // g_g2: b2' = W2.gb + b2 (fp32, written by K0)
 };
 
 __device__ __forceinline__ float g_wsum(float v) {
@@ -104,8 +102,7 @@ __device__ __forceinline__ uint64_t sdesc(uint32_t addr, uint32_t lbo, uint32_t 
   return (uint64_t)((addr >> 4) & 0x3FFF) | ((uint64_t)((lbo >> 4) & 0x3FFF) << 16) |
          ((uint64_t)((sbo >> 4) & 0x3FFF) << 32) | (1ull << 46) | (2ull << 61);
 }
-// byte offset of (channel c, token t) in the MN-major SW128 B tile: 64-token chunks LBO apart, 128 B per channel,
-// 16-B unit (t&63)>>3 XORed with c&7 (validated against torch in the r9 engine gate)
+// byte offset of (channel c, token t) in the MN-major SW128 B tile: 64-token chunks LBO apart, 128 B per channel
 __device__ __forceinline__ uint32_t swzB(int c, int t, int LBO) {
   return (uint32_t)((t >> 6) * LBO + c * 128 + ((((t & 63) >> 3) ^ (c & 7)) << 4) + (t & 7) * 2);
 }
@@ -118,14 +115,9 @@ __device__ __forceinline__ uint32_t swzB(int c, int t, int LBO) {
                  "=r"(v[22]), "=r"(v[23]), "=r"(v[24]), "=r"(v[25]), "=r"(v[26]), "=r"(v[27]), "=r"(v[28]),            \
                  "=r"(v[29]), "=r"(v[30]), "=r"(v[31])                                                                \
                : "r"(ta) : "memory")
-#if TC_STAMPS || G2_STAMPS
-__device__ __forceinline__ unsigned long long g_gtime() {
-  unsigned long long t; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t)::"memory"); return t;
-}
-#endif
 
-// K0 (swz = 1: W1' as pre-swizzled K-major SW128 images [hidden block][k-block] of 128 x 64 fp16 for g_tc)
-__global__ void __launch_bounds__(256) g_prep(GParams p, int nfb, int nub, int ndb, int swz) {
+// K0 (swz = 1: W1' as pre-swizzled K-major SW128 images for g_tc; nbb > 0: b2' = W2.gb + b2 for g_g2)
+__global__ void __launch_bounds__(256) g_prep(GParams p, int nfb, int nub, int ndb, int nbb, int swz) {
   const int C = p.C, C4 = p.C4, KS = C / 16;
   int blk = blockIdx.x;
   if (blk < nfb) {
@@ -187,6 +179,20 @@ __global__ void __launch_bounds__(256) g_prep(GParams p, int nfb, int nub, int n
     return;
   }
   blk -= ndb;
+  if (blk < nbb) {  // b2'[c] = W2[c].gb + b2[c], one warp per channel (also warms W2 into L2 for g_g2)
+    const int c = blk * 8 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    if (c >= C) return;
+    float dot = 0.f;
+    for (int k = lane * 4; k < C4; k += 128) {
+      const float4 w = __ldg(reinterpret_cast<const float4*>(p.w2 + (size_t)c * C4 + k));
+      const float4 gv = __ldg(reinterpret_cast<const float4*>(p.gb + k));
+      dot = fmaf(w.x, gv.x, dot); dot = fmaf(w.y, gv.y, dot); dot = fmaf(w.z, gv.z, dot); dot = fmaf(w.w, gv.w, dot);
+    }
+    dot = g_wsum(dot);
+    if (lane == 0) p.b2p[c] = dot + __ldg(p.b2 + c);
+    return;
+  }
+  blk -= nbb;
   const int i = blk * 256 + threadIdx.x;
   if (i < p.B * C4) p.gsum[i] = 0.f;
 }
@@ -200,9 +206,6 @@ struct P1Cfg {
   static constexpr int OFF_D = SM_W1F, OFF_ST = OFF_D + 2 * SM_D, OFF_UV = OFF_ST + 2 * SM_ST, OFF_PS = OFF_UV + SM_UV,
                        OFF_DW = OFF_PS + 2 * SM_PS, SMEM = OFF_DW + SM_DW;
 };
-
-// token t of a 32-token chunk sits at position n*8 + 2q + e (t = 8q + 2n + e), so that after ldmatrix.trans + mma each
-// lane's accumulators cover 8 consecutive tokens of a hidden row (one 16-B store per row)
 __device__ __forceinline__ int tok_pos(int t) { return (t & ~31) | (((t >> 1) & 3) << 3) | (((t >> 3) & 3) << 1) | (t & 1); }
 
 template <int C, int R, int W, int NCW, int NGW, int MG, bool DWS>
@@ -213,7 +216,7 @@ __global__ void __launch_bounds__((NCW + NGW) * 32, 1) g_pass1(GParams p) {
   static_assert(NCT % P == 0 && (S & (S - 1)) == 0 && S <= 32, "stats split");
   constexpr int NMG = C4 / (16 * MG), NCH = T / 32;
   static_assert(C4 % (16 * MG) == 0 && T % 32 == 0 && W % 8 == 0 && R % 2 == 0 && C % 16 == 0, "tiles");
-  constexpr int PF = 3;  // conv register prefetch distance (input rows)
+  constexpr int PF = 3;
   extern __shared__ __align__(16) unsigned char sm[];
   uint4* w1s = reinterpret_cast<uint4*>(sm);
   __half* dsb = reinterpret_cast<__half*>(sm + Cf::OFF_D);
@@ -224,22 +227,19 @@ __global__ void __launch_bounds__((NCW + NGW) * 32, 1) g_pass1(GParams p) {
   const int tid = threadIdx.x;
   const int H = p.H, HW = p.HW, K2 = p.K2, TPI = p.TPI;
   __half* hg = reinterpret_cast<__half*>(p.h);
-
   for (int i = tid; i < Cf::SM_W1F / 16; i += NT) w1s[i] = reinterpret_cast<const uint4*>(p.w1f)[i];
   for (int i = tid; i < C4; i += NT) { uvs[i] = reinterpret_cast<const float2*>(p.uv)[i]; psb[i] = 0.f; psb[C4 + i] = 0.f; }
   if (DWS)
     for (int i = tid; i < C * 56; i += NT) dws[i] = p.dwp[i];
   __syncthreads();
   const int warp = __shfl_sync(0xffffffffu, tid >> 5, 0), lane = tid & 31;
-
   if (warp < NCW) {
-    // ================= conv warps
     int i = 0;
 #pragma unroll 1
     for (int tile = blockIdx.x; tile < p.ntiles; tile += gridDim.x, i++) {
       const int buf = i & 1;
       const int b = tile / TPI, rb = tile - b * TPI, h0 = rb * R, hw0 = h0 * W;
-      if (i >= 2) nbar_sync(3 + buf, NT);  // GEMM warps are done with this buffer
+      if (i >= 2) nbar_sync(3 + buf, NT);
       __half* ds = dsb + buf * (C * LDT);
       constexpr int NIT = C * (R / 2) * QO;
 #pragma unroll 1
@@ -292,7 +292,7 @@ __global__ void __launch_bounds__((NCW + NGW) * 32, 1) g_pass1(GParams p) {
         }
 #pragma unroll
         for (int r = 0; r < 2; r++) {
-          const int t0 = (r0 + r) * W + w0;  // multiple of 8: q fixed, n = 0..3
+          const int t0 = (r0 + r) * W + w0;
           __half* dp = ds + c * LDT + (t0 & ~31) + (((t0 >> 3) & 3) << 1);
 #pragma unroll
           for (int n = 0; n < 4; n++)
@@ -300,7 +300,7 @@ __global__ void __launch_bounds__((NCW + NGW) * 32, 1) g_pass1(GParams p) {
         }
       }
       nbar_sync(5, NCT);
-      {  // per-token LayerNorm statistics of the fp16 d tile (2 tokens per thread, S channel slices)
+      {
         const int pp = tid / S, s = tid - pp * S;
         const int pos = tok_pos(2 * pp);
         float s1a = 0.f, s2a = 0.f, s1b = 0.f, s2b = 0.f;
@@ -326,11 +326,10 @@ __global__ void __launch_bounds__((NCW + NGW) * 32, 1) g_pass1(GParams p) {
           for (int j = 0; j < 8; j++) *reinterpret_cast<uint32_t*>(ha + (size_t)j * HW) = j < 2 ? one : 0u;
         }
       }
-      nbar_arrive(1 + buf, NT);  // d tile + stats ready
+      nbar_arrive(1 + buf, NT);
     }
     for (int j = (i >= 2 ? i - 2 : 0); j < i; j++) nbar_sync(3 + (j & 1), NT);
   } else {
-    // ================= GEMM + epilogue warps
     const int gw = warp - NCW, gt = tid - NCT, g = lane >> 2, t4 = lane & 3;
     int i = 0;
 #pragma unroll 1
@@ -366,7 +365,6 @@ __global__ void __launch_bounds__((NCW + NGW) * 32, 1) g_pass1(GParams p) {
             for (int n = 0; n < 4; n++) mma16816(acc[m][n], a, bf[n >> 1][(n & 1) * 2], bf[n >> 1][(n & 1) * 2 + 1]);
           }
         }
-        // lane holds tokens nc*32 + 8*t4 + 2n + e for hidden rows k0 (e = 0,1) and k1 = k0 + 8 (e = 2,3)
         const int tb = nc * 32 + 8 * t4;
         float4 st[4];
 #pragma unroll
@@ -396,7 +394,7 @@ __global__ void __launch_bounds__((NCW + NGW) * 32, 1) g_pass1(GParams p) {
           if (t4 == 0) { atomicAdd(pss + k0, ss0); atomicAdd(pss + k1, ss1); }
         }
       }
-      nbar_arrive(3 + buf, NT);  // done reading d tile + stats of this buffer
+      nbar_arrive(3 + buf, NT);
       nbar_sync(6, NGT);
       float* gs = p.gsum + (size_t)b * C4;
       for (int k = gt; k < C4; k += NGT) { atomicAdd(gs + k, pss[k]); pss[k] = 0.f; }
@@ -405,10 +403,6 @@ __global__ void __launch_bounds__((NCW + NGW) * 32, 1) g_pass1(GParams p) {
 }
 
 // ---------------------------------------------------------------- r9: single-tile fused pass 1 on tcgen05 (g_tc)
-// warps 2-15 run the conv in channel rounds (one item per thread per round) and signal each round on an mbarrier;
-// warp 0 issues the MMAs k-block-outer over the resident accumulators as the rounds land (the MMA overlaps the conv),
-// then the remaining hidden blocks into TMEM slots freed by the epilogue; warp 1 feeds the W1' ring; warps 2-15 then
-// compute the LN statistics; all 16 warps drain TMEM items (32 hidden rows x 32 tokens of their lane quadrant).
 template <int C, int R, int W, int TP, int NS>
 struct TCfg {
   static constexpr int NT = 512, C4 = 4 * C, T = R * W, KB = (C + 63) / 64, NK16 = C / 16, NJ = C4 / 128,
@@ -422,7 +416,6 @@ struct TCfg {
   static constexpr int S = Q >= 32 ? 32 : Q >= 16 ? 16 : Q >= 8 ? 8 : Q >= 4 ? 4 : Q >= 2 ? 2 : 1;
   static constexpr int NST = P * S, PADU = (TP - T) / 8 > 0 ? (TP - T) / 8 : 1;
   static constexpr uint32_t IDESC = (1u << 4) | (1u << 16) | ((uint32_t)(TP >> 3) << 17) | ((128u >> 4) << 24);
-  // ring sequence -> W1' image (hidden block j, k-block kb): k-block-outer over the NA resident blocks, then block-major
   __host__ __device__ static constexpr int img_of(int i) {
     return i < NA * KB ? (i % NA) * KB + i / NA : (NA + (i - NA * KB) / KB) * KB + (i - NA * KB) % KB;
   }
@@ -437,7 +430,6 @@ __global__ void __launch_bounds__(512, 1) g_tc(GParams p) {
   constexpr int QO = W / 8, PF = 3;
   static_assert(T <= TP && TP % 64 == 0 && TP <= 256 && T % 8 == 0 && W % 8 == 0 && R % 2 == 0 && C % 16 == 0, "tile");
   static_assert(C4 % 128 == 0 && NST % 32 == 0 && NST <= 448 && S <= 32 && CPR * IPC <= 448, "split");
-  // TMEM slot reuse: an item of use u waits accf parity u&1, so a quadrant must never run two uses ahead
   static_assert(NJ <= NSLOT || NSLOT * NQ >= 8, "slot parity");
   static_assert(Cf::SMEM <= 232448, "smem");
   extern __shared__ __align__(1024) unsigned char smraw[];
@@ -456,10 +448,6 @@ __global__ void __launch_bounds__(512, 1) g_tc(GParams p) {
   const int tile = blockIdx.x, b = tile / TPI, h0 = (tile - b * TPI) * R, hw0 = h0 * W;
   const unsigned char* img = reinterpret_cast<const unsigned char*>(p.w1f);
   __half* hg = reinterpret_cast<__half*>(p.h);
-#if TC_STAMPS
-  unsigned long long* stp = p.stamp ? p.stamp + blockIdx.x * 16 : nullptr;
-  if (stp && tid == 0) stp[0] = g_gtime();
-#endif
   if (tid == 0) {
     for (int s = 0; s < NS; s++) {
       asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" ::"r"(b_full + 8 * s) : "memory");
@@ -473,7 +461,7 @@ __global__ void __launch_bounds__(512, 1) g_tc(GParams p) {
     for (int q = 0; q < 4; q++) ctr[q] = 0;
     asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
   }
-  if (T < TP)  // padding tokens of the B tile are zero (their accumulator columns are never stored)
+  if (T < TP)
     for (int i = tid; i < C * PADU; i += NT) {
       const int c = i / PADU, t = T + 8 * (i - c * PADU);
       *reinterpret_cast<uint4*>(dsm + swzB(c, t, LBO)) = make_uint4(0u, 0u, 0u, 0u);
@@ -488,10 +476,7 @@ __global__ void __launch_bounds__(512, 1) g_tc(GParams p) {
   __syncthreads();
   tc_after();
   const uint32_t tbase = *tslot;
-
   if (warp == 0) {
-    // ---- MMA issuer. Phase 1: k-block-outer over the NA resident accumulators, gated by the conv rounds.
-    //      Phase 2: hidden blocks NA.. into TMEM slots freed by the epilogue.
     int i = 0;
     auto stage = [&](uint32_t dt, int kb, uint32_t accf) {
       const int s = i % NS;
@@ -518,7 +503,7 @@ __global__ void __launch_bounds__(512, 1) g_tc(GParams p) {
 #pragma unroll 1
     for (int kb = 0; kb < KB; kb++) {
       const int lastc = (64 * kb + 63 < C ? 64 * kb + 63 : C - 1);
-      mbar_wait(b_drdy + 8 * (lastc / CPR), 0);  // conv round holding this k-block's last channel has landed
+      mbar_wait(b_drdy + 8 * (lastc / CPR), 0);
       tc_after();
 #pragma unroll 1
       for (int j = 0; j < NA; j++) stage(tbase + j * TP, kb, kb == KB - 1 ? b_accf + 8 * j : 0u);
@@ -531,11 +516,7 @@ __global__ void __launch_bounds__(512, 1) g_tc(GParams p) {
 #pragma unroll 1
       for (int kb = 0; kb < KB; kb++) stage(tbase + slot * TP, kb, kb == KB - 1 ? b_accf + 8 * slot : 0u);
     }
-#if TC_STAMPS
-    if (stp && lane == 0) stp[3] = g_gtime();
-#endif
   } else if (warp == 1) {
-    // ---- W1' ring producer: prefill lands while the conv runs; refill once the MMAs that read a stage completed
     if (elect_one())
       for (int i = 0; i < Cf::NPRE; i++) bulk_g2s(sA + i * 16384, img + (size_t)Cf::img_of(i) * 16384, 16384, b_full + 8 * i);
     __syncwarp();
@@ -547,8 +528,6 @@ __global__ void __launch_bounds__(512, 1) g_tc(GParams p) {
       __syncwarp();
     }
   } else {
-    // ---- 7x7 depthwise conv, warps 2-15: round r covers channels [r*CPR, (r+1)*CPR), one item (8 columns x 2 rows of
-    //      one channel) per thread, written as one 16-B unit per row of the MN-major SW128 B tile
     const int ctid = tid - 64;
 #pragma unroll 1
     for (int r = 0; r < NR; r++) {
@@ -609,15 +588,11 @@ __global__ void __launch_bounds__(512, 1) g_tc(GParams p) {
           *reinterpret_cast<uint4*>(dsm + swzB(c, t0, LBO)) = u;
         }
       }
-      asm volatile("fence.proxy.async.shared::cta;" ::: "memory");  // this round's d units visible to the tensor core
+      asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
       __syncwarp();
       if (lane == 0) asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" ::"r"(b_drdy + 8 * r) : "memory");
     }
-#if TC_STAMPS
-    if (stp && tid == 64) stp[1] = g_gtime();
-#endif
     nbar_sync(1, 448);
-    // ---- per-token LayerNorm statistics of the fp16 d tile (2 tokens per thread, S channel slices)
     if (ctid < NST) {
       const int pp = ctid / S, s = ctid - pp * S, t = 2 * pp;
       float s1a = 0.f, s2a = 0.f, s1b = 0.f, s2b = 0.f;
@@ -645,14 +620,8 @@ __global__ void __launch_bounds__(512, 1) g_tc(GParams p) {
     }
     nbar_sync(1, 448);
     nbar_arrive(2, 512);
-#if TC_STAMPS
-    if (stp && tid == 64) stp[4] = g_gtime();
-#endif
   }
-  if (warp < 2) nbar_sync(2, 512);  // stats ready (the stats warps only arrive, so the MMA warp never blocks them)
-
-  // ---- epilogue: items of 32 hidden rows (this warp's TMEM lane quadrant) x 32 tokens, claimed per quadrant in order;
-  //      the fp16 h item goes through a per-warp smem transpose so each store instruction writes 8 rows x 64 B
+  if (warp < 2) nbar_sync(2, 512);
   {
     const int qd = warp & 3;
     unsigned char* stg = sm + Cf::OFF_STG + warp * 2048;
@@ -695,7 +664,7 @@ __global__ void __launch_bounds__(512, 1) g_tc(GParams p) {
       }
       __syncwarp();
 #pragma unroll
-      for (int r = 0; r < 4; r++) {  // 8 rows x 64 B per store instruction
+      for (int r = 0; r < 4; r++) {
         const int row = r * 8 + (lane >> 2), c = lane & 3, t = q * 32 + 8 * c;
         if (T % 32 == 0 || t < T)
           *reinterpret_cast<uint4*>(hb + (size_t)(j * 128 + qd * 32 + row) * HW + t) =
@@ -705,24 +674,18 @@ __global__ void __launch_bounds__(512, 1) g_tc(GParams p) {
       atomicAdd(gs + k, ss);
     }
   }
-#if TC_STAMPS
-  if (stp && lane == 0 && (warp == 0 || warp == 4)) stp[5 + (warp >> 2)] = g_gtime();
-#endif
   tc_before();
   __syncthreads();
   if (warp == 0) {
     tc_after();
     asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, 512;" ::"r"(tbase) : "memory");
   }
-#if TC_STAMPS
-  if (stp && tid == 0) stp[7] = g_gtime();
-#endif
 }
 
-// K3: grid (B, C/16): per image s_b[k] = 1 + gw*gf/(mean gf + eps); one W2_b row per warp, the row loaded up front
+// K3 (64,96 / 32,128 only): per image s_b[k] = 1 + gw*gf/(mean gf + eps); one W2_b row per warp
 __global__ void __launch_bounds__(512, 2) g_grn(GParams p) {
   extern __shared__ __align__(16) float gsm[];
-  constexpr int MAXI = 12;  // C4 <= 1536
+  constexpr int MAXI = 12;
   const int C = p.C, C4 = p.C4, K2 = p.K2;
   float* sc = gsm; float* red = gsm + C4;
   const int b = blockIdx.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
@@ -801,7 +764,7 @@ __device__ __forceinline__ void g2_grid_bar(unsigned int nb) {
 template <int C, int N, int NS>
 struct G2Cfg {
   static constexpr int C4 = 4 * C, KB = C4 / 64, NB = (N + 63) / 64, NCT = (C + 127) / 128, NCH = (N + 31) / 32,
-                       IPW = (NCH + 3) / 4, MAXI = C4 / 128, NPRE = NS < KB ? NS : KB;
+                       IPW = (NCH + 3) / 4, MAXI = C4 / 128, NPRE = NS < KB ? NS : KB, NKI = (C4 + 511) / 512;
   static constexpr int SA = 16384, SB = NB * 8192, STG = SA + SB;
   static constexpr int OFF_S = NS * STG, OFF_BAR = OFF_S + C4 * 4 + 128, NBAR = 3 * NS + 1;
   static constexpr int SMEM = OFF_BAR + NBAR * 8 + 16 + 1024;
@@ -809,13 +772,13 @@ struct G2Cfg {
   static constexpr uint32_t IDESC = (1u << 4) | (1u << 16) | ((uint32_t)(N >> 3) << 17) | ((128u >> 4) << 24);
 };
 
-// unit u = (c-tile ct, image ub, token chunk uq): out[ub][ct*128 + 0..127][uq*N + 0..N-1]
+// unit u = (c-tile ct, image ub, token chunk): out[ub][ct*128 + 0..127][hw0 + 0..N-1]
 template <int C, int N, int NS>
 __global__ void __launch_bounds__(512, 1) g_g2(GParams p, const __grid_constant__ CUtensorMap tmA,
                                                 const __grid_constant__ CUtensorMap tmB) {
   using Cf = G2Cfg<C, N, NS>;
   constexpr int C4 = Cf::C4, KB = Cf::KB, NB = Cf::NB, NCT = Cf::NCT, NCH = Cf::NCH, IPW = Cf::IPW, MAXI = Cf::MAXI,
-                NPRE = Cf::NPRE, SA = Cf::SA, SB = Cf::SB, STG = Cf::STG;
+                NPRE = Cf::NPRE, NKI = Cf::NKI, SA = Cf::SA, SB = Cf::SB, STG = Cf::STG;
   static_assert(N % 16 == 0 && N <= 256 && C4 % 128 == 0 && C % 4 == 0, "shape");
   static_assert(NS * STG >= 16 * 4096 && Cf::SMEM <= 232448, "smem");
   extern __shared__ __align__(1024) unsigned char smraw[];
@@ -832,10 +795,30 @@ __global__ void __launch_bounds__(512, 1) g_g2(GParams p, const __grid_constant_
   const int nunits = NCT * B * NQ, u = blockIdx.x;
   const bool has_unit = u < nunits;
   const int ct = u % NCT, rest = u / NCT, ub = rest / NQ, hw0 = (rest - ub * NQ) * N;
-#if G2_STAMPS
-  unsigned long long* stp = p.stamp ? p.stamp + blockIdx.x * 8 : nullptr;
-  if (stp && tid == 0) stp[0] = g_gtime();
-#endif
+
+  // phase-P loads in one round at entry: this warp's (at most two) W2 rows of image pb, the GRN sums and gw
+  const int G = gridDim.x / B;
+  const bool pact = (int)blockIdx.x < G * B;
+  const int pb = blockIdx.x % B, pg = blockIdx.x / B;
+  const int c0 = pg + G * warp, c1 = c0 + 16 * G;
+  float4 wv0[MAXI], wv1[MAXI];
+  float gsv[NKI], gwv[NKI];
+  if (pact) {
+    if (c0 < C) {
+#pragma unroll
+      for (int i = 0; i < MAXI; i++) wv0[i] = __ldg(reinterpret_cast<const float4*>(p.w2 + (size_t)c0 * C4 + lane * 4 + i * 128));
+    }
+    if (c1 < C) {
+#pragma unroll
+      for (int i = 0; i < MAXI; i++) wv1[i] = __ldg(reinterpret_cast<const float4*>(p.w2 + (size_t)c1 * C4 + lane * 4 + i * 128));
+    }
+#pragma unroll
+    for (int i = 0; i < NKI; i++) {
+      const int k = tid + 512 * i;
+      gsv[i] = k < C4 ? __ldcg(p.gsum + (size_t)pb * C4 + k) : 0.f;
+      gwv[i] = k < C4 ? __ldg(p.gw + k) : 0.f;
+    }
+  }
   if (tid == 0) {
     for (int s = 0; s < NS; s++) {
       asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" ::"r"(b_fa + 8 * s) : "memory");
@@ -867,73 +850,46 @@ __global__ void __launch_bounds__(512, 1) g_g2(GParams p, const __grid_constant_
     __syncwarp();
   }
 
-  // ---- phase P: CTA j < G*B builds rows c = j/B + G*i of image j%B: A_b = fp16(W2 * s_b) [B][C][C4]; image-0 CTAs
-  //      also write b2' = W2.gb + b2. s_b and the conversion use K3's arithmetic (same roundings).
-  {
-    const int G = gridDim.x / B;
-    if ((int)blockIdx.x < G * B) {
-      const int pb = blockIdx.x % B, pg = blockIdx.x / B;
-      int c = pg + G * warp;
-      float4 wv[MAXI];
-      auto ldrow = [&](int cc) {
-        const float* wr = p.w2 + (size_t)cc * C4;
+  // ---- phase P: s_b (K3's arithmetic) and A_b = fp16(W2 * s_b) rows c0, c1 of image pb, layout [B][C][C4]
+  if (pact) {
+    float loc = 0.f;
 #pragma unroll
-        for (int i = 0; i < MAXI; i++) wv[i] = __ldg(reinterpret_cast<const float4*>(wr + lane * 4 + i * 128));
-      };
-      if (c < C) ldrow(c);
-      float loc = 0.f;
-      for (int k = tid; k < C4; k += 512) {
-        const float gf = sqrtf(__ldcg(p.gsum + (size_t)pb * C4 + k));
-        ssm[k] = gf; loc += gf;
-      }
-      loc = g_wsum(loc);
-      if (lane == 0) red[warp] = loc;
-      __syncthreads();
-      if (warp == 0) {
-        float v = lane < 16 ? red[lane] : 0.f;
-        v = g_wsum(v);
-        if (lane == 0) red[16] = 1.f / (v / (float)C4 + p.eps);
-      }
-      __syncthreads();
-      const float inv = red[16];
-      for (int k = tid; k < C4; k += 512) ssm[k] = fmaf(__ldg(p.gw + k) * ssm[k], inv, 1.f);
-      __syncthreads();
-      __half* w2b = reinterpret_cast<__half*>(p.w2b);
-#pragma unroll 1
-      while (c < C) {
-        __half* dst = w2b + ((size_t)pb * C + c) * C4;
-        float dot = 0.f;
-#pragma unroll
-        for (int i = 0; i < MAXI; i++) {
-          const int k = lane * 4 + i * 128;
-          const float4 w = wv[i];
-          const float4 s = *reinterpret_cast<const float4*>(ssm + k);
-          uint2 o;
-          o.x = h2u(__floats2half2_rn(w.x * s.x, w.y * s.y));
-          o.y = h2u(__floats2half2_rn(w.z * s.z, w.w * s.w));
-          *reinterpret_cast<uint2*>(dst + k) = o;
-          if (pb == 0) {
-            const float4 gv = __ldg(reinterpret_cast<const float4*>(p.gb + k));
-            dot = fmaf(w.x, gv.x, dot); dot = fmaf(w.y, gv.y, dot); dot = fmaf(w.z, gv.z, dot); dot = fmaf(w.w, gv.w, dot);
-          }
-        }
-        if (pb == 0) {
-          dot = g_wsum(dot);
-          if (lane == 0) p.b2p[c] = dot + __ldg(p.b2 + c);
-        }
-        c += 16 * G;
-        if (c < C) ldrow(c);
-      }
+    for (int i = 0; i < NKI; i++) { const float gf = sqrtf(gsv[i]); gsv[i] = gf; loc += gf; }
+    loc = g_wsum(loc);
+    if (lane == 0) red[warp] = loc;
+    __syncthreads();
+    if (warp == 0) {
+      float v = lane < 16 ? red[lane] : 0.f;
+      v = g_wsum(v);
+      if (lane == 0) red[16] = 1.f / (v / (float)C4 + p.eps);
     }
+    __syncthreads();
+    const float inv = red[16];
+#pragma unroll
+    for (int i = 0; i < NKI; i++) {
+      const int k = tid + 512 * i;
+      if (k < C4) ssm[k] = fmaf(gwv[i] * gsv[i], inv, 1.f);
+    }
+    __syncthreads();
+    __half* w2b = reinterpret_cast<__half*>(p.w2b);
+    auto conv_row = [&](int c, const float4 (&wv)[MAXI]) {
+      __half* dst = w2b + ((size_t)pb * C + c) * C4;
+#pragma unroll
+      for (int i = 0; i < MAXI; i++) {
+        const int k = lane * 4 + i * 128;
+        const float4 w = wv[i];
+        const float4 s = *reinterpret_cast<const float4*>(ssm + k);
+        uint2 o;
+        o.x = h2u(__floats2half2_rn(w.x * s.x, w.y * s.y));
+        o.y = h2u(__floats2half2_rn(w.z * s.z, w.w * s.w));
+        *reinterpret_cast<uint2*>(dst + k) = o;
+      }
+    };
+    if (c0 < C) conv_row(c0, wv0);
+    if (c1 < C) conv_row(c1, wv1);
   }
   asm volatile("fence.proxy.async;" ::: "memory");  // A_b is read by TMA in other CTAs
-#if G2_STAMPS
-  if (stp && tid == 0) stp[1] = g_gtime();
-#endif
   g2_grid_bar(gridDim.x);
-#if G2_STAMPS
-  if (stp && tid == 0) stp[2] = g_gtime();
-#endif
   if (!has_unit) return;
 
   if (warp == 0) {
@@ -956,22 +912,12 @@ __global__ void __launch_bounds__(512, 1) g_g2(GParams p, const __grid_constant_
     }
   } else if (warp == 1) {
     // ---- MMA issuer: 4 x (128 x N x 16) per 64-k stage into one accumulator
-#if G2_STAMPS
-    long long wclk = 0, c0 = 0;
-#endif
 #pragma unroll 1
     for (int kb = 0; kb < KB; kb++) {
       const int s = kb % NS;
       const uint32_t par = (kb / NS) & 1;
-#if G2_STAMPS
-      const long long w0 = clock64();
-#endif
       mbar_wait(b_fa + 8 * s, par);
       mbar_wait(b_fb + 8 * s, par);
-#if G2_STAMPS
-      if (kb == 0) { c0 = clock64(); if (stp && lane == 0) stp[3] = g_gtime(); }
-      else wclk += clock64() - w0;
-#endif
       tc_after();
       if (elect_one()) {
         const uint32_t aS = sbase + s * STG, bS = aS + SA;
@@ -991,10 +937,6 @@ __global__ void __launch_bounds__(512, 1) g_g2(GParams p, const __grid_constant_
       }
       __syncwarp();
     }
-#if G2_STAMPS
-    mbar_wait(b_acc, 0);
-    if (stp && lane == 0) { stp[4] = (unsigned long long)(clock64() - c0); stp[6] = (unsigned long long)wclk; }
-#endif
   }
 
   // ---- epilogue (all 16 warps): item = 32 channels (this warp's TMEM lane quadrant) x 32 tokens; x is prefetched into
@@ -1008,7 +950,7 @@ __global__ void __launch_bounds__(512, 1) g_g2(GParams p, const __grid_constant_
 #pragma unroll
     for (int r = 0; r < 8; r++) {
       const int c = ct * 128 + q * 32 + 4 * r + (lane >> 3);
-      bb[r] = c < C ? __ldcg(p.b2p + c) : 0.f;
+      bb[r] = c < C ? __ldg(p.b2p + c) : 0.f;
 #pragma unroll
       for (int it = 0; it < IPW; it++) {
         const int j = jw + 4 * it, t = j * 32 + (lane & 7) * 4;
@@ -1018,9 +960,6 @@ __global__ void __launch_bounds__(512, 1) g_g2(GParams p, const __grid_constant_
     }
     mbar_wait(b_acc, 0);
     tc_after();
-#if G2_STAMPS
-    if (stp && tid == 64) stp[5] = g_gtime();
-#endif
     unsigned char* stg = sm + warp * 4096;
 #pragma unroll
     for (int it = 0; it < IPW; it++) {
@@ -1053,9 +992,6 @@ __global__ void __launch_bounds__(512, 1) g_g2(GParams p, const __grid_constant_
     tc_after();
     asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;" ::"r"(tbase), "n"(Cf::TCOLS) : "memory");
   }
-#if G2_STAMPS
-  if (stp && tid == 0) stp[7] = g_gtime();
-#endif
 }
 
 // ---------------------------------------------------------------- host
@@ -1085,7 +1021,6 @@ static const char* launch_p1(const GParams& p, cudaStream_t s) {
   g_pass1<C, R, W, NCW, NGW, MG, DWS><<<grid, Cf::NT, Cf::SMEM, s>>>(p);
   return nullptr;
 }
-// one CTA per tile (112 / 128 tiles <= 148 SMs; 1 CTA per SM by registers, so the 512-column TMEM alloc never waits)
 template <int C, int R, int W, int TP, int NS>
 static const char* launch_tc(const GParams& p, cudaStream_t s) {
   using Cf = TCfg<C, R, W, TP, NS>;
@@ -1131,7 +1066,9 @@ static const char* launch_g2(const GParams& p, cudaStream_t s) {
     if (e != cudaSuccess) return cudaGetErrorString(e);
     init = true;
   }
-  if (p.HW % N != 0 || Cf::NCT * p.B * (p.HW / N) > g_num_sms() || g_num_sms() < p.B) return "g_g2: bad unit split";
+  const int G = g_num_sms() / p.B;
+  if (p.HW % N != 0 || Cf::NCT * p.B * (p.HW / N) > g_num_sms() || G < 1 || (C + G - 1) / G > 32)
+    return "g_g2: bad unit split";
   CUtensorMap ta, tb;
   if (!g_map2d(&ta, p.w2b, (uint64_t)Cf::C4, (uint64_t)p.B * C, (uint64_t)Cf::C4 * 2, 64, 128)) return "g_g2: A map";
   if (!g_map2d(&tb, p.h, (uint64_t)p.HW, (uint64_t)p.B * p.K2, (uint64_t)p.HW * 2, 64, 64)) return "g_g2: B map";
@@ -1147,7 +1084,6 @@ static cublasLtHandle_t g_lt() {
   return h;
 }
 #define LTCHK(x) do { if ((x) != CUBLAS_STATUS_SUCCESS) { err = "cublasLt: " #x; goto done; } } while (0)
-// descriptors, batch strides and pointers are set on every call; only the heuristic result is cached per shape
 static const char* g_gemm2(const GParams& p, void* ws, size_t wsb, cudaStream_t s) {
   static std::map<std::tuple<int, int, int>, cublasLtMatmulHeuristicResult_t> cache;
   const char* err = nullptr;
@@ -1191,8 +1127,8 @@ done:
   if (op) cublasLtMatmulDescDestroy(op);
   return err;
 }
-// mask selects launches (15 = all; lower values only for per-launch timing). g2mode (tc rows only): 0 = K3 + cuBLASLt
-// GEMM2 (r9), 1 = g_g2 (4,96 with 224-token units), 2 = g_g2 (4,96 with 112-token units)
+// mask selects launches (15 = all). g2mode (tc rows only): 0 = K3 + cuBLASLt GEMM2 (r9), 1 = g_g2 with 224-token
+// units at 4,96, 2 = g_g2 with 112-token units at 4,96 (8,320 always uses 256-token units)
 extern "C" const char* g_launch(GParams p, void* ltws, size_t ltws_bytes, int mask, int g2mode, void* stream_v) {
   cudaStream_t s = (cudaStream_t)stream_v;
   const int R = g_rows_per_tile(p.C, p.H, p.W);
@@ -1204,8 +1140,9 @@ extern "C" const char* g_launch(GParams p, void* ltws, size_t ltws_bytes, int ma
   if (mask & 1) {
     const int nfb = swz ? ((p.C4 / 128) * ((p.C + 63) / 64) * 1024 + 255) / 256
                         : ((p.C4 / 16) * (p.C / 16) * 32 + 255) / 256;
-    const int nub = (p.C4 + 7) / 8, ndb = (p.C * 56 + 255) / 256, nzb = (p.B * p.C4 + 255) / 256;
-    g_prep<<<nfb + nub + ndb + nzb, 256, 0, s>>>(p, nfb, nub, ndb, swz);
+    const int nub = (p.C4 + 7) / 8, ndb = (p.C * 56 + 255) / 256, nbb = use_g2 ? (p.C + 7) / 8 : 0,
+              nzb = (p.B * p.C4 + 255) / 256;
+    g_prep<<<nfb + nub + ndb + nbb + nzb, 256, 0, s>>>(p, nfb, nub, ndb, nbb, swz);
   }
   if (mask & 2) {
     if (p.C == 96 && p.W == 112) err = launch_p1<96, 2, 112, 7, 9, 3, true>(p, s);
@@ -1271,7 +1208,6 @@ static void run_g(torch::Tensor& x, torch::Tensor& dww, torch::Tensor& dwb, torc
                   torch::Tensor& b2, double eps, double leps, torch::Tensor& out, cudaStream_t stream) {
   const int B = (int)x.size(0), C = (int)x.size(1), H = (int)x.size(2), W = (int)x.size(3);
   const int HW = H * W, C4 = 4 * C, K2 = C4 + 8;
-  // W1' scratch: m16n8k16 fragments (C4*C fp16) or pre-swizzled 128x64 images ((C4/128) * ceil(C/64) * 16 KB)
   const size_t w1f_frag = (size_t)C4 * C * 2, w1f_img = (size_t)(C4 / 128) * ((C + 63) / 64) * 16384;
   const size_t o_w1f = 0, o_uv = align256(o_w1f + (w1f_frag > w1f_img ? w1f_frag : w1f_img)),
                o_dwp = align256(o_uv + (size_t)C4 * 8),
@@ -1289,7 +1225,8 @@ static void run_g(torch::Tensor& x, torch::Tensor& dww, torch::Tensor& dwb, torc
   p.B = B; p.C = C; p.H = H; p.W = W; p.HW = 0; p.C4 = 0; p.K2 = 0; p.TPI = 0; p.ntiles = 0;
   p.eps = (float)eps; p.ln_eps = (float)leps;
   p.stamp = nullptr;
-  const char* err = g_launch(p, wp + o_lt, ltb, 15, 1, (void*)stream);
+  // g2mode 2: g_g2 at 8,320 (256-token units) and 4,96 (112-token units)
+  const char* err = g_launch(p, wp + o_lt, ltb, 15, 2, (void*)stream);
   if (err != nullptr) throw std::runtime_error(std::string("g_launch failed: ") + err);
 }
 
@@ -1934,7 +1871,7 @@ extern "C" const char* convnext_launch(Params p, void* stream_v) {
 ```
 
 ```yaml design-card
-id: r10-g-e2-g2-coop
+id: r10-g-e2-g2-coop-v3
 parents:
   - r9-g-e3-tc05-p1s
 operation: structural_mutation
@@ -1950,24 +1887,24 @@ niche:
   cache: default
   spec: dispatch:size
 hypothesis: >-
-  At 8,320 and 4,96, K3 plus the cuBLASLt GEMM2 (20.2 / 12.2 us rented) are replaced by one cooperative tcgen05 launch,
-  g_g2, so these rows run 3 launches instead of 4. Phase P computes s_b and writes A_b = fp16(W2*s_b) with K3's
-  arithmetic, and the image-0 CTAs write b2' in fp32. The h B-stages are TMA-prefetched before one flat
-  self-resetting grid barrier. After it, a 4-stage TMA ring (A 16 KB + B 32 KB) feeds 1SM 128x256x16 MMAs into one
-  TMEM accumulator, 96 units at 8,320 and 56 at 4,96. The epilogue writes out = x + acc + b2' in coalesced NCHW rows,
-  with x prefetched into registers. The task's in-place B scale was dropped because it fails precision (findings).
-  Estimate: g_g2 ~10-11 us at 8,320 and ~6 us at 4,96, so rows ~49-50 / ~31 us rented. UNTESTED: the B200 backend
-  was down for the whole session; the code has never been compiled.
+  One cooperative tcgen05 launch, g_g2, replaces K3 + cuBLASLt GEMM2 at 8,320 and 4,96, so those rows run 3 launches
+  instead of 4. Phase P loads every W2 row, gsum and gw in one round and builds A_b = fp16(W2*s_b) with K3's roundings;
+  b2' comes from K0. One flat grid barrier follows, with the h B-stages TMA-prefetched before it. A 4-stage TMA ring
+  (A 16 KB + B 32 KB) feeds 1SM 128x256x16 MMAs; at 4,96 the units are 112 tokens with a 6-stage ring. The epilogue
+  writes out = x + acc + b2' with x prefetched into registers and coalesced NCHW rows. Measured result (refuted):
+  16/16 pass, but 8,320 62.1 vs 58.5 us and 4,96 37.4 vs 37.2 us against r9-merge in the same container. g_g2 alone
+  takes 23.1 us cold at 8,320 (target <= 9; refutation line 14). The engine and layouts are correct; the fixed chain
+  (phase P, barrier, first A landing) plus an ingest-bound 1SM mainloop cost more than K3 + cuBLASLt.
 expected_effect:
   S:
     pct: 0
     confidence: high
   M:
-    pct: -3
-    confidence: low
+    pct: 0
+    confidence: medium
   L:
-    pct: -3
-    confidence: low
+    pct: 1
+    confidence: medium
 resources_sm100a:
   regs_per_thread: 128
   smem_per_cta_bytes: 203000
@@ -1976,26 +1913,32 @@ resources_sm100a:
   bytes_in_flight_per_sm: 196608
   launches_per_call: 3
 knobs:
-  g2_8_320: "g_g2<320,256,4>: 96 units (3 c-tiles x 8 images x 4 chunks of 256 tokens; c-tile 3 is half zero), KB=20 stages of 64 k, TMEM 256 cols, 148 CTAs cooperative (52 do phase P only)"
-  g2_4_96: "g_g2<96,224,4> (56 units, default g2mode 1) or g_g2<96,112,6> (112 units, g2mode 2): time both, pick in binding"
-  phaseP: "CTA j < (148/B)*B handles image j%B, rows c = j/B + (148/B)*m, one row per warp, W2 row prefetched before the s_b reduce"
-  barrier: "module-level g2_bar_cnt/g2_bar_gen, atom.acq_rel arrive, last arriver resets the count and st.release bumps gen; waiters spin on ld.acquire (no nanosleep)"
-  roles: "warp 0 TMA producer, warp 1 MMA issuer (elect.sync issue only, whole-warp loops), all 16 warps epilogue (2 items of 32x32 each at N=256)"
+  g2_8_320: "g_g2<320,256,4>: 96 units (3 c-tiles x 8 images x 4 chunks of 256 tokens; c-tile 3 half masked), KB=20 stages of 64 k, TMEM 256 cols, 148 CTAs cooperative"
+  g2_4_96: "g_g2<96,112,6> (g2mode 2, 112 units, all 6 stages prefetched); g_g2<96,224,4> (g2mode 1) measured 0.7-1.3 us slower"
+  phaseP: "CTA j < (148/B)*B: image j%B, rows j/B + (148/B)*warp (+16*(148/B)); W2 rows, gsum, gw loaded at entry in one round"
+  barrier: "module-level g2_bar_cnt/g2_bar_gen, atom.acq_rel arrive, last arriver resets the count and st.release bumps gen; waiters spin on ld.acquire"
+  k0: "extra nbb = C/8 blocks: b2'[c] = W2[c].gb + b2[c] (one warp per channel; also warms W2 into L2)"
 dispatch:
   - {shape: "64,96,112,112", kernel: "K0 + g_pass1<96,...> + g_grn + cublasLt (unchanged)"}
   - {shape: "32,128,64,64", kernel: "K0 + g_pass1<128,...> + g_grn + cublasLt (unchanged)"}
   - {shape: "8,320,32,32", kernel: "K0 + g_tc<320,2,32,64,9> + g_g2<320,256,4>"}
-  - {shape: "4,96,56,56", kernel: "K0 + g_tc<96,2,56,128,6> + g_g2<96,224,4>"}
+  - {shape: "4,96,56,56", kernel: "K0 + g_tc<96,2,56,128,6> + g_g2<96,112,6>"}
   - {shape: "all others", kernel: "r0 anchor convnext_fused (fallback only; do not merge)"}
 tests:
   - H42
 findings:
-  - "PRECISION SIM (torch fp64 emulation of the shipped roundings: d16, LN stats of d16, fp16(lnw*W1), u = rowsum of fp16 W1', exact GELU, h16, sumsq from unrounded g; harness generator rules; seeds 0-3 via torch.Generator, not the harness seed 200). 8,320 (atol 2.4e-3): P0 current fp16(W2*s_b).h16 max 1.77-1.91e-3 (74-80 %), 0 beyond; P1 task design fp16(W2).fp16(h16*s) max 2.09-2.44e-3 (87-101 %), 1 element beyond atol at seed 0; P2 fp16(fp16(W2)*s).h16 2.02-2.33e-3 (84-97 %), 0 beyond; P3 hi/lo B split 1.81-1.99e-3 (75-83 %). 4,96 (atol 2.8e-3): P0 61-70 %, P1 73-78 %, P2 65-76 %, P3 62-68 %, all 0 beyond. P1 is refuted at 8,320 and P2 has no margin; only P0 or a 2-MMA hi/lo split meet the 0-beyond bar [probe_b200]"
-  - "Design consequence: the B-tile in-place scale (and HFMA2 hi/lo-s variants of it, which give the same fp16(h16*s)) is dead at 8,320. A cheaper fix than hi/lo-B (2x MMA = ~20k clk per unit at N=256): build A_b = fp16(W2*s_b) once per image inside g_g2 (3.3M elements over 148 CTAs, ~22K per CTA) before one flat grid barrier. This keeps P0 roundings exactly (b2' now fp32 instead of hi/lo fp16) and makes the mainloop a pure TMA->MMA ring with no in-ring work [INFERRED]"
-  - "Rejected alternatives (arithmetic only): per-stage A build from fp32 W2 by producer warps needs 64 KB of L2->SM per 64-k stage (125 B/clk at the N=256 MMA ideal, above the 68-92 B/clk measured in H31) and 256 regs/lane per warp-owned stage; per-CTA private A build is 655 KB fp32 per CTA (~4 us); tokens-as-M orientation needs N=160x2 MMAs at the 105-clk floor (16.8k clk per 128-token unit) [INFERRED]"
-  - "INFRA: the B200 backend (Modal function) was stopped for the whole session after the first probe: compile_b200 and 5 probe_b200 calls all returned 'function is stopped'. Nothing in g_g2 was compiled, validated or timed. Desk check found and fixed one PTX error (atom.add.acq_rel.gpu.global.u32 -> atom.acq_rel.gpu.global.add.u32) [compile_b200, probe_b200]"
-  - "OWED before any merge: compile_b200 (regs <= 128, STACK 0, UTMALDG/UTCHMMA present); standalone g_g2 vs torch (x + W2_b.h + b2') at both rows; harness_time of the 3-launch vs 4-launch pipeline interleaved x3 at 8,320 / 4,96; g_g2 cold alone (target <= 9 / <= 4.5 us); G2_STAMPS=1 build to report clk per 128x256x16 instruction (stp[4]-stp[6] over 4*KB) for the audit; N=224 vs N=112 at 4,96; run_tests 16/16 with portal-order re-runs; 10-round fp64 precision log (P0 class, expected 74-82 % at 8,320) [INFERRED]"
-  - "Risks to check first: TMA box rows (128) larger than the A map's per-image rows at C=96 (the 2-D map spans B*C rows, so only the last image hits OOB fill; the junk rows are masked in the epilogue); mbarrier tx counts for partially OOB B boxes at the image end of 4,96 (TMA counts full box bytes); cudaGetDriverEntryPointByVersion availability on the portal's CUDA 13.1 [INFERRED]"
+  - "PRECISION SIM before any code (torch fp64 emulation of the shipped roundings, harness generator rules, seeds 0-3): at 8,320 (atol 2.4e-3) P0 fp16(W2*s_b).h16 max 1.77-1.91e-3 (74-80 %), 0 beyond; P1 task design fp16(W2).fp16(h16*s) 2.09-2.44e-3 (87-101 %), 1 element beyond atol at seed 0; P2 fp16(fp16(W2)*s).h16 84-97 %; P3 hi/lo B split 75-83 %. At 4,96 all variants pass (P1 73-78 %). The in-place B scale (twice-rounded hidden) is refuted at 8,320; only P0 or a 2-MMA split are safe [probe_b200]"
+  - "INFRA: the B200 backend was down for the first half of the session ('function ... is stopped' on compile and 5 probes); the work resumed later on a fresh container. /tmp files written by one probe did not survive into the resumed container, so probes must embed their full source [probe_b200]"
+  - "compile (sm_100a): g_g2<320,256,4> 128 regs, g_g2<96,224,4> 128, g_g2<96,112,6> 90, 0 B local/spill; 55 UTMALDG in the module. The engine (K-major SW128 A box 64x128 from a 2-D TMA map over B*C rows, MN-major SW128 B by 64x64 boxes, LBO 8192 SBO 1024 +2048 per k16, idesc N=256/224/112) was correct on the first build: run_tests 16/16 [compile_b200, run_tests]"
+  - "v1 (rolled phase-P loads, b2' in phase P, 4,96 N=224): run_tests 16/16; 8,320 64.1 vs 58.5 us, 4,96 40.5 vs 37.2 (r9-merge, same container) [run_tests]"
+  - "v1 stamps at 8,320 (probe, g_g2 after a 2xL2 flush, us from first CTA start, medians): phase P end 7.4 (about 6 serial DRAM rounds for gsum, gw, W2 rows and gb), barrier out 9.7, first stage ready 11.5, epilogue start 20.0, end 23.6; g_g2 alone 26.3 us, full chain (K0+P1+g_g2) 64.8 vs K0+P1 38.4 [probe_b200]"
+  - "AUDIT ITEM (1SM N=256 with TMA-fed operands): the MMA warp spans 13.6-15.1k clk for 20 stages = 681-755 clk per 64-k stage (170-190 clk per 128x256x16 instruction against the 128-clk ideal), 25-40 % of it waiting on full barriers, i.e. ~65-72 B/clk/SM of 48 KB stages. 1SM N=256 does NOT reach the MMA ideal when A and B both stream through TMA; it is ingest-bound like H31's 68-92 B/clk. N=128 units (192 > 148 SMs, not usable) ran 538 clk per 32 KB stage = 135 clk per instruction (near the ~105-128 floor) [probe_b200]"
+  - "v2 (all phase-P loads in one round at entry, gb prefetched): g_g2 alone 26.3 -> 23.1 us, full chain 64.8 -> 60.4 us at 8,320; phase P end 7.4 -> 5.1 us, barrier out 7.2, first stage 8.7, epilogue start 17.2, end 20.5. 4,96: N=224 g_g2 14.0 us, N=112 13.3 us (112 units, 457 clk per stage, waits 555 clk total). Max |err| vs the torch fp32 reference (seed 200): 1.73e-3 at 8,320, 1.89e-3 at 4,96 [probe_b200]"
+  - "v3 (shipped: b2' moved to K0, which also warms W2 into L2; both W2 rows per warp prefetched; 4,96 N=112): run_tests 16/16 incl. portal-order re-runs; 8,320 62.1 vs 58.5 us (+6.1 %), 4,96 37.4 vs 37.2 (tie), 64,96 / 32,128 unchanged code (864.4 / 227.2 vs 864.2 / 227.0) [run_tests]"
+  - "H42 verdict: REFUTED as built. The refutation clause fires: g_g2 alone is 23 us cold at 8,320, above 14. The single launch saves ~2 us of launch gap but adds a serial chain before the first MMA: phase P 2.6-5 us, barrier ~2 us (the release waits for the CTA's A_b stores to drain), first A landing ~1.5 us. The 1SM mainloop then runs at 1.33-1.47x the ideal on 96 of 148 SMs, and the epilogue takes ~3.3 us. cuBLASLt (11.3 us) plus K3 (8.9 us) is ~20 us. 4,96 is a tie, so the portal launch-count benefit may give it ~1 us there; that is noise-level [INFERRED]"
+  - "What would be needed to win at 8,320: drop the grid barrier by building A_b per (c-tile, image) in a 4-CTA group (dataflow counters, or a cluster of the 4 token-chunk units sharing a TMA multicast of A), or pair the GEMM (cta_group::2, M = 256 = 2 c-tiles, half the B ingest per SM) so the mainloop reaches ~512 clk per stage; together worth ~8-10 us of the 23. Folding gb or the scale into the hidden is ruled out by precision (P1, and F's r6 gb finding) [INFERRED]"
+  - "Precision of the shipped path: roundings equal K3's (fp16(W2*s_b) with s_b in the same fp32 order, h16 once), b2' is exact fp32 instead of hi/lo fp16, and GEMM accumulation order differs. run_tests 10 rounds x 16 rows pass; single-seed max |err| 1.73e-3 (8,320, 72 % of atol) / 1.89e-3 (4,96). The 10-round fp64 log was NOT run for v3 [probe_b200, run_tests]"
+  - "Pitfalls: tensor maps via cudaGetDriverEntryPointByVersion('cuTensorMapEncodeTiled', 12000) work on CUDA 13 without linking libcuda directly; a TMA box of 128 rows over a 96-row-per-image map is fine when masked rows are discarded in the epilogue; the PTX form is atom.acq_rel.gpu.global.add.u32 (not atom.add.acq_rel...) [compile_b200, run_tests]"
 paths:
   - {max_tokens: 8192, lang: cuda, width: 128, threads: 512, rows: 2, grid: oneshot, mem: tma, launches: 3, x: none, w: none, st: none, cluster: 1}
   - {max_tokens: 12544, lang: cuda, width: 128, threads: 512, rows: 2, grid: oneshot, mem: tma, launches: 3, x: none, w: none, st: none, cluster: 1}
@@ -2013,11 +1956,9 @@ runs_on:
     runs: false
     representative: false
 risks:
-  - "UNTESTED: never compiled or run (backend down all session); must pass compile_b200, a torch check and run_tests 16/16 before any merge"
-  - "Merge-only candidate: 12 rows run the slow r0 anchor; only 8,320 and 4,96 change vs the parent (64,96 / 32,128 code paths identical)"
-  - "Cooperative launch of 148 CTAs needs 1 CTA/SM residency (203 KB smem); the grid barrier counter is module-level state, self-reset by the last arriver"
-  - "4,96 default uses 56 units of N=224 (56 SMs busy); the 112-unit N=112 variant may be faster and is one g2mode switch away"
-  - "fp32 GEMM accumulation order differs from cuBLASLt; roundings equal the logged P0 class, but the 10-round log must be redone on the built kernel"
+  - "Merge-only candidate: 12 rows run the slow r0 anchor; 8,320 is slower than r9-merge (do not merge), 4,96 ties (merge only if the portal's launch-count effect is trusted)"
+  - "Cooperative launch of 148 CTAs needs 1 CTA/SM residency (203 KB smem); the grid-barrier counter is module-level state, self-reset by the last arriver"
+  - "10-round fp64 precision log not run for this build; roundings match the logged P0 class"
 measure_first:
   - B200
 compliance:

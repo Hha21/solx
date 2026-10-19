@@ -1,0 +1,62 @@
+id: r10-i-e3-tmaconv-gate
+parents: [r0-convnext-coop-fp32-anchor]
+operation: new_design
+language: cuda_cpp
+niche:
+  mem: ldg128
+  st: direct
+  grid: persistent
+  launch: fused
+  tile: rows128
+  red: cta
+  cache: default
+  spec: all
+hypothesis: >-
+  H43 STEP 1. A conv fed by one 3-D TMA box per 16-channel stage (out-of-image rows and columns zero-filled by the
+  TMA unit), with 49 taps in registers and 2x7 (64,96) or 4x4 (32,128) register patches, writes fp16 d straight
+  into the SW128 B layout and the LN statistics into smem. It runs conv-only 64,96 in 233 us rented (G r7 conv side
+  472; FMA bound 102) and 32,128 in 56 us. That is below the 250 us STEP 2 threshold but above the 180 us success
+  line. STEP 2/3 were not built, so the ships-as-candidate code is the r0 anchor on every row and the merge takes
+  nothing. The conv engine is kept disabled in i_tmaconv_gate.cu for STEP 2.
+expected_effect:
+  S: {pct: 0, confidence: high}
+  M: {pct: 0, confidence: high}
+  L: {pct: 0, confidence: high}
+resources_sm100a:
+  regs_per_thread: 128
+  smem_per_cta_bytes: 70208
+  threads_per_cta: 256
+  ctas_per_sm: 2
+  bytes_in_flight_per_sm: 65536
+  launches_per_call: 1
+knobs: {GATE_64_96: "R2 PW7 CG16 NS2 box 120x8x16, 288 thr, 186432 B", GATE_32_128: "R4 PW4 CG16 NS3 box 72x10x16, 288 thr, 220224 B"}
+tests: [H43]
+findings:
+  - "INFRA (first part): every B200 call failed with 'function ... is stopped' until the resume; the first placeholder r10-i-e3-gate-unrun (r0 anchor only) is replaced by this card [probe_b200]"
+  - "STEP 1 v1, per-row 1-D cp.async.bulk (448 B per row, CG x nr copies per 16-channel stage from 32 producer lanes, padded rows): 64,96 full 700 us / compute-only 242 / copy-only 578 rented (1.91-1.96 GHz); 32,128 R=4 191 / 61 / 163; R=2 250 / 62 / 224. Copy issue is the binding term: ~18.6k small copies per SM at ~31 ns each (8.3 MB/SM at 14 GB/s/SM) [probe_b200]"
+  - "STEP 1 v2, one 3-D TMA box per stage (dims {W,H,B*C}, box {W+8, R+6, 16}, start {-4, h0-3, b*C+g*16}; OOB zero fill gives the w and h padding, no predication): 64,96 full 233.8 / compute-only 226.8 / copy-only 118.1 us (CTA max 238 / 232 / 108); 32,128 R=4 55.8 / 52.1 / 29.0 (CTA max 53 vs median 41: 3.46 tiles per CTA quantisation); R=2 57.7 / 53.0 / 34.8. Copies now overlap fully; compute binds [probe_b200]"
+  - "Gate verdict H43: conv-only 233 us <= 250, so STEP 2 is justified; it misses the 180 us success line, but the refutation line (> 300) does not fire. The conv is 2.2x its 102 us FMA bound with 8 conv warps (2 per SMSP, 155-168 regs): latency/issue-bound, not pipe-bound. At 32,128 it is 2.4x the 22 us bound [probe_b200]"
+  - "Bank conflicts do not matter: a channel stride of 0 mod 32 words (8-row box, 2-way conflict between the warp's two channels) gave 227 us compute-only vs 220 us for a 10-row box with stride 16 mod 32 (25 % more copied bytes, full 230.6 vs 233.8). TMA forces 128-B aligned destinations, so the stride is always 0 mod 32 with per-channel boxes [probe_b200]"
+  - "Correctness at the edges: d at tile 0 (h0=0) and tile 3583 (h0=110) of 64,96 and tiles 0 / 511 of 32,128 matches fp16(torch conv2d) within 1 fp16 ulp (3.9e-3 at |d| 8-16, from fp32 summation order); per-token mean <= 4.1e-5 abs, rstd <= 2.4e-5 rel vs torch on the fp16 d. The SW128 B writer function and the -4 box start are right [probe_b200]"
+  - "128-register cap (__launch_bounds__(512,1), as the 16-warp pass-1 CTA needs): 64,96 128 regs, STACK 0, 259.9 us (+12 %); 32,128 128 regs, STACK 8, 58.0 us (+4 %). The conv fits beside 8 other warps [probe_b200]"
+  - "smem budget for STEP 2 at 64,96: x ring 2 x 61.4 KB + d tile 48 KB + LN partials 14 KB = 186 KB, leaving ~41 KB for the W1' A ring (2 x 16 KB) and h staging. A double-buffered d tile does not fit, so d must be released per k16 step: CG=16 channels = exactly one k16 step of K=96, so the MMA warp can issue each hidden block's k16 step as soon as its channel group lands, the way G r9 overlapped the conv in channel rounds [INFERRED]"
+  - "Pass-1 projection from the gate: conv 233-260 us on the FMA/issue side; the tcgen05 MMA (18 x ~112 clk per tile, ~2k clk) is off the SIMT pipes; the A&S GELU epilogue (MUFU floor 133 us) runs on 6 other warps. If those overlap, pass 1 ~280-350 us vs G r7's 668, and the 64,96 row ~280-350 + 8 (K3) + 186 (G2) + 3 (K0) = ~480-550 us rented vs 857: within H43's <= 560 target. Unverified [INFERRED]"
+  - "Not done: STEP 2 (tcgen05 GEMM1 + epilogue warps), STEP 3 (GRN scale + cuBLASLt GEMM2 tail), run_tests, precision log. The shipped kernel.cu/binding.cpp are the r0 anchor byte-for-byte (16/16 in r0); i_tmaconv_gate.cu is preprocessed away (#if 0); a build with such an extra TU was checked [compile_b200]"
+  - "Pitfalls: b200probe Kernel args take Python int as int32 and b200probe.i64 as int64; a tensor map in global memory (opaque bytes copied to a device tensor) works as the TMA operand, but harness_time's shifted inputs then read the original x (fine for timing, not for correctness); cuTensorMapEncodeTiled needs cuuint64_t / cuuint32_t wrapped lists [probe_b200]"
+paths:
+  - {max_tokens: null, lang: cuda, width: 128, threads: 256, rows: 128, grid: persistent, mem: ldg, launches: 1, x: none, w: none, st: none, cluster: 1}
+runs_on:
+  H200: {runs: true, representative: false, note: "r0 anchor only; target_hardware B200"}
+  A100: {runs: true, representative: false}
+  L40S: {runs: true, representative: false}
+risks:
+  - "Ships nothing new: every row runs the r0 anchor; its value is the validated conv engine and the gate numbers"
+  - "The 233 us conv is still 2.2x its bound and runs at 260 us under the 128-reg cap; pass 1 may still land above 350 us if the GELU epilogue warps compete for issue slots with only 2 conv warps per SMSP"
+  - "STEP 2 needs a per-k16-step d release (no double-buffered d at 64,96) and a per-call tensor map for x"
+measure_first: [H200]
+compliance:
+  single_stream: true
+  no_cross_call_state: true
+  fp32_math: true
+  no_threads_or_fork: true
+  no_precompiled_binaries: true

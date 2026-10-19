@@ -1,15 +1,15 @@
 {
- "duration_api_ms": 1973414,
+ "duration_api_ms": 3659800,
  "stop_reason": "end_turn",
  "session_id": "c434c6ce-2d91-4a94-996e-05ec0a78081c",
- "total_cost_usd": 5.8315992,
+ "total_cost_usd": 15.567610000000002,
  "usage": {
-  "input_tokens": 22,
-  "cache_creation_input_tokens": 278164,
-  "cache_read_input_tokens": 2379554,
-  "output_tokens": 166665,
+  "input_tokens": 18,
+  "cache_creation_input_tokens": 493665,
+  "cache_read_input_tokens": 3444994,
+  "output_tokens": 254881,
   "output_tokens_details": {
-   "thinking_tokens": 57856
+   "thinking_tokens": 14205
   },
   "server_tool_use": {
    "web_search_requests": 0,
@@ -17,19 +17,19 @@
   },
   "service_tier": "standard",
   "cache_creation": {
-   "ephemeral_1h_input_tokens": 278164,
+   "ephemeral_1h_input_tokens": 493665,
    "ephemeral_5m_input_tokens": 0
   },
   "inference_geo": "global",
   "iterations": [
    {
     "input_tokens": 2,
-    "output_tokens": 54552,
-    "cache_read_input_tokens": 274042,
-    "cache_creation_input_tokens": 4122,
+    "output_tokens": 54724,
+    "cache_read_input_tokens": 483609,
+    "cache_creation_input_tokens": 54824,
     "cache_creation": {
      "ephemeral_5m_input_tokens": 0,
-     "ephemeral_1h_input_tokens": 4122
+     "ephemeral_1h_input_tokens": 54824
     },
     "type": "message"
    }
@@ -39,15 +39,15 @@
  },
  "modelUsage": {
   "claude-opus-5-5": {
-   "inputTokens": 20,
-   "outputTokens": 166662,
-   "cacheReadInputTokens": 2216596,
-   "cacheCreationInputTokens": 256870,
+   "inputTokens": 38,
+   "outputTokens": 421543,
+   "thinkingTokens": 72061,
+   "cacheReadInputTokens": 5661590,
+   "cacheCreationInputTokens": 750535,
    "webSearchRequests": 0,
-   "costUSD": 5.8315992,
+   "costUSD": 15.567610000000002,
    "contextWindow": 1000000,
    "maxOutputTokens": 128000,
-   "thinkingTokens": 57856,
    "canonicalModel": "claude-opus-5-5",
    "provider": "firstParty",
    "costBasis": "list"
@@ -83,17 +83,17 @@
  },
  "safety_stops": 0,
  "is_error": false,
- "num_turns": 10,
+ "num_turns": 9,
  "subtype": "success",
  "api_error_status": null,
- "ttft_ms": 176804,
+ "ttft_ms": 4663,
  "type": "result",
- "duration_ms": 2030951,
- "uuid": "ea56823b-840a-4fbc-8cb3-4cd29c5915a7",
- "ttft_stream_ms": 1570,
- "time_to_request_ms": 116,
- "first_content_frame_ms": 1570,
+ "duration_ms": 1927223,
+ "uuid": "58b49bdf-6afc-42cd-ac7b-b5426f88dfeb",
+ "ttft_stream_ms": 1656,
+ "time_to_request_ms": 114,
+ "first_content_frame_ms": 1657,
  "queued_turn_count": 0,
  "result_index": 0,
- "seconds": 2038.3
+ "seconds": 1934.2
 }

@@ -1,0 +1,96 @@
+id: r10-g-e2-g2-coop-v3
+parents:
+  - r9-g-e3-tc05-p1s
+operation: structural_mutation
+language: cuda_cpp
+niche:
+  lin: "G:E2:H42"
+  mem: tma-tensor
+  st: direct
+  grid: oneshot
+  launch: split
+  tile: token
+  red: cta
+  cache: default
+  spec: dispatch:size
+hypothesis: >-
+  One cooperative tcgen05 launch, g_g2, replaces K3 + cuBLASLt GEMM2 at 8,320 and 4,96, so those rows run 3 launches
+  instead of 4. Phase P loads every W2 row, gsum and gw in one round and builds A_b = fp16(W2*s_b) with K3's roundings;
+  b2' comes from K0. One flat grid barrier follows, with the h B-stages TMA-prefetched before it. A 4-stage TMA ring
+  (A 16 KB + B 32 KB) feeds 1SM 128x256x16 MMAs; at 4,96 the units are 112 tokens with a 6-stage ring. The epilogue
+  writes out = x + acc + b2' with x prefetched into registers and coalesced NCHW rows. Measured result (refuted):
+  16/16 pass, but 8,320 62.1 vs 58.5 us and 4,96 37.4 vs 37.2 us against r9-merge in the same container. g_g2 alone
+  takes 23.1 us cold at 8,320 (target <= 9; refutation line 14). The engine and layouts are correct; the fixed chain
+  (phase P, barrier, first A landing) plus an ingest-bound 1SM mainloop cost more than K3 + cuBLASLt.
+expected_effect:
+  S:
+    pct: 0
+    confidence: high
+  M:
+    pct: 0
+    confidence: medium
+  L:
+    pct: 1
+    confidence: medium
+resources_sm100a:
+  regs_per_thread: 128
+  smem_per_cta_bytes: 203000
+  threads_per_cta: 512
+  ctas_per_sm: 1
+  bytes_in_flight_per_sm: 196608
+  launches_per_call: 3
+knobs:
+  g2_8_320: "g_g2<320,256,4>: 96 units (3 c-tiles x 8 images x 4 chunks of 256 tokens; c-tile 3 half masked), KB=20 stages of 64 k, TMEM 256 cols, 148 CTAs cooperative"
+  g2_4_96: "g_g2<96,112,6> (g2mode 2, 112 units, all 6 stages prefetched); g_g2<96,224,4> (g2mode 1) measured 0.7-1.3 us slower"
+  phaseP: "CTA j < (148/B)*B: image j%B, rows j/B + (148/B)*warp (+16*(148/B)); W2 rows, gsum, gw loaded at entry in one round"
+  barrier: "module-level g2_bar_cnt/g2_bar_gen, atom.acq_rel arrive, last arriver resets the count and st.release bumps gen; waiters spin on ld.acquire"
+  k0: "extra nbb = C/8 blocks: b2'[c] = W2[c].gb + b2[c] (one warp per channel; also warms W2 into L2)"
+dispatch:
+  - {shape: "64,96,112,112", kernel: "K0 + g_pass1<96,...> + g_grn + cublasLt (unchanged)"}
+  - {shape: "32,128,64,64", kernel: "K0 + g_pass1<128,...> + g_grn + cublasLt (unchanged)"}
+  - {shape: "8,320,32,32", kernel: "K0 + g_tc<320,2,32,64,9> + g_g2<320,256,4>"}
+  - {shape: "4,96,56,56", kernel: "K0 + g_tc<96,2,56,128,6> + g_g2<96,112,6>"}
+  - {shape: "all others", kernel: "r0 anchor convnext_fused (fallback only; do not merge)"}
+tests:
+  - H42
+findings:
+  - "PRECISION SIM before any code (torch fp64 emulation of the shipped roundings, harness generator rules, seeds 0-3): at 8,320 (atol 2.4e-3) P0 fp16(W2*s_b).h16 max 1.77-1.91e-3 (74-80 %), 0 beyond; P1 task design fp16(W2).fp16(h16*s) 2.09-2.44e-3 (87-101 %), 1 element beyond atol at seed 0; P2 fp16(fp16(W2)*s).h16 84-97 %; P3 hi/lo B split 75-83 %. At 4,96 all variants pass (P1 73-78 %). The in-place B scale (twice-rounded hidden) is refuted at 8,320; only P0 or a 2-MMA split are safe [probe_b200]"
+  - "INFRA: the B200 backend was down for the first half of the session ('function ... is stopped' on compile and 5 probes); the work resumed later on a fresh container. /tmp files written by one probe did not survive into the resumed container, so probes must embed their full source [probe_b200]"
+  - "compile (sm_100a): g_g2<320,256,4> 128 regs, g_g2<96,224,4> 128, g_g2<96,112,6> 90, 0 B local/spill; 55 UTMALDG in the module. The engine (K-major SW128 A box 64x128 from a 2-D TMA map over B*C rows, MN-major SW128 B by 64x64 boxes, LBO 8192 SBO 1024 +2048 per k16, idesc N=256/224/112) was correct on the first build: run_tests 16/16 [compile_b200, run_tests]"
+  - "v1 (rolled phase-P loads, b2' in phase P, 4,96 N=224): run_tests 16/16; 8,320 64.1 vs 58.5 us, 4,96 40.5 vs 37.2 (r9-merge, same container) [run_tests]"
+  - "v1 stamps at 8,320 (probe, g_g2 after a 2xL2 flush, us from first CTA start, medians): phase P end 7.4 (about 6 serial DRAM rounds for gsum, gw, W2 rows and gb), barrier out 9.7, first stage ready 11.5, epilogue start 20.0, end 23.6; g_g2 alone 26.3 us, full chain (K0+P1+g_g2) 64.8 vs K0+P1 38.4 [probe_b200]"
+  - "AUDIT ITEM (1SM N=256 with TMA-fed operands): the MMA warp spans 13.6-15.1k clk for 20 stages = 681-755 clk per 64-k stage (170-190 clk per 128x256x16 instruction against the 128-clk ideal), 25-40 % of it waiting on full barriers, i.e. ~65-72 B/clk/SM of 48 KB stages. 1SM N=256 does NOT reach the MMA ideal when A and B both stream through TMA; it is ingest-bound like H31's 68-92 B/clk. N=128 units (192 > 148 SMs, not usable) ran 538 clk per 32 KB stage = 135 clk per instruction (near the ~105-128 floor) [probe_b200]"
+  - "v2 (all phase-P loads in one round at entry, gb prefetched): g_g2 alone 26.3 -> 23.1 us, full chain 64.8 -> 60.4 us at 8,320; phase P end 7.4 -> 5.1 us, barrier out 7.2, first stage 8.7, epilogue start 17.2, end 20.5. 4,96: N=224 g_g2 14.0 us, N=112 13.3 us (112 units, 457 clk per stage, waits 555 clk total). Max |err| vs the torch fp32 reference (seed 200): 1.73e-3 at 8,320, 1.89e-3 at 4,96 [probe_b200]"
+  - "v3 (shipped: b2' moved to K0, which also warms W2 into L2; both W2 rows per warp prefetched; 4,96 N=112): run_tests 16/16 incl. portal-order re-runs; 8,320 62.1 vs 58.5 us (+6.1 %), 4,96 37.4 vs 37.2 (tie), 64,96 / 32,128 unchanged code (864.4 / 227.2 vs 864.2 / 227.0) [run_tests]"
+  - "H42 verdict: REFUTED as built. The refutation clause fires: g_g2 alone is 23 us cold at 8,320, above 14. The single launch saves ~2 us of launch gap but adds a serial chain before the first MMA: phase P 2.6-5 us, barrier ~2 us (the release waits for the CTA's A_b stores to drain), first A landing ~1.5 us. The 1SM mainloop then runs at 1.33-1.47x the ideal on 96 of 148 SMs, and the epilogue takes ~3.3 us. cuBLASLt (11.3 us) plus K3 (8.9 us) is ~20 us. 4,96 is a tie, so the portal launch-count benefit may give it ~1 us there; that is noise-level [INFERRED]"
+  - "What would be needed to win at 8,320: drop the grid barrier by building A_b per (c-tile, image) in a 4-CTA group (dataflow counters, or a cluster of the 4 token-chunk units sharing a TMA multicast of A), or pair the GEMM (cta_group::2, M = 256 = 2 c-tiles, half the B ingest per SM) so the mainloop reaches ~512 clk per stage; together worth ~8-10 us of the 23. Folding gb or the scale into the hidden is ruled out by precision (P1, and F's r6 gb finding) [INFERRED]"
+  - "Precision of the shipped path: roundings equal K3's (fp16(W2*s_b) with s_b in the same fp32 order, h16 once), b2' is exact fp32 instead of hi/lo fp16, and GEMM accumulation order differs. run_tests 10 rounds x 16 rows pass; single-seed max |err| 1.73e-3 (8,320, 72 % of atol) / 1.89e-3 (4,96). The 10-round fp64 log was NOT run for v3 [probe_b200, run_tests]"
+  - "Pitfalls: tensor maps via cudaGetDriverEntryPointByVersion('cuTensorMapEncodeTiled', 12000) work on CUDA 13 without linking libcuda directly; a TMA box of 128 rows over a 96-row-per-image map is fine when masked rows are discarded in the epilogue; the PTX form is atom.acq_rel.gpu.global.add.u32 (not atom.add.acq_rel...) [compile_b200, run_tests]"
+paths:
+  - {max_tokens: 8192, lang: cuda, width: 128, threads: 512, rows: 2, grid: oneshot, mem: tma, launches: 3, x: none, w: none, st: none, cluster: 1}
+  - {max_tokens: 12544, lang: cuda, width: 128, threads: 512, rows: 2, grid: oneshot, mem: tma, launches: 3, x: none, w: none, st: none, cluster: 1}
+  - {max_tokens: 131072, lang: cuda, width: 128, threads: 512, rows: 2, grid: persistent, mem: ldg, launches: 4, x: none, w: none, st: none, cluster: 1}
+  - {max_tokens: null, lang: cuda, width: 128, threads: 512, rows: 2, grid: persistent, mem: ldg, launches: 4, x: none, w: none, st: none, cluster: 1}
+runs_on:
+  H200:
+    runs: false
+    representative: false
+    note: "tcgen05 / TMEM: sm_100a only (target_hardware B200)"
+  A100:
+    runs: false
+    representative: false
+  L40S:
+    runs: false
+    representative: false
+risks:
+  - "Merge-only candidate: 12 rows run the slow r0 anchor; 8,320 is slower than r9-merge (do not merge), 4,96 ties (merge only if the portal's launch-count effect is trusted)"
+  - "Cooperative launch of 148 CTAs needs 1 CTA/SM residency (203 KB smem); the grid-barrier counter is module-level state, self-reset by the last arriver"
+  - "10-round fp64 precision log not run for this build; roundings match the logged P0 class"
+measure_first:
+  - B200
+compliance:
+  single_stream: true
+  no_cross_call_state: true
+  fp32_math: true
+  no_threads_or_fork: true
+  no_precompiled_binaries: true
