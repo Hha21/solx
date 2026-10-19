@@ -13,12 +13,12 @@ clock-locked B200; submissions are made by hand.
 
 ## Where we are
 
-As of 2026-10-13. Our scores are private portal submissions. The public #1 column comes from the 2026-09-20 board
+As of 2026-10-20. Our scores are private portal submissions. The public #1 column comes from the 2026-09-20 board
 snapshot, except #129, which is the live board.
 
 | Board | Problem | Best | Public #1 |
 |---|---|---|---|
-| **L2 #129** | **`035_convnextv2_block_with_grn`** (7x7 depthwise conv, LayerNorm, MLP with GELU and GRN, residual; fp32; 16 sizes) | **0.7313** (`r8-merge`), 2nd on the live board | 0.7435 |
+| **L2 #129** | **`035_convnextv2_block_with_grn`** (7x7 depthwise conv, LayerNorm, MLP with GELU and GRN, residual; fp32; 16 sizes) | **0.7392** (`r10-merge`) | 0.7509 |
 | L1 #35 | `035_flux_ada_layer_norm_zero_modulation_extraction` | 0.6941 | 0.7945 |
 | L1 #88 | `088_rotary_position_embedding_application` | 0.6827 | 0.6978 |
 | L1 #85 | `085_geglu_activation` | 0.6755 | 0.6905 |
@@ -27,7 +27,7 @@ snapshot, except #129, which is the live board.
 | FlashInfer #218 | `009_gemm_n5120_k2048` | 0.4870 | 0.5356 |
 | L1 #30 | `030_attention_output_projection_with_residual` | 0.4529 | 0.5464 |
 
-### #129: 0.30 to 0.73 in eight rounds
+### #129: 0.30 to 0.74 in ten rounds
 
 | Round | Submission | What changed | Portal |
 |---|---|---|---|
@@ -39,9 +39,11 @@ snapshot, except #129, which is the live board.
 | r6 | `r6-merge` | D's tcgen05 kernel, its epilogue spill fixed, takes the wide-channel sizes | 0.6908 |
 | r7 | `r7-merge` | D's single-launch tcgen05 kernel reaches the small-channel sizes; new lineage G fuses conv, GEMM1, GELU and the GRN sums for the two largest | 0.7207 |
 | r8 | `r8-merge` | D runs its GEMM1 epilogue on all 16 warps; G extends to two more sizes; new lineage H (a dataflow work queue) is refuted | 0.7313 |
+| r9 | `r9-merge` | D defers its W2 pass and uses a flat grid barrier; D's GEMM2 runs as tcgen05 CTA pairs at 32,768; G moves GEMM1 to tcgen05 at 8,320 | 0.7359 |
+| r10 | `r10-merge` | a fresh ideas pool; D finds and removes a register spill in its 768-channel kernel and balances its tiles; G's custom GEMM2 and new lineage I are refuted | 0.7392 |
 
-Eight lineages (A-H) have been started so far. The lead has retired B, C, E and F and paused A, and H's first build was
-refuted in r8. The current submission routes the 16 sizes across four kernels from lineages D and G.
+Nine lineages (A-I) have been started so far. The lead has retired A, B, C, E, F and H, and I's first gate failed in
+r10. The current submission routes the 16 sizes across seven kernels from lineages D and G.
 
 ## How the loop works
 
@@ -94,7 +96,7 @@ flowchart TB
   best portal kernel and every new candidate alternately in one Modal container, since drift between containers is
   5-12 µs per size, larger than many real gains. It then projects each candidate's portal time using the
   portal/bench ratio that the candidate's own lineage shows on the portal. Projection vs result: r7 0.7208 vs 0.7207,
-  r8 0.7333 vs 0.7313.
+  r8 0.7333 vs 0.7313, r9 0.7351 vs 0.7359, r10 0.7392 vs 0.7392.
 - **Rules.** Before each submission, the operator checks the merged code against the leaderboard rules: no state
   carried between calls, accumulators zeroed inside each call, no PDL, no stream or graph tricks, and diagnostics
   compiled out.
