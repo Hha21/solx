@@ -1,0 +1,104 @@
+id: r10-d-e1-balanced-nostack
+parents:
+  - r9-d-e1-asynca
+  - r9-d-e2-pair-smemg
+operation: structural_mutation
+language: cuda_cpp
+niche:
+  mem: tma-tensor
+  st: direct
+  grid: persistent
+  launch: fused
+  tile: token
+  red: cta
+  cache: default
+  spec: dispatch:size
+hypothesis: >-
+  H41 (balanced image-straddling token ranges, no g, single-accumulator GEMM2 with the h tile scaled in place) is only
+  partly supported. GEMM1 balance pays: the GEMM1 end at 16,384 came 5.9 us earlier. But the scaled-B GEMM2, the
+  per-image gf pass and the KS red.add bytes give most of it back, so tc2 ships on 16,384 only. The larger win in this
+  file is the STEP 0(b) fix: the shipped r9 tc_kernel<768,49> spilled (128 regs, 120 B stack, 76 STL/LDL in the GELU and
+  g passes) because the deferred W2 conversion sat inside the GEMM1 epilogue tile loop. At C=768 it is now issued
+  before the loop: 105 regs, STACK 0, and 2.2-3.6 us faster on 8/16/32,768. The move is applied at C=768 only, because
+  at C=384 it cost about 0.7 us.
+expected_effect:
+  S:
+    pct: 0
+    confidence: medium
+  M:
+    pct: -3
+    confidence: medium
+  L:
+    pct: -3
+    confidence: low
+resources_sm100a:
+  regs_per_thread: 105
+  smem_per_cta_bytes: 232448
+  threads_per_cta: 512
+  ctas_per_sm: 1
+  bytes_in_flight_per_sm: 196608
+  launches_per_call: 1
+knobs:
+  tc2_rows: "16,384,14,14 only: NR1 12 (R1 264 tokens, N 272 = 128 + 144), NR2 24 (R2 136, N 144), KS 2, NGRP 1, NST2 4"
+  tc_kernel_768: "deferred W2 conversion before the GEMM1 epilogue tile loop (if constexpr C_ >= 768)"
+  tc_kernel_384: "unchanged r9 code"
+  sc_kernel: "unchanged"
+  TC_STAMPS: 0
+  TC2_STAMPS: 0
+dispatch:
+  - shapes: "16,384,14,14"
+    kernel: "tc2_kernel<384,196>"
+    meta: {grid: "num SMs, cooperative, 144 GEMM1 tiles, 144 GEMM2 units"}
+  - shapes: "2,768,7,7 8,768,7,7 16,768,7,7 32,768,7,7"
+    kernel: "tc_kernel<768,49> (stack-free)"
+    meta: {grid: "num SMs, cooperative"}
+  - shapes: "8,384,14,14"
+    kernel: "tc_kernel<384,196> (r9 code)"
+    meta: {grid: "num SMs, cooperative"}
+  - shapes: "C <= 192 rows, 1,160,449,7"
+    kernel: "sc_kernel (r9 code)"
+    meta: {}
+  - shapes: "8,320 / 32,128 / 64,96"
+    kernel: "convnext_fused (r0 anchor, merge-only)"
+    meta: {}
+tests:
+  - H41
+findings:
+  - "STEP 0(a) barrier read: arrive side = all threads fence.proxy.async.global + __syncthreads + one-thread atom.acq_rel.gpu (last arriver st.release); wait side = ld.acquire.gpu spin + __syncthreads, then the TMA warp runs fence.proxy.async.global before its first TMA in phases B and C. All required parts present; nothing added [code read]"
+  - "STEP 0(c) 1500-call stress, fixed inputs vs fp64 reference: 8,768 tc_kernel worst = first call 1.709e-3; 16,384 tc_kernel 1.910e-3 = first; 16,384 tc2 2.329e-3 = first. No drift; barrier verified, kept flat [probe_b200]"
+  - "STEP 0(b) STACK: the r9 shipped tc_kernel<768,49> is REG 128 STACK 120 (76 STL/LDL; STL inside the GELU chunk loop, LDL.S16 reloads of hreg halves in the g pass); tc_kernel<384,196> 102/0. compile_b200's '0 B local' does not show stack frames, so use cuobjdump -res-usage. Moving the in-loop tc_w2_work call ahead of the tile loop gives 105 regs / STACK 0. Dead ends that kept STACK 120: tld16 halves in the GEMM2 7x7 drain; LN-stat loads split in two; uk/vk/gwk loads after the barrier. sc_kernel STACK not checked this round [probe_b200]"
+  - "Spill fix timed in-container interleaved x3 (parent vs fixed, us): 2,768 24.3-24.4 vs 23.9-24.0; 8,768 32.3-32.4 vs 30.1-30.2; 16,768 43.5-43.6 vs 41.1-41.2; 32,768 65.0-65.3 vs 61.6-61.7 (r9-merge pair path 61.6 in run_tests); 8,384 33.6 vs 34.4 and 16,384 51.3-51.5 vs 52.0 (worse at C=384, so applied at C=768 only). Outputs within 2e-6 of the unchanged path; max err vs fp64 1.48-1.70e-3 [probe_b200]"
+  - "tc2 v1 (4-warp stage-owner groups, KS 4 everywhere) run_tests 16/16 PASS first build. In-container vs r9-merge: 8,768 35.7 vs 32.9; 16,768 45.6 vs 44.2; 16,384 51.6 vs 51.7; 8,384 34.8 vs 33.9; 32,768 66.5 vs 61.6 [run_tests]"
+  - "Stamps at 16,384 (globaltimer ~1 us granular, CTA median/max from first start): GEMM1 end parent 26.9/35.1 vs tc2 27.1/29.2 (max 5.9 us earlier, success bar >= 4 met); sync 2 at 37.6 vs 30.7. GEMM2 then took 19 us in tc2 vs 12.5 in the parent: s ready +2.0 us after sync 2, first stage ready +3.6 us later, 6 stages first->last 5.6 us (~1.1 us/stage vs the parent's 0.55 us/48 KB stage), drain 5-7 us. Refutation clause 'scaled-B stages > 1.3x parent' fires (2x at 16,384) [probe_b200]"
+  - "tc2 v2 (all 12 warps scale every stage, gw slice loaded with gsum, half2 d16 stores, runtime K-slice stride, KS 2 with half-width GEMM2 ranges at 16,384/32,768) run_tests 16/16: 16,384 49.1 vs 51.7 (-5 %); 8,768 37.5 (worse: 12 warps synchronising per small 32 KB stage); 16,768 45.6; 8,384 34.2 vs 33.9; 32,768 66.7. Interleaved x3 at 16,384 (exact tc2 code): 50.2/52.9/50.3 vs 51.1/51.1/50.9, a ~1 us gain [run_tests, probe_b200]"
+  - "Why tc2 cannot win at 7x7 or small N: with the ~105 clk floor per 1SM MMA for N <= 128, GEMM1 tile time does not fall when the tile narrows (8,768: 80- vs 112-column tiles, same 12 x 4 x ~105 clk mainloop). Per-CTA gf over <= 7 images (up to 86 KB of L2 reads after sync 2) and red.add volume (out x KS, ~4 TB/s) add 2-5 us. Balance pays only where the parent ran 2-tile tails with wide N (16,384) [INFERRED from stamps]"
+  - "PRECISION LOG tc2 (fp64 reference, harness generators, torch.manual_seed(200), 10 rounds): 16,384 max|err| 2.292e-3 vs atol 3.3e-3 (69 %), 0 beyond; 8,384 2.248e-3 vs 2.8e-3 (80 %), 0 beyond, not shipped. The hidden is rounded twice (fp16 h, then fp16(h*s)): sc class, no hi/lo split needed. The tc_kernel<768> change keeps arithmetic and order, so the r8 log stands (59-65 %) [probe_b200]"
+  - "NOT DONE: run_tests of this exact final file (it combines run_tests-verified tc2 code with the probe-verified C=768 change); evict_first on W1/W2 loads; 2,768 tc2 (B*HW = 98 is not a multiple of 8); STEP 4 GEMM2 per-stage stamps at 8,768 [INFERRED]"
+paths:
+  - {max_tokens: 6272, lang: cuda, width: 128, threads: 512, rows: 128, grid: persistent, mem: tma, launches: 1, x: none, w: none, st: none, cluster: 1, note: "tc_kernel<768,49> stack-free on 2/8/16/32,768; tc_kernel<384,196> r9 on 8,384; tc2_kernel<384,196> on 16,384"}
+  - {max_tokens: 12544, lang: cuda, width: 128, threads: 384, rows: 128, grid: persistent, mem: tma, launches: 1, x: none, w: none, st: none, cluster: 1, note: "sc_kernel unchanged on the C <= 192 rows and 1,160"}
+  - {max_tokens: null, lang: cuda, width: 128, threads: 256, rows: 128, grid: persistent, mem: ldg, launches: 1, x: none, w: none, st: none, cluster: 1, note: "r0 fp32 anchor on 8,320 / 32,128 / 64,96 (merge-only)"}
+runs_on:
+  H200:
+    runs: false
+    representative: false
+    note: "tcgen05/TMEM are sm_100a-only"
+  A100:
+    runs: false
+    representative: false
+  L40S:
+    runs: false
+    representative: false
+risks:
+  - "This exact file was not run through run_tests: run it (16/16 plus portal-order re-runs) before merging"
+  - "32,768 on this file ties the r9 pair path (61.7 vs 61.6); the merge should take the better of the two"
+  - "16,384 tc2 gain is about 1-2.6 us rented, near portal noise"
+  - "sc_kernel STACK was not checked this round"
+measure_first:
+  - B200
+compliance:
+  single_stream: true
+  no_cross_call_state: true
+  fp32_math: true
+  no_threads_or_fork: true
+  no_precompiled_binaries: true

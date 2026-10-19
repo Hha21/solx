@@ -1,0 +1,57 @@
+id: r10-i-e3-gate-unrun
+parents: [r0-convnext-coop-fp32-anchor]
+operation: new_design
+language: cuda_cpp
+niche:
+  mem: ldg128
+  st: direct
+  grid: persistent
+  launch: fused
+  tile: rows128
+  red: cta
+  cache: default
+  spec: all
+hypothesis: >-
+  H43 (lineage I seed). Not tested: the B200 Modal function was stopped for the whole session, so every probe_b200
+  and compile_b200 call failed and no GPU measurement exists. The shipped code is the unchanged r0 anchor on all 16
+  rows. The STEP 1 gate kernel is a bulk-staged, register-blocked conv with padded rows and fp16 d written into the
+  SW128 B layout. It is kept disabled in i_gate_conv.cu for the next lineage-I session, which should run STEP 1 first.
+expected_effect:
+  S: {pct: 0, confidence: high}
+  M: {pct: 0, confidence: high}
+  L: {pct: 0, confidence: high}
+resources_sm100a:
+  regs_per_thread: 128
+  smem_per_cta_bytes: 70208
+  threads_per_cta: 256
+  ctas_per_sm: 2
+  bytes_in_flight_per_sm: 65536
+  launches_per_call: 1
+knobs: {GATE_64_96: "R2 PW7 CG16 NS2 DBUF1 288thr 188480B", GATE_32_128: "R4 PW4 CG16 NS3 DBUF1 220224B or R2 PW4 CG16 NS3 DBUF2 187456B"}
+tests: [H43]
+findings:
+  - "INFRA: every B200 call this session (probe_b200 x4, compile_b200 x1) failed with 'Modal call failed: ConflictError: function ... is stopped'. Only get_kernel and predict_score worked. No STEP 1/2/3 number exists, H43 stays open, and no run_tests was possible [probe_b200, compile_b200]"
+  - "b200probe API (read before the outage): cuda_kernel(src, name, opts) -> Kernel; Kernel.set_smem(nbytes) raises the dynamic-smem limit; Kernel(grid, block, *args, smem=N, stream=None) passes tensors as pointers, Python int as int32, b200probe.i64 as int64, float as fp32. Kernel names need extern \"C\" [probe_b200]"
+  - "smem arithmetic for the H43 tile at 64,96 (desk): a 16-channel x stage with padded rows is 16 x 8 rows x 120 floats = 62.5 KB (57 KB unpadded); 2 stages + one 48 KB d tile (224 tokens padded to 4 x 64-token chunks x 96 ch x 2 B) + 14 KB LN partials = 188.5 KB. A double-buffered d tile (+48 KB) plus a 2 x 16 KB W1' ring does not fit in 227 KB. So STEP 2 must either use a single d buffer released per k16 step (CG=16 channels = exactly one k16 step of K=96, so the MMA can consume each channel group as it lands) or 8-channel stages split across two halves of the conv warps [INFERRED]"
+  - "lane-mapping constraint (desk): with 8 conv warps (256 lanes) and one channel-patch per lane, CG x (W/PW) must equal 256. At W=112 the 2x8 patch of the brief gives 14 patches per channel (66 % lane use at CG=12); 2x7 gives 16 patches, so CG=16 maps exactly. 2x7 needs 8 rows x 13 scalar LDS = 104 LDS per 686 FMA (6.6 FMA/LDS). Its start column 7j+1 is unaligned, so no LDS.128. A channel stride of 16 mod 32 words makes the two channels of a warp bank-disjoint (stride-7 lanes give 16 distinct banks per channel) [INFERRED]"
+  - "L2->SM ingest at R=2 (desk): 96 ch x 8 rows x 448 B = 344 KB per 224-token tile, 8.3 MB per SM over 24.2 tiles. At 94 GB/s/SM (G r9 bulk-ring microbench) that is 88 us against the 102 us FMA bound at 1.95 GHz, so ingest is nearly co-binding and a 2-stage ring must cover ~1-2k clk of L2 latency per 1.37k-clk group. Modes 1/2 of the gate (no-copy and copy-only) are there to separate the two. R=4 (2.5x halo) cuts ingest by 38 % but quantises to 13 tiles per CTA on 12.1 [INFERRED]"
+  - "32,128 tile choice (desk): R=3 needs a partial last strip (64 % 3 != 0); R=4 gives N=256 (MMA at ideal), 4x4 patches with 3 LDS.128 per row (784 FMA / 30 LDS), 16 strips x 32 = 512 tiles (3.46 per CTA, 13 % quantisation); R=2 gives 1024 tiles (6.9 per CTA) at N=128 (1.65x MMA floor, still far below conv time). The gate times both [INFERRED]"
+  - "gate kernel desk-check fix: the 32,128 R=4 NS=3 variant needs 220224 B dynamic smem, not 220000; the comment in i_gate_conv.cu carries the correct per-variant sizes [INFERRED]"
+  - "predict_score: L band -5 % alone = 0.7399 vs 0.7359; a 10 % L-band cut is worth +0.0080 [predict_score]"
+paths:
+  - {max_tokens: null, lang: cuda, width: 128, threads: 256, rows: 128, grid: persistent, mem: ldg, launches: 1, x: none, w: none, st: none, cluster: 1}
+runs_on:
+  H200: {runs: true, representative: false, note: "r0 anchor only; target_hardware set to B200"}
+  A100: {runs: true, representative: false}
+  L40S: {runs: true, representative: false}
+risks:
+  - "Ships nothing new: the merge takes no row from this candidate. Its value is the gate kernel source and the smem/lane arithmetic"
+  - "i_gate_conv.cu is compiled as an empty translation unit (#if 0); the gate code inside has never been compiled, so expect first-compile fixes"
+  - "The H43 smem budget at 64,96 does not close with a double-buffered d tile; STEP 2 needs a k16-granular single d buffer or 8-channel stages"
+measure_first: [H200]
+compliance:
+  single_stream: true
+  no_cross_call_state: true
+  fp32_math: true
+  no_threads_or_fork: true
+  no_precompiled_binaries: true

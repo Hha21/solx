@@ -1,0 +1,92 @@
+id: r10-g-e2-g2-coop
+parents:
+  - r9-g-e3-tc05-p1s
+operation: structural_mutation
+language: cuda_cpp
+niche:
+  lin: "G:E2:H42"
+  mem: tma-tensor
+  st: direct
+  grid: oneshot
+  launch: split
+  tile: token
+  red: cta
+  cache: default
+  spec: dispatch:size
+hypothesis: >-
+  At 8,320 and 4,96, K3 plus the cuBLASLt GEMM2 (20.2 / 12.2 us rented) are replaced by one cooperative tcgen05 launch,
+  g_g2, so these rows run 3 launches instead of 4. Phase P computes s_b and writes A_b = fp16(W2*s_b) with K3's
+  arithmetic, and the image-0 CTAs write b2' in fp32. The h B-stages are TMA-prefetched before one flat
+  self-resetting grid barrier. After it, a 4-stage TMA ring (A 16 KB + B 32 KB) feeds 1SM 128x256x16 MMAs into one
+  TMEM accumulator, 96 units at 8,320 and 56 at 4,96. The epilogue writes out = x + acc + b2' in coalesced NCHW rows,
+  with x prefetched into registers. The task's in-place B scale was dropped because it fails precision (findings).
+  Estimate: g_g2 ~10-11 us at 8,320 and ~6 us at 4,96, so rows ~49-50 / ~31 us rented. UNTESTED: the B200 backend
+  was down for the whole session; the code has never been compiled.
+expected_effect:
+  S:
+    pct: 0
+    confidence: high
+  M:
+    pct: -3
+    confidence: low
+  L:
+    pct: -3
+    confidence: low
+resources_sm100a:
+  regs_per_thread: 128
+  smem_per_cta_bytes: 203000
+  threads_per_cta: 512
+  ctas_per_sm: 1
+  bytes_in_flight_per_sm: 196608
+  launches_per_call: 3
+knobs:
+  g2_8_320: "g_g2<320,256,4>: 96 units (3 c-tiles x 8 images x 4 chunks of 256 tokens; c-tile 3 is half zero), KB=20 stages of 64 k, TMEM 256 cols, 148 CTAs cooperative (52 do phase P only)"
+  g2_4_96: "g_g2<96,224,4> (56 units, default g2mode 1) or g_g2<96,112,6> (112 units, g2mode 2): time both, pick in binding"
+  phaseP: "CTA j < (148/B)*B handles image j%B, rows c = j/B + (148/B)*m, one row per warp, W2 row prefetched before the s_b reduce"
+  barrier: "module-level g2_bar_cnt/g2_bar_gen, atom.acq_rel arrive, last arriver resets the count and st.release bumps gen; waiters spin on ld.acquire (no nanosleep)"
+  roles: "warp 0 TMA producer, warp 1 MMA issuer (elect.sync issue only, whole-warp loops), all 16 warps epilogue (2 items of 32x32 each at N=256)"
+dispatch:
+  - {shape: "64,96,112,112", kernel: "K0 + g_pass1<96,...> + g_grn + cublasLt (unchanged)"}
+  - {shape: "32,128,64,64", kernel: "K0 + g_pass1<128,...> + g_grn + cublasLt (unchanged)"}
+  - {shape: "8,320,32,32", kernel: "K0 + g_tc<320,2,32,64,9> + g_g2<320,256,4>"}
+  - {shape: "4,96,56,56", kernel: "K0 + g_tc<96,2,56,128,6> + g_g2<96,224,4>"}
+  - {shape: "all others", kernel: "r0 anchor convnext_fused (fallback only; do not merge)"}
+tests:
+  - H42
+findings:
+  - "PRECISION SIM (torch fp64 emulation of the shipped roundings: d16, LN stats of d16, fp16(lnw*W1), u = rowsum of fp16 W1', exact GELU, h16, sumsq from unrounded g; harness generator rules; seeds 0-3 via torch.Generator, not the harness seed 200). 8,320 (atol 2.4e-3): P0 current fp16(W2*s_b).h16 max 1.77-1.91e-3 (74-80 %), 0 beyond; P1 task design fp16(W2).fp16(h16*s) max 2.09-2.44e-3 (87-101 %), 1 element beyond atol at seed 0; P2 fp16(fp16(W2)*s).h16 2.02-2.33e-3 (84-97 %), 0 beyond; P3 hi/lo B split 1.81-1.99e-3 (75-83 %). 4,96 (atol 2.8e-3): P0 61-70 %, P1 73-78 %, P2 65-76 %, P3 62-68 %, all 0 beyond. P1 is refuted at 8,320 and P2 has no margin; only P0 or a 2-MMA hi/lo split meet the 0-beyond bar [probe_b200]"
+  - "Design consequence: the B-tile in-place scale (and HFMA2 hi/lo-s variants of it, which give the same fp16(h16*s)) is dead at 8,320. A cheaper fix than hi/lo-B (2x MMA = ~20k clk per unit at N=256): build A_b = fp16(W2*s_b) once per image inside g_g2 (3.3M elements over 148 CTAs, ~22K per CTA) before one flat grid barrier. This keeps P0 roundings exactly (b2' now fp32 instead of hi/lo fp16) and makes the mainloop a pure TMA->MMA ring with no in-ring work [INFERRED]"
+  - "Rejected alternatives (arithmetic only): per-stage A build from fp32 W2 by producer warps needs 64 KB of L2->SM per 64-k stage (125 B/clk at the N=256 MMA ideal, above the 68-92 B/clk measured in H31) and 256 regs/lane per warp-owned stage; per-CTA private A build is 655 KB fp32 per CTA (~4 us); tokens-as-M orientation needs N=160x2 MMAs at the 105-clk floor (16.8k clk per 128-token unit) [INFERRED]"
+  - "INFRA: the B200 backend (Modal function) was stopped for the whole session after the first probe: compile_b200 and 5 probe_b200 calls all returned 'function is stopped'. Nothing in g_g2 was compiled, validated or timed. Desk check found and fixed one PTX error (atom.add.acq_rel.gpu.global.u32 -> atom.acq_rel.gpu.global.add.u32) [compile_b200, probe_b200]"
+  - "OWED before any merge: compile_b200 (regs <= 128, STACK 0, UTMALDG/UTCHMMA present); standalone g_g2 vs torch (x + W2_b.h + b2') at both rows; harness_time of the 3-launch vs 4-launch pipeline interleaved x3 at 8,320 / 4,96; g_g2 cold alone (target <= 9 / <= 4.5 us); G2_STAMPS=1 build to report clk per 128x256x16 instruction (stp[4]-stp[6] over 4*KB) for the audit; N=224 vs N=112 at 4,96; run_tests 16/16 with portal-order re-runs; 10-round fp64 precision log (P0 class, expected 74-82 % at 8,320) [INFERRED]"
+  - "Risks to check first: TMA box rows (128) larger than the A map's per-image rows at C=96 (the 2-D map spans B*C rows, so only the last image hits OOB fill; the junk rows are masked in the epilogue); mbarrier tx counts for partially OOB B boxes at the image end of 4,96 (TMA counts full box bytes); cudaGetDriverEntryPointByVersion availability on the portal's CUDA 13.1 [INFERRED]"
+paths:
+  - {max_tokens: 8192, lang: cuda, width: 128, threads: 512, rows: 2, grid: oneshot, mem: tma, launches: 3, x: none, w: none, st: none, cluster: 1}
+  - {max_tokens: 12544, lang: cuda, width: 128, threads: 512, rows: 2, grid: oneshot, mem: tma, launches: 3, x: none, w: none, st: none, cluster: 1}
+  - {max_tokens: 131072, lang: cuda, width: 128, threads: 512, rows: 2, grid: persistent, mem: ldg, launches: 4, x: none, w: none, st: none, cluster: 1}
+  - {max_tokens: null, lang: cuda, width: 128, threads: 512, rows: 2, grid: persistent, mem: ldg, launches: 4, x: none, w: none, st: none, cluster: 1}
+runs_on:
+  H200:
+    runs: false
+    representative: false
+    note: "tcgen05 / TMEM: sm_100a only (target_hardware B200)"
+  A100:
+    runs: false
+    representative: false
+  L40S:
+    runs: false
+    representative: false
+risks:
+  - "UNTESTED: never compiled or run (backend down all session); must pass compile_b200, a torch check and run_tests 16/16 before any merge"
+  - "Merge-only candidate: 12 rows run the slow r0 anchor; only 8,320 and 4,96 change vs the parent (64,96 / 32,128 code paths identical)"
+  - "Cooperative launch of 148 CTAs needs 1 CTA/SM residency (203 KB smem); the grid barrier counter is module-level state, self-reset by the last arriver"
+  - "4,96 default uses 56 units of N=224 (56 SMs busy); the 112-unit N=112 variant may be faster and is one g2mode switch away"
+  - "fp32 GEMM accumulation order differs from cuBLASLt; roundings equal the logged P0 class, but the 10-round log must be redone on the built kernel"
+measure_first:
+  - B200
+compliance:
+  single_stream: true
+  no_cross_call_state: true
+  fp32_math: true
+  no_threads_or_fork: true
+  no_precompiled_binaries: true

@@ -1,0 +1,8 @@
+{
+ "is_error": true,
+ "subtype": "timeout",
+ "stderr": "",
+ "session_id": "d3ca2392-98fe-4c88-8ddb-928d86d52bcf",
+ "seconds": 5400.1,
+ "total_cost_usd": 1.6875655999999999
+}

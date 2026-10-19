@@ -1,0 +1,33 @@
+id: r10-merge
+parents:
+- r9-merge
+- r10-d-e1-balanced-nostack
+operation: repair
+language: cuda_cpp
+niche:
+  cache: default
+  grid: oneshot
+  launch: split
+  mem: bulk1d
+  red: warp
+  spec: dispatch:size
+  st: direct
+  tile: rows8
+hypothesis: 'Operator per-workload merge: Per-workload merge (loop/merge.py, kernels unchanged) of r9-merge with r10-d-e1-balanced-nostack
+  on 1,192,28,28, 16,384,14,14, 16,768,7,7, 2,96,56,56, 4,192,28,28, 8,768,7,7, where they beat it side by side. Projected
+  portal score 0.7392 (best 0.7359).'
+dispatch:
+- kernel: r10-d-e1-balanced-nostack
+  shapes: 2,96,56,56 8,768,7,7 16,768,7,7 16,384,14,14 4,192,28,28 1,192,28,28
+- kernel: r7-g-e1-fusedp1-mma
+  shapes: 64,96,112,112 32,128,64,64
+- kernel: r8-d-e1-allwarp-epi
+  shapes: 1,160,449,7 1,96,56,56 8,384,14,14 8,192,28,28
+- kernel: r8-g-e2-singletile
+  shapes: 4,96,56,56
+- kernel: r9-d-e1-asynca
+  shapes: 2,768,7,7
+- kernel: r9-d-e2-pair-smemg
+  shapes: 32,768,7,7
+- kernel: r9-g-e3-tc05-p1s
+  shapes: 8,320,32,32
