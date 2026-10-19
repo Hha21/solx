@@ -89,8 +89,10 @@ get_kernel, read_example). No other tools are available. When you are done, your
 candidate in the OUTPUT CONTRACT format (fenced blocks), with its design card including paths and findings."""
 
 
-RESUME_NOTE = """Your session was cut off by a usage limit; the tools are available again (with a fresh GPU budget for
-this resumed part, so spend it on finishing, not on starting over). Everything you did before is above. Continue the
+RESUME_NOTE = """Your session was cut off (by a usage limit, or by the rented B200 dropping out: tool calls failing with
+"function ... is stopped"); the tools work again, with a fresh GPU budget for this resumed part, so spend it on
+finishing, not on starting over. Everything you did before is above; if you handed in a placeholder candidate because
+the tools were down, this replaces it (give the new kernel a new name). Continue the
 experiment from where you stopped, keep the remaining steps short, then reply with exactly one candidate in the OUTPUT
 CONTRACT format, with the card's findings covering what you measured before and after the interruption."""
 
