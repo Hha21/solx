@@ -256,7 +256,9 @@ def leader_gap_text():
     try:
         sys.path.insert(0, str(ROOT / "poc"))
         import leader_gap
-        return leader_gap.report()
+        import sol_targets
+        live = sol_targets.LIVE_FIRST.get(problem.current().name)      # the live board's #1 when we have it
+        return leader_gap.report([live] if live else None)
     except Exception as e:
         return f"(unavailable: {e})"
 
@@ -273,6 +275,11 @@ def evidence_sections(arc, effects=True):
            f"=== LAB NOTEBOOK ===\n{prompts.lab_notebook(arc, limit=260)}",
            f"=== PORTAL RESULTS (best first) ===\n{calib or '(none yet)'}",
            f"=== LEADER GAP (what the public top scores imply; poc/leader_gap.py) ===\n{leader_gap_text()}"]
+    try:
+        import sol_targets
+        out.append(f"=== SOL TARGETS (loop/sol_targets.py) ===\n{sol_targets.targets_text()}")
+    except Exception as e:                      # a failure here must never break a round
+        out.append(f"=== SOL TARGETS (loop/sol_targets.py) ===\n(unavailable: {e})")
     if effects:
         try:
             eff = emulator.effects_markdown(emulator.Emulator(arc))

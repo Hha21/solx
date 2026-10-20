@@ -75,7 +75,7 @@ def report(scores=None):
     p = problem.current()
     lb, date = leaderboard_scores(p.name)
     if scores:
-        lb = dict(zip(("s1", "s2", "s3", "s5"), scores))
+        lb, date = dict(zip(("s1", "s2", "s3", "s5"), scores)), "live figures given"
     rows = our_rows(p.name)
     if not rows:
         return f"(leader gap: no portal results for {p.name} yet)"
