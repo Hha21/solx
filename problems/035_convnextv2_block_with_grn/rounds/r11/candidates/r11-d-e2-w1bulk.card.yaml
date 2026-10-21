@@ -1,0 +1,101 @@
+id: r11-d-e2-w1bulk
+parents:
+  - r10-d-e1-balanced-nostack
+operation: structural_mutation
+language: cuda_cpp
+niche:
+  mem: bulk1d
+  st: direct
+  grid: persistent
+  launch: fused
+  tile: token
+  red: cta
+  cache: default
+  spec: dispatch:size
+hypothesis: >-
+  H44 (REFUTED). The idea: phase A's W1 fp32 stream (12 LDG.128 per lane, about 4 TB/s) is limited by load-issue
+  rate, so cp.async.bulk copies of each CTA's contiguous W1 rows (up to 64 KB into the free ring tail, converted from
+  smem with unchanged arithmetic) would reach 6.5 TB/s or more and move sync 1 earlier by 1.5 us or more. Measured:
+  after the harness flush the W1 read runs at the dirty-L2 DRAM read cap (about 5.1-5.2 TB/s) whether it uses LDG or
+  bulk copies, at any chunking. In the kernel the bulk W1 lands later (4.2 us median at 8,768) and the rows are
+  0.2-0.9 us slower. The in-ring fp32 W1 conversion gate (variant B) costs 3.2-4x the fp16 ring per stage (limit
+  1.25x), so variant B was not built. Shipped as the record of a negative result, with TC_W1BULK=1; TC_W1BULK=0
+  rebuilds the parent path.
+expected_effect:
+  S:
+    pct: 2
+    confidence: high
+  M:
+    pct: 1.5
+    confidence: high
+  L:
+    pct: 0
+    confidence: high
+resources_sm100a:
+  regs_per_thread: 105
+  smem_per_cta_bytes: 232448
+  threads_per_cta: 512
+  ctas_per_sm: 1
+  bytes_in_flight_per_sm: 65536
+  launches_per_call: 1
+knobs:
+  TC_W1BULK: 1
+  TC_W1CH: 65536
+  TC_PA_W1: "128 KB (W1 rows in ring [128 KB, 192 KB), <= 21 rows x 3 KB at C=768, <= 11 x 1.5 KB at C=384)"
+  tc2_rows: "unchanged (16,384 only; tc2 phase A keeps the LDG W1 path)"
+  sc_kernel: "unchanged"
+dispatch:
+  - shapes: "16,384,14,14"
+    kernel: "tc2_kernel<384,196> (r10 code)"
+    meta: {grid: "num SMs, cooperative"}
+  - shapes: "2,768,7,7 8,768,7,7 16,768,7,7 32,768,7,7 8,384,14,14"
+    kernel: "tc_kernel with bulk W1 (TC_W1BULK=1)"
+    meta: {grid: "num SMs, cooperative"}
+  - shapes: "C <= 192 rows, 1,160,449,7"
+    kernel: "sc_kernel (r9 code)"
+    meta: {}
+  - shapes: "8,320 / 32,128 / 64,96"
+    kernel: "convnext_fused (r0 anchor, merge-only)"
+    meta: {}
+tests:
+  - H44
+findings:
+  - "STEP 0 resources (cuobjdump -res-usage on probe builds of the tc path, sm_100a): parent LDG path tc_kernel<768,49>/<384,196> 105/102 regs STACK 0; bulk path 105/102 STACK 0; stamped builds 107/102 (LDG) and 106/104 (bulk), STACK 0. The full shipped file's tc_kernel is the same code as the probe build [probe_b200]"
+  - "STEP 1 parent stamps (globaltimer base + per-CTA clock64 deltas, median/max over CTAs, median of 8 flushed runs, us from first CTA start) at 8,768: copies issued 1.47/2.98, planes landed 2.63/3.61, conv end 4.03/4.83, W1 LDG issued 1.94/3.56, phase A end 5.78/7.03, sync-1 release 9.38/9.71, GEMM1 end 17.81/18.96, sync 2 20.95/21.12, end 27.78/28.16 [probe_b200]"
+  - "STEP 1 parent stamps at 32,768: planes 3.57/4.37, conv end 7.55/8.59, W1 issued 2.08/4.29, phase A end 10.15/11.60, sync 1 14.00/14.55, GEMM1 end 33.62/39.92, sync 2 42.20/42.47, end 58.88/59.90. At 2,768: planes 2.36/2.88, conv 3.33/3.84, phase A end 4.66/5.44, sync 1 7.72/8.06, GEMM1 end 11.61/15.00, end 16.64/22.14 [probe_b200]"
+  - "Variant A stamps (single 64 KB bulk copy per CTA after the planes): 8,768 planes 2.13/3.20, conv end 3.21/4.76, W1 landed 4.20/6.10, phase A end 5.43/6.98, sync 1 8.92/9.15 (-0.46 us), GEMM1 end 17.69, end 27.65; 32,768 W1 landed 8.56/10.08, phase A end 9.79/11.19, sync 1 12.96/13.55 (-1.04 us), GEMM1 end 32.82, end 58.24; 2,768 sync 1 8.03 (+0.31). Success line (sync 1 >= 2 us earlier) missed at both rows [probe_b200]"
+  - "Interleaved x3 harness_time, parent LDG (u0) vs bulk (u1), unstamped builds from one source, us: 2,768 23.65/23.65/23.71 vs 24.50/24.48/24.53; 8,768 30.11/30.08/29.50 vs 30.30/30.04/30.34; 16,768 40.38/40.52/40.52 vs 41.44/41.37/41.31; 32,768 61.20/61.34/61.36 vs 62.14/61.94/61.87; 8,384 33.87/33.86/33.82 vs 34.11/34.11/34.18. Every row is worse; the refutation clause 'every shipped row within 1 us' fires [probe_b200]"
+  - "Core-assumption microbench (148 x 512 threads, each CTA reads its 64 KB share of a 9.4 MB fp32 W1 after the 2xL2 flush, harness_time): empty kernel 1.95-2.02 us; one 64 KB bulk copy 5.42-5.44; serial 4 KB chunks 5.44-5.47; serial 16 KB 5.36-5.44; 32 lanes x 1/2/4 KB 5.66-5.68 / 5.44-5.49 / 5.36-5.44; parent pattern 12 LDG.128 per lane 5.63-5.65. Bulk is at most 0.2 us faster than LDG in isolation, and chunk size does not matter [probe_b200]"
+  - "W1 read rate after the flush (LDG, baseline with a 1-row DRAM touch 2.62 us): 9.4 MB 4.45 us, 18.8 MB 6.22 us. That is about 0.7 us first-round latency plus about 5.1-5.2 TB/s marginal, the dirty-L2 read cap, so the 'LSU-issue term' premise of H44 is false. In phase A the stream shares DRAM with the x reads and the out/d16/w1h writes, so about 4 TB/s there is expected [probe_b200]"
+  - "Variant B gate v1 (96 CTAs, 4 per W1 slice, 12 stages of FLOAT32 TMA box {64 k,128 rows} SWIZZLE_NONE, 3 slots, 4 or 8 converter warps folding lnw, cvt.rn.f16x2 and writing SW128 K-major A + fence.proxy.async + arrive, MMA N=112/176 against a bulk-landed B): steady 1322-1387 clk/stage cold, 1370 warm, vs fp16 ring 407-443 warm and 594-644 cold. First stage ready 4500-4900 clk cold vs 2750-2900 [probe_b200]"
+  - "Variant B gate v2 (fp32 A as two SW128 FLOAT32 boxes of 32x128, 4 decoupled fp32 slots plus 2 AB stages, separate A and B producer warps): 1677-1716 clk/stage cold and warm vs fp16 533-634; no better than v1. Converter count (4 vs 8) and L2 warmth do not matter, so the fp32 landing/ring round trip binds, not the conversion arithmetic. Gate ratio 3.2-4x vs the 1.25x limit: in-ring W1 not built [probe_b200]"
+  - "run_tests 16/16 PASS (portal-order re-runs included), this vs r10-merge in one container, single timing, us: 2,768 24.6 vs 24.2; 8,768 30.3 vs 30.1; 16,768 41.3 vs 40.5; 32,768 60.7 vs 61.6 (the merge path there is the r9 pair kernel; the interleaved probe showed bulk 62.0 vs parent 61.3); 8,384 33.9 vs 33.2; 16,384 50.3 vs 51.6 and the sc rows are unchanged code (noise). The G rows run the r0 anchor (merge-only), hence the emulator's 0.645 [run_tests]"
+  - "PRECISION: W1 conversion arithmetic and lane order are unchanged (both paths call the shared tc_w1_row: fp16(W1*lnw), u = sum of the fp16 values, v = W1.lnb + b1, same warp_sum order). Single-seed fp64 check (seed 200, harness generators), parent vs bulk: 2,768 1.478e-3 vs 1.478e-3; 8,768 1.576e-3 vs 1.576e-3; 32,768 1.701e-3 vs 1.701e-3 (equal to 4 significant figures, not checked bit for bit). The r8 tc log (59-65 % of atol) stands [probe_b200]"
+  - "NOT DONE: the deferred W2 pass by bulk copy. During GEMM1 at 16/32,768 the NST1=4 x 40 KB ring plus the epilogue buffers leave no smem, and the read is DRAM-capped anyway. 8,384 and 16,384 were not applied (8,384 bulk +0.27 us; tc2 unchanged). The 'W1 issue end' stamp is the warp-0 issue time, not landing [INFERRED]"
+  - "Lesson for lineage D: at C=768 the 18.8 MB of fp32 weights cost >= ~3.6 us of DRAM plus about 0.7 us latency per call under the dirty flush, whatever the access instruction. Eviction hints on harness tensors are forbidden by the r11 override, so only fewer weight bytes per call or hiding the reads under useful work can move this term. The sync-1 stamp gain of 0.5-1 us does not carry to kernel time because the late W1 landing and the deferred W2 stream then compete during GEMM1 [INFERRED]"
+paths:
+  - {max_tokens: 6272, lang: cuda, width: 128, threads: 512, rows: 128, grid: persistent, mem: tma, launches: 1, x: none, w: none, st: none, cluster: 1, note: "tc_kernel with bulk W1 (64 KB cp.async.bulk per CTA) on 2/8/16/32,768 and 8,384; tc2_kernel r10 on 16,384"}
+  - {max_tokens: 12544, lang: cuda, width: 128, threads: 384, rows: 128, grid: persistent, mem: tma, launches: 1, x: none, w: none, st: none, cluster: 1, note: "sc_kernel unchanged on the C <= 192 rows and 1,160"}
+  - {max_tokens: null, lang: cuda, width: 128, threads: 256, rows: 128, grid: persistent, mem: ldg, launches: 1, x: none, w: none, st: none, cluster: 1, note: "r0 fp32 anchor on 8,320 / 32,128 / 64,96 (merge-only)"}
+runs_on:
+  H200:
+    runs: false
+    representative: false
+    note: "tcgen05/TMEM are sm_100a-only"
+  A100:
+    runs: false
+    representative: false
+  L40S:
+    runs: false
+    representative: false
+risks:
+  - "Slower than the parent on every tc row it changes (0.2-0.9 us); do not merge any row from this kernel"
+  - "Single run_tests timing; the interleaved x3 numbers come from probe builds of the tc path only"
+measure_first:
+  - B200
+compliance:
+  single_stream: true
+  no_cross_call_state: true
+  fp32_math: true
+  no_threads_or_fork: true
+  no_precompiled_binaries: true

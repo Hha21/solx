@@ -1,0 +1,74 @@
+id: r11-j-e3-gate-killed
+parents: [r0-convnext-coop-fp32-anchor]
+operation: new_design
+language: cuda_cpp
+niche:
+  mem: ldg128
+  st: direct
+  grid: persistent
+  launch: fused
+  tile: rows128
+  red: cta
+  cache: default
+  spec: all
+hypothesis: >-
+  H46 (lineage J, E3): cluster split-K cells for 2,768 / 8,768 fill 144 CTAs and cut both GEMM mainloops,
+  with partials reduced inside the cluster before the GELU and the residual store. STEP 0 refuted it before
+  any build. On B200, clusters of 3 or more fit only 120-135 co-resident CTAs (not 144). Exchanging a
+  50 KB fp32 partial inside a cluster costs 1.63-2.11 us per CTA by the best route (DSMEM pull), over the
+  1.5 us kill line; 100 KB costs 2.7-3.0 us. The candidate is the r0 anchor unchanged, a placeholder that
+  carries the findings. It must not take any merge row.
+expected_effect:
+  S:
+    pct: 0
+    confidence: high
+  M:
+    pct: 0
+    confidence: high
+  L:
+    pct: 0
+    confidence: high
+resources_sm100a:
+  regs_per_thread: 128
+  smem_per_cta_bytes: 70208
+  threads_per_cta: 256
+  ctas_per_sm: 2
+  bytes_in_flight_per_sm: 65536
+  launches_per_call: 1
+knobs:
+  NT: 256
+  GRID: 296
+tests: [H46]
+findings:
+  - "STEP 0a co-residency (cudaOccupancyMaxActiveClusters, 512 thr; identical at 150 / 200 / 227 KB smem; 210 KB for cs 5 / 7): cluster size 1 -> 148 CTAs, 2 -> 74 clusters = 148, 3 -> 45 = 135, 4 -> 33 = 132, 5 -> 26 = 130, 6 -> 22 = 132, 7 -> 15 = 105, 8 -> 15 = 120; 12 is rejected (cudaErrorInvalidClusterSize without the non-portable attribute). The planned 144-CTA grids (24 x KS6 at 2,768; 24 x 2 x KS3 at 8,768) cannot be co-resident: cooperative + cluster launch of 144 CTAs in clusters of 6 returned error 720 (cooperative launch too large); 132 CTAs launch fine [probe_b200]"
+  - "STEP 0b exchange, per-CTA globaltimer span after a 2xL2 zero-fill, 512 thr, coop + cluster launch, median (max) over CTAs, median of 5 reps. Owner of 128/KS rows sums KS-1 mates' fp32 partial rows. KS6 50 KB (N=98, 132 CTAs): L2 scratch STG.cg + barrier.cluster release/acquire + LDG.cg 2.74 (3.23) us; DSMEM ld.shared::cluster.v4 pull 2.11 (2.53); cp.reduce.async.bulk.add.f32 into a prezeroed L2 buffer + cluster barrier + LDG 2.78 (3.10). KS4 50 KB: 2.21 / 1.63 / 2.61. KS3 100 KB (N=196): 3.01 / 2.72 / 4.00. KS4 100 KB: 2.85 / 2.75 / 3.68. KS5 200 KB (N=392, 120 CTAs): 5.09 / 4.37 / 6.21. KS2 100 KB (148 CTAs): 2.91 / 1.98 / 4.42 [probe_b200]"
+  - "Kill line fires: best route at 50 KB is 1.63 us (KS4) and 2.11 us (KS6), above 1.5 us. A barrier-only control costs 0.22 us, so the exchange cost is data movement. DSMEM pull runs at ~20-27 GB/s/SM at fan-in 3-5 (KS6 pulls 42 KB in ~1.9 us), consistent with r1 C's 12-18 B/clk/SM [probe_b200]"
+  - "Dead ends: a hybrid exchange (some mates via L2, the rest via DSMEM in parallel) was slower than pure DSMEM: KS6 50 KB 3.33-3.42 us, KS4 2.37-2.59, KS3 100 KB 4.53. A DSMEM push (st.shared::cluster.v4 into the owner's receive slots) was also slower: KS6 3.01, KS4 2.46, KS3 100 KB 4.03 us. Both used per-element owner arithmetic, which may add part of the cost, but neither route approached the pull [probe_b200]"
+  - "Fan-in matters more than bytes: a DSMEM pull of 26 KB (an fp16-sized N=98 partial) costs 1.02 us at KS6 and 0.83 at KS4; 50 KB costs 0.66 us at KS2 and 1.41 at KS3; 26 KB at KS2 0.54 us. So KS2 cells (cluster of 2, 148 co-resident) and fp16-packed partials both pass a 1.5 us line. fp16 partials add a rounding of about 2^-12 x |partial| x sqrt(KS) on top of tc's 59-65 % of atol; precision untested [probe_b200]"
+  - "Ceiling with the measured exchange (arithmetic, not built). 2,768 with KS4 cells (96 CTAs): GEMM1 = first landing ~1 + 3 k-blocks ~0.65 + exchange 1.63 + owner epilogue (32 rows) ~0.8 = ~4.1 us, against D's ~1 + 2.6 (48 MMAs at the ~105 clk floor) + 3.04 = ~6.6 us. That is about -2.5 us on GEMM1, plus a smaller GEMM2 share: the row might go 24.4 -> ~21 us rented (-12 %), short of the 19 us success line. 8,768: the co-residency cap (132-135 CTAs vs D's 96) cuts epilogue elements per CTA by only ~27 %, and the 100 KB exchange (2.7-3.0 us) eats the saving. No gain projected, so the H46 clause (GEMM1 phase >= 30 % shorter than 11.7 us) would not be met at 8,768 [INFERRED]"
+  - "Untested design note for a revival at 2,768 only: every (hidden tile, K slice) cell owns a distinct W1 slice, so it can convert its fp32 W1 slice in registers straight into its smem SW128 A tile (no fp16 W1 scratch, LN-weight fold and u/v partials computed locally, LN statistics reduced in the same exchange). This removes W1 from phase A. With KS6 the conv redundancy would be 24x (~3.2 us FMA per CTA at 1.5 GHz), so the conv must stay a grid-wide phase [INFERRED]"
+  - "run_tests 16/16 PASS for this placeholder (r0 anchor). Same container, r10-merge for reference: 2,768 123.3 vs 24.4, 8,768 262.0 vs 30.2 us. No precision log is needed: the anchor's fp32 arithmetic is unchanged [run_tests]"
+  - "Budget used: 5 probes, 1 run_tests, 0 compile_b200. No tcgen05 code was built, so there is no engine validation, stamps, STACK check or precision log for a J kernel [INFERRED]"
+paths:
+  - {max_tokens: null, lang: cuda, width: 128, threads: 256, rows: 128, grid: persistent, mem: ldg, launches: 1, x: none, w: none, st: none, cluster: 1}
+runs_on:
+  H200:
+    runs: true
+    representative: false
+    note: "r0 anchor placeholder; the J gate numbers are B200-specific (cluster residency, DSMEM rate)"
+  A100:
+    runs: true
+    representative: false
+  L40S:
+    runs: true
+    representative: false
+risks:
+  - "Placeholder only: it is the r0 anchor (0.30 portal) and must not be merged into any row."
+  - "The gate microbench pulls from smem-resident partials; a real kernel would also pay the TMEM -> smem drain (~0.3-0.5 us) before the exchange, so the measured costs are lower bounds."
+measure_first: [H200]
+compliance:
+  single_stream: true
+  no_cross_call_state: true
+  fp32_math: true
+  no_threads_or_fork: true
+  no_precompiled_binaries: true

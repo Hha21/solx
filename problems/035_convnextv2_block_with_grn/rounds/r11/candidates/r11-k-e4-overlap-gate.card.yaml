@@ -1,0 +1,88 @@
+id: r11-k-e4-overlap-gate
+parents:
+  - r0-convnext-coop-fp32-anchor
+operation: new_design
+language: cuda_cpp
+niche:
+  mem: ldg128
+  st: direct
+  grid: persistent
+  launch: fused
+  tile: rows128
+  red: cta
+  cache: default
+  spec: all
+hypothesis: >-
+  H47 (lineage K) test: a persistent warp-specialised tcgen05 engine whose epilogue warps drain tile i while the MMA
+  warp runs tile i+1 would shorten the GEMM1 phase at 32,768 / 16,768 / 16,384 by >= 30 %. STEP 0b refuted the
+  premise. Under co-run, a 12-warp epilogue keeps 69-74 % and the MMA ring keeps 59-65 % of their solo rates at
+  N=208, against an 80 % gate. Overlap saves only 16-26 % of the serial sum. The engine was not built. The shipped
+  code is the r0 anchor, unchanged (merge-only, takes no rows).
+expected_effect:
+  S:
+    pct: 0
+    confidence: high
+  M:
+    pct: 0
+    confidence: high
+  L:
+    pct: 0
+    confidence: high
+resources_sm100a:
+  regs_per_thread: 128
+  smem_per_cta_bytes: 70208
+  threads_per_cta: 256
+  ctas_per_sm: 2
+  bytes_in_flight_per_sm: 65536
+  launches_per_call: 1
+knobs:
+  NT: 256
+  GRID: 296
+tests:
+  - H47
+findings:
+  - "STEP 0a, 1SM straight-line issue (64 unrolled tcgen05.mma kind::f16 128xNx16, precomputed SW128 K-major descriptors, smem-resident operands, elect.sync-predicated issue in a uniform warp; rented 1.75-1.86 GHz). Total clk per instruction (issue-loop clk in brackets): N=64 50.2 (44.5), N=128 66.4 (58.7), N=224 114.4 (100.4), N=256 130.4 (114.4). Against the N/2 ideal that is 1.57x / 1.04x / 1.02x / 1.02x, identical at 1, 128 and 148 CTAs. The ~105 clk 'floor' at N <= 128 (G r9) is not a hardware floor; it came from the issue/loop structure. N >= 128 runs at the tensor peak in 1SM mode [probe_b200]"
+  - "STEP 0a, pair cta_group::2 M=256 (cluster 2x1 via __cluster_dims__, per-SM work 128xNx16, smem-resident): N=64 45.5, N=128 66.7, N=224 114.7, N=256 130.7 clk per instruction, the same at 1 and 74 pairs. A pair gives no per-SM instruction-rate gain over 1SM except at N=64 (45.5 vs 50.2); its only benefit is halving the B landing bytes. Tile N >= 128 in 1SM mode is enough for any K engine [probe_b200]"
+  - "STEP 0b gate setup: 148 CTAs x 512 thr, 1 CTA/SM. Warp 0 is the producer (2 cp.async.bulk per stage from an L2-warm buffer, 4 stages of 43 KB at N=208). Warp 1 is the MMA warp (4 MMAs per stage into accumulator 1, commit to the empty barrier). 12 epilogue warps (3 per TMEM lane quadrant) drain accumulator 0 with tcgen05.ld 32x32b.x16, LN fold, A&S erfc GELU, per-image sumsq, cvt.rn.f16x2 and stores. 64 regs, STACK 0 [probe_b200]"
+  - "STEP 0b result, N=208, efficient epilogue: direct STG.128 gives epilogue 39.0 us solo (5460 el/us/SM) vs 56.1 co-run (69 %), and MMA 431 clk/stage solo (ideal 416) vs 696 co-run (65 %). Staged coalesced stores: 74 % / 62 %. No stores: 73 % / 59 %. N=128: 79 / 54, 80 / 53 and 80 / 55 %. GATE FAILED on both sides in every store variant. Overlapped time vs the serial sum saves 16-24 % [probe_b200]"
+  - "Limiter ablations (no-store build, N=208, epilogue / MMA share of solo): MMA without TMA waits 78 / 78; epilogue without LDS 82 / 53; epilogue without MUFU (FMA-only fake GELU) 64 / 81; both 76 / 78; 5 stages 72 / 62; 8 epilogue warps 75 / 71; 4 epilogue warps 79 / 92 but epilogue solo 48 us (-25 % throughput); 8 warps + 5 stages 75 / 78. Not a gate pass in any configuration [probe_b200]"
+  - "Limiter: issue and dispatch sharing inside each SMSP. The TMEM lane-quadrant rule (warp % 4) forces the epilogue onto all 4 schedulers, so the producer and MMA warps always share one with 2-3 MUFU/FMA-heavy epilogue warps. Each stage hand-off (try_wait wake, fence, 4 MMA issues, commit, refill) stretches by 265-355 clk. On the MMA side the GELU's MUFU work is the main contender (removing it lifts the MMA to 81 %); on the epilogue side it is the MMA's smem operand reads against LDS (removing LDS lifts the epilogue to 82 %). Stores and the TMEM ld port are not the limiter. A deeper ring does not help, because the cost is in the MMA warp's issue, not in TMA latency [probe_b200]"
+  - "Pitfall: a gate build whose epilogue had runtime ablation flags compiled to a 36 % slower epilogue (61.5 us vs 39 us solo). With that lighter pressure the gate looked like a pass (83 % / 85 %), and 'no stores' gave the MMA 98 %. Gate tests must use the production-efficient epilogue; only compile-time variants are representative [probe_b200]"
+  - "Projection (not built): the best measured overlap (about 24 % of the serial CTA work) applied to D's ~28 us GEMM1 phase at 32,768 gives about 21 us. That misses the >= 30 % (<= 19.6 us) line, so H47's second refutation clause also fires on arithmetic. Most of what a K engine could gain at 32,768 comes from balance (1.3 vs 2 tiles per CTA), which is H41 territory, not from overlap [INFERRED]"
+  - "If lineage K is revived: (1) MUFU-free epilogue maths on the overlapped tile (an FMA-only erf polynomial) moves the MMA to 81 %, but the epilogue then loses (64 %); (2) one epilogue warp per SMSP keeps the MMA at 92 % but cuts epilogue throughput by 25 %; (3) the biggest lever is to make the MMA warp's per-stage issue lighter (fewer, larger stages from resident W1 slices, so no per-stage waits: 78 / 78 without TMA). None of these clears the 80/80 gate alone [INFERRED]"
+  - "run_tests of the shipped fallback (r0 anchor, code unchanged, target_hardware [B200]): 16/16 PASS. Rented times equal the archived anchor, e.g. 32,768 1218.8 vs r10-merge 61.4 us; merge-only, take no rows. No new arithmetic, so no precision log is owed [run_tests]"
+paths:
+  - max_tokens: null
+    lang: cuda
+    width: 128
+    threads: 256
+    rows: 128
+    grid: persistent
+    mem: ldg
+    launches: 1
+    x: none
+    w: none
+    st: none
+    cluster: 1
+runs_on:
+  H200:
+    runs: true
+    representative: false
+    note: "fp32 SIMT anchor; the gate probes are tcgen05-only (B200)"
+  A100:
+    runs: true
+    representative: false
+  L40S:
+    runs: true
+    representative: false
+risks:
+  - "Fallback only: this kernel is the r0 anchor and must not take any row in the merge"
+  - "Gate numbers come from a synthetic co-run (L2-warm operands, no dirty-L2 flush, fake LN statistics); real tiles add cold landing and h-store traffic, which only add contention"
+measure_first:
+  - B200
+compliance:
+  single_stream: true
+  no_cross_call_state: true
+  fp32_math: true
+  no_threads_or_fork: true
+  no_precompiled_binaries: true

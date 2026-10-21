@@ -1,0 +1,30 @@
+id: r11-merge
+parents:
+- r10-merge
+- r11-d-e1-g2-mp2-bulk
+operation: repair
+language: cuda_cpp
+niche:
+  cache: default
+  grid: oneshot
+  launch: split
+  mem: bulk1d
+  red: warp
+  spec: dispatch:size
+  st: direct
+  tile: rows8
+hypothesis: 'Operator per-workload merge: Per-workload merge (loop/merge.py, kernels unchanged) of r10-merge with r11-d-e1-g2-mp2-bulk
+  on 2,768,7,7, 32,768,7,7, where they beat it side by side. Projected portal score 0.7402 (best 0.7391).'
+dispatch:
+- kernel: r10-d-e1-balanced-nostack
+  shapes: 2,96,56,56 8,768,7,7 16,768,7,7 4,192,28,28 1,192,28,28
+- kernel: r11-d-e1-g2-mp2-bulk
+  shapes: 2,768,7,7 32,768,7,7
+- kernel: r7-g-e1-fusedp1-mma
+  shapes: 64,96,112,112 32,128,64,64
+- kernel: r8-d-e1-allwarp-epi
+  shapes: 1,160,449,7 16,384,14,14 1,96,56,56 8,384,14,14 8,192,28,28
+- kernel: r8-g-e2-singletile
+  shapes: 4,96,56,56
+- kernel: r9-g-e3-tc05-p1s
+  shapes: 8,320,32,32

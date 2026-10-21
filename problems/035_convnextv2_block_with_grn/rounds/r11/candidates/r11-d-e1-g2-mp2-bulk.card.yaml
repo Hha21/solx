@@ -1,0 +1,106 @@
+id: r11-d-e1-g2-mp2-bulk
+parents:
+  - r10-d-e1-balanced-nostack
+operation: structural_mutation
+language: cuda_cpp
+niche:
+  mem: tma-tensor
+  st: bulk
+  grid: persistent
+  launch: fused
+  tile: token
+  red: cta
+  cache: default
+  spec: dispatch:size
+hypothesis: >-
+  H45 is refuted as stated. The GEMM2 phase of tc_kernel is much shorter than assumed: 1.5 / 3.3 / 7.3 / 14.2 / 3.0 us
+  at 2/8/16/32,768 and 8,384. Its 48 KB stages are bound by L2 bandwidth (~109 GB/s/SM on 148 SMs, about 16 TB/s), not
+  by MMA issue, so one MMA per [h|g] stage gains nothing. The bulk reduce is only 1.25x faster than scalar red.add, and
+  the ~2 us drain tail is set by the reduction bytes (out x KS) that all land at the end. What pays is cutting B bytes:
+  at 32,768 each GEMM2 unit covers 256 output channels (MP=2), so two W2 tiles share each landed B stage and phase C
+  falls from 16.0 to 11.3 us; that row runs 57.6 vs 61.4 us in run_tests. The other rows move by -0.8 us or less.
+expected_effect:
+  S:
+    pct: 0
+    confidence: medium
+  M:
+    pct: -1
+    confidence: low
+  L:
+    pct: -2
+    confidence: medium
+resources_sm100a:
+  regs_per_thread: 110
+  smem_per_cta_bytes: 232448
+  threads_per_cta: 512
+  ctas_per_sm: 1
+  bytes_in_flight_per_sm: 196608
+  launches_per_call: 1
+knobs:
+  tc_rows: "NI/KS/NI2/MP: 2,768 1/12/1/1; 8,768 2/6/2/1; 16,768 3/3/2/1; 32,768 3/3/2/2; 8,384 1/3/0/1; 16,384 tc2 (unchanged)"
+  gemm2_stage: "MP=1: 48 KB (W2 16K + h/g 2x NAT2 x 8K), 4-deep; MP=2: 64 KB, 3-deep, single TMEM buffer (512 cols)"
+  drain: "7x7: dense [128][49] fp32 smem tile per (channel tile, image), one cp.reduce.async.bulk.add.f32; last unit stages in the free ring; exit wait_group.read 0"
+  TC_ONEMMA: 1
+  TC_BULK: 1
+  TC_STAMPS: 0
+dispatch:
+  - shapes: "2,768,7,7 8,768,7,7 16,768,7,7 32,768,7,7"
+    kernel: "tc_kernel<768,49> (r11 GEMM2: one MMA, whole-image units, bulk-reduce drain; MP=2 at 32,768)"
+    meta: {grid: "num SMs, cooperative, 144 GEMM2 units"}
+  - shapes: "8,384,14,14"
+    kernel: "tc_kernel<384,196> (one-MMA GEMM2, float4 red.add drain)"
+    meta: {grid: "num SMs, cooperative"}
+  - shapes: "16,384,14,14"
+    kernel: "tc2_kernel<384,196> (r10, unchanged)"
+    meta: {}
+  - shapes: "C <= 192 rows, 1,160,449,7"
+    kernel: "sc_kernel (r10, unchanged)"
+    meta: {}
+  - shapes: "8,320 / 32,128 / 64,96"
+    kernel: "convnext_fused (r0 anchor, merge-only)"
+    meta: {}
+tests:
+  - H45
+findings:
+  - "STEP 0: the parent card records the barrier protocol review and the 1500-call stress test as done (r10 STEP 0(a)/(c)), so neither was repeated. cuobjdump -res-usage on a probe build of the shipped tc_kernel device code (same code; stamps compiled out): REG 110 / 104, STACK 0 for tc_kernel<768,49> and <384,196>. sc_kernel and tc2_kernel are byte-identical to r10; their STACK was not re-checked this round [probe_b200]"
+  - "STEP 1 stamps, parent-equivalent build (TC_ONEMMA=0 TC_BULK=0), rented, CTA medians from the first CTA start: sync 2 / GEMM2 phase / per-CTA mainloop / drain tail (us). 2,768 17.0 / 1.5 / 1.75 / 2.75 (72 busy CTAs); 8,768 20.5 / 3.3 / 3.5 / 3.0 (144); 16,768 28.2 / 7.3 / 7.0 / 2.9 (126); 32,768 40.8 / 14.2 / 14.0 / 3.0 (148, 2 units on most); 8,384 25.2 / 3.0 / 3.25 / 2.5 (117). The premise of ~8 us at 8,768 and ~25 us at 32,768 is wrong: phase B (GEMM1, 9.5-28 us) and phase A (7.5-12.5 us) dominate every row [probe_b200]"
+  - "Mechanism: 32,768 moves 288 x 16 x 48 KB = 221 MB of GEMM2 operands in ~14 us, about 16 TB/s, which is the L2 cross-die ceiling. 0.44 us per 48 KB stage is ~57 B/clk/SM: L2 bandwidth, not MMA (one N=256 MMA per k16 instead of two N=128 left the stage time at 0.44 us) [probe_b200]"
+  - "STEP 2: cp.reduce.async.bulk.global.shared::cta.bulk_group.add.f32 compiles on sm_100a and is bit-equal to red.add. 148 CTAs x 25 KB into a just-prefilled output: 3.34 / 4.32 / 6.53 us for 1/2/4 tiles per CTA, against 3.52 / 4.77 / 7.5 for the parent's 16-lane scalar red pattern. The marginal rate is ~1.25x better; on a cold output the two are equal (2.8 TB/s, DRAM-bound) [probe_b200]"
+  - "Bulk reduce needs whole-image units at 7x7: a [128][49] fp32 image segment is 25088 contiguous bytes, but partial-image rows are not 16-B aligned (196 B stride). 14x14 rows are 16-B aligned per channel, but each 128-column unit would need ~256 small copies (~31 ns each), so 14x14 keeps its float4 red.add drain [INFERRED, probe_b200]"
+  - "STEP 3 interleaved x3 (tc_kernel-only builds, harness_time, rented us). v1 (one MMA + whole-image bulk units) vs parent-equivalent: 2,768 22.6 vs 24.6; 8,768 29.5 vs 30.8; 16,768 40.4 vs 41.2; 32,768 62.0 vs 61.7; 8,384 33.6 vs 34.2. Adding wait_group.read at exit and ring staging on the last unit: <= 0.5 us on every row [probe_b200]"
+  - "STEP 3(b'), MP=2 (two W2 tiles share one [h|g] B stage, 64 KB 3-deep stages, 2x256 TMEM columns): 32,768 KS 3 (144 units) 59.4-59.5 vs 63.0-63.1 us interleaved; phase C 16.0 -> 11.3 us, mainloop 15.75 -> 10.75. 32,768 KS 6 (2 units per CTA, no TMEM double buffer): 63.4 (worse). 16,768 MP 2 KS 6: 40.75 vs 41.18 (-0.4, reduction bytes double; not shipped). 8,768 MP 2 KS 12: 30.92 vs 30.27 (worse) [probe_b200]"
+  - "Drain tail after the last mainloop: 1.75-3.0 us whatever the drain form, about bytes_reduced_at_end / ~4.8 TB/s (32,768 MP=2: 14.5 MB, 3.0 us; MP=1 with 2 units per CTA: 2.0 us, because half overlaps the second unit). The tail falls only if KS (reduction bytes) falls or if the drain overlaps another unit's mainloop [probe_b200]"
+  - "run_tests 16/16 PASS (portal-order re-runs included), same GPU as r10-merge (rented us): 32,768 57.6 vs 61.4 (-6.1 %); 2,768 22.8 vs 23.6; 8,768 29.9 vs 30.5; 16,768 40.4 vs 40.4; 8,384 33.8 vs 34.0; 16,384 49.4 vs 51.6 (tc2 code unchanged: that is noise); sc rows -0.7..+0.6 (unchanged code) [run_tests]"
+  - "Verdict against the E1 bars: GEMM2 phase >= 40 % shorter on >= 4 rows: missed (only 32,768, -30 %). Row targets: 32,768 -3.7..-3.8 us vs >= 4 (narrow miss); 16,768, 16,384, 8,768, 8,384 and 2,768 missed. Refutation clause fires: bulk < 1.3x scalar in STEP 2 and the shipped build is within 1 us of the parent on 5 of 6 rows. H45 as stated: refuted. Lever kept: B sharing across output-channel tiles (MP=2) where GEMM2 runs >= 16 stages per CTA [run_tests, probe_b200]"
+  - "PRECISION: the roundings are unchanged (d16, fp16(lnw*W1), h16, g16, fp16 W2, the GELU); only the fp32 summation order of the split-K partials changes (bulk add vs red.add, MP doesn't change KS at 32,768). Single seed against an fp64 reference with the harness generators, shipped variant: 2,768 1.55e-3 (atol 2.6e-3), 8,768 1.70e-3, 16,768 1.70e-3, 32,768 1.79e-3 (2.9e-3), identical to the parent-equivalent build; outputs differ from it by <= 4e-6. The r8 10-round log (tc 59-65 % of atol) stands [probe_b200]"
+  - "Dead ends: one MMA over [h|g] alone (stage time unchanged, L2-bound); ring staging plus wait_group.read (<= 0.5 us); MP=2 at 8,768 and 16,768 (doubled reduction bytes cancel the halved B ingest); MP=2 with 2 units per CTA (no TMEM double buffering) [probe_b200]"
+  - "Merge advice: take 32,768 from this kernel (-3.8 us rented, ~-4.5 us portal at D's 1.2-1.3 ratio, about +0.0007 of mean). 2,768 / 8,768 (-0.6..-0.8 us) are noise-level; take them only if an interleaved merge timing confirms. For D r12 the next GEMM2 lever is fewer reduction bytes at the end (lineage J's cluster reduce, or overlapping drains), and GEMM1 phase B (9.5-28 us) is the larger term (lineage K) [INFERRED]"
+  - "Pitfalls: probe containers often do not keep /tmp between calls, so embed every source in each probe. A tc_kernel-only .so built with nvcc and called through ctypes builds in ~3 s for 6 variants, against ~20-40 s for a torch extension; that is the fast loop for tc_kernel work. The globaltimer resolution here is ~0.25 us [probe_b200]"
+paths:
+  - {max_tokens: 1568, lang: cuda, width: 128, threads: 512, rows: 128, grid: persistent, mem: tma, launches: 1, x: none, w: none, st: none, cluster: 1, note: "tc_kernel<768,49>: r11 GEMM2 (one MMA, whole-image bulk-reduce drain, MP=2 at 32,768); tc_kernel<384,196> one-MMA at 8,384; tc2 at 16,384"}
+  - {max_tokens: 12544, lang: cuda, width: 128, threads: 384, rows: 128, grid: persistent, mem: tma, launches: 1, x: none, w: none, st: none, cluster: 1, note: "sc_kernel unchanged on the C <= 192 rows and 1,160"}
+  - {max_tokens: null, lang: cuda, width: 128, threads: 256, rows: 128, grid: persistent, mem: ldg, launches: 1, x: none, w: none, st: none, cluster: 1, note: "r0 fp32 anchor on 8,320 / 32,128 / 64,96 (merge-only)"}
+runs_on:
+  H200:
+    runs: false
+    representative: false
+    note: "tcgen05/TMEM and cp.reduce.async.bulk paths are sm_100a-only"
+  A100:
+    runs: false
+    representative: false
+  L40S:
+    runs: false
+    representative: false
+risks:
+  - "Only 32,768 clearly beats the parent; the other tc-row deltas (<= 0.8 us) are within portal noise"
+  - "MP=2 is MMA-heavier per stage (8 N=256 MMAs); at the portal's 1.5 GHz the MMA term stretches by ~1.3x, so the portal gain at 32,768 may be smaller than the L2-bound rented gain suggests"
+  - "The CTA exits after cp.async.bulk.wait_group.read (the CUTLASS tma_store_wait form), not after a full completion wait; 16/16 x 10 rounds and the portal-order re-runs pass"
+  - "STACK was checked on a probe build of the identical tc_kernel device code, not on the run_tests binary; sc/tc2 are unchanged and were not re-checked"
+measure_first:
+  - B200
+compliance:
+  single_stream: true
+  no_cross_call_state: true
+  fp32_math: true
+  no_threads_or_fork: true
+  no_precompiled_binaries: true
