@@ -31,7 +31,7 @@ lineages:
   - Keep. Barrier microbench (r4) flat atomic-counter barrier 0.86-1.07 us vs 1.6-1.9 us for the cg flip barrier; a two-level
     tree is worse (3.9 us); one flag polled by 295 CTAs is observed in 0.64 us.
   - Keep. Per-tile dataflow (H27) lost 1.4-2x for skeleton reasons, and the image-level version (H38) lost on per-item cost;
-    counters are cheap but do not pay.
+    counters are cheap but do not pay as a whole-kernel structure.
   - Pitfalls. runtime guards around mma.sync cost ~470 clk per k-block; register-direct erff epilogues take 16 us per tile;
     a release arrive with loads in flight stalls.
 - id: C
@@ -47,29 +47,32 @@ lineages:
   - Keep. TFLOAT32 TMA maps round to nearest even bit-exactly (H14); red.global.add.f32 into L2 reaches 4.1-4.4 TB/s from
     256-512 CTAs.
   - Keep. Cold __ldg of small vectors at the point of use adds a DRAM round each; bulk-load them at entry.
-  - Conv redundancy 4C/BN and per-CTA serial rounds dominated; the all-N token-tile family is dead for C >= 384.
+  - r12 lead arithmetic - a tcgen05 on-chip-hidden revival for the wide-C rows dies on split-K reduction volume (12-24 x out
+    bytes = 29-116 MB of red.add at 8,384 .. 32,768).
 - id: D
   thesis: Cooperative single-launch specialist (bulk-plane conv, per-tile GRN statistics, split-K GEMM2 with coalesced red.add)
     whose GEMM engine is hand-written tcgen05 kind::f16 in the swap-AB orientation (weights as M, tokens as N), so the output
     tile is NCHW; the six wide-C rows (tc_kernel) and the C <= 192 rows, 1,160 and 4,96 (sc_kernel).
   status: active
   started: r3
-  best: r10-d-e1-balanced-nostack
+  best: r11-d-e1-g2-mp2-bulk
   conclusions:
-  - Holds 12 of 16 rows in r10-merge (0.7392); portal ratios 1.20-1.32; M/L projections within +-2 %; S rows move +-1.2 us
-    between unchanged submissions.
-  - r10 main win was removing the STACK-120 spill of tc_kernel<768,49> (portal 8,768 42.0 -> 38.7, 16,768 56.7 -> 52.5); balanced
-    tile tables (H41) missed their targets (16,384 65.4, 32,768 78.1 portal). Every build checks cuobjdump -res-usage STACK.
-  - Remaining terms per wide-C row - phase A W1 fp32 stream issued as 12 LDG.128 per lane (~4 TB/s, 2.5 us of phase A, 3.2
-    us at sync 1); GEMM1 epilogue near its issue bound plus h(+g) store bytes and never overlapped with a mainloop; GEMM2
-    ingest-bound stages (~0.7 us per 48 KB) on <= 96-120 units plus a scalar red.add drain of 3.7-8 us at 16/32,768; barriers
-    worth <= 0.5 us per sync.
+  - Holds 12 of 16 rows in r11-merge-b (0.7404); portal ratios 1.20-1.32; M/L projections within +-2 %; S rows move +-1.2
+    us between unchanged submissions.
+  - r11 - MP=2 (two W2 tiles sharing one [h|g] B stage) wins where a CTA runs many GEMM2 stages (2,768 -6 %, 32,768 -4 % rented);
+    bulk-copy weight pass and in-ring fp32 W1 conversion refuted (H44); r10's balanced tc2 path kept only on 16,384; r10's
+    main win was the STACK-120 fix (check STACK on every build).
+  - Remaining terms per wide-C row - GEMM1 epilogue (issue + h/g store bytes, 1-2 serial tiles per CTA), the g term doubling
+    GEMM2 B bytes and MMA N, the phase-A W1 stream (~2.5 us, no cheaper form found), barriers <= 0.5 us per sync; sc rows
+    - 2.6-3.1 us weight chain before sync 1. r12 tests H49 (g removed via per-image counters) and H48 (sc owner-converted
+    weights).
   - Validated and reusable - MN-major SW128 B (LBO 8192, SBO 1024, +2048 per k16), K-major SW128 A (SBO 1024, +32 B per k16),
-    idesc bits, cta_group::2 recipe (whole kernel one cta_group; coop + cluster 2x1 works; pairs pay only at many stages per
-    CTA), one producer warp per stage round-robin, all-warp epilogue at 512 thr, staged coalesced h stores, target_hardware
-    [B200] only. Precision tc 59-65 % of atol, sc 79-89 % (hidden rounded twice); new arithmetic needs a 10-round log.
+    idesc bits, cta_group::2 recipe, one producer warp per stage round-robin, all-warp epilogue at 512 thr, staged coalesced
+    h stores, target_hardware [B200] only; straight-line issue reaches the MMA ideal at N >= 128 (r11 K), so any engine near
+    105 clk per instruction has loop overhead. Precision tc 59-65 % of atol, sc 79-89 %.
   - Dead ends - weight warps split from conv warps; lighter epilogue arithmetic; 2-deep pipelined tcgen05.ld; g built in smem
-    inside the 48 KB ring; L2 prefetch of W2 in the sync-1 window; pairs at B <= 8; reordering W1 loads vs conv.
+    inside the 48 KB ring; L2 prefetch of W2 in the sync-1 window; pairs at B <= 8; reordering W1 loads vs conv; bulk weight
+    pass; in-ring fp32 W1 conversion.
 - id: E
   thesis: Library tcgen05 with fused epilogues (CUTLASS 4.4 sm100 builder GEMMs whose EVT epilogues carry the LN fold, exact
     erf GELU, hidden store and per-image GRN sum of squares; TF32 operands straight from fp32 memory where the MMA is cheap).
@@ -112,17 +115,15 @@ lineages:
   started: r7
   best: r9-g-e3-tc05-p1s
   conclusions:
-  - Holds 4 rows in r10-merge - 64,96 (portal 1071, S 0.802) and 32,128 (287, 0.772) from r7 g_pass1 (mma.sync); 8,320 (74.6,
-    0.763) and 4,96 (46.8, 0.744) from r9 g_tc; 4-launch pipeline at portal ratio 1.26-1.27.
+  - Holds 4 rows in r11-merge-b - 64,96 (portal 1077, S 0.801) and 32,128 (288, 0.771) from r7 g_pass1 (mma.sync); 8,320 (74.9,
+    0.762) and 4,96 (47.0, 0.743) from r9 g_tc; 4-launch pipeline at portal ratio 1.26-1.27.
   - r10 H42 refuted - the custom tcgen05 GEMM2 g_g2 ran 23 us cold at 8,320 against the 9 us kill line (serial chain before
     the first MMA); K3 + cuBLASLt G2 stay.
-  - tcgen05 engine validated at C=96/320 (writer address functions in the notebook); 1SM kind::f16 128xNx16 measured ~105
-    clk per instruction for N <= 128; conv-overlapped MMA in channel rounds and per-warp smem-transposed h stores are the
-    shipped levers.
-  - Remaining at 8,320 (rented) - K0 ~4 / P1 ~39 (epilogue ~2x its issue bound) / K3 8.9 / cuBLASLt G2 11.3 (3.8 TB/s). Top
-    rows hand over to lineage I (H43).
-  - Paused r11 by operator directive (all four experiments on the wide-C rows); precision logged for all 4 shipped rows (61-82
-    % of atol).
+  - r11 K STEP 0a - the ~105 clk per instruction G measured at N <= 128 is issue-loop overhead, not hardware (straight-line
+    N=64 50 clk); g_tc's 200 MMAs per tile at 8,320 could cost about half, but the epilogue (~2x its issue bound) binds there.
+    Not scheduled.
+  - Remaining at 8,320 (rented) - K0 ~4 / P1 ~39 / K3 8.9 / cuBLASLt G2 11.3 (3.8 TB/s). Top rows hand over to lineage I (H43).
+  - Paused since r11 (no slot); precision logged for all 4 shipped rows (61-82 % of atol).
 - id: H
   thesis: Image-counter dataflow in one persistent tcgen05 kernel for the B >= 8 wide-C rows - a static work queue claimed
     through an atomic head, each item gated on per-image readiness counters instead of grid barriers.
@@ -138,49 +139,66 @@ lineages:
     plus consumer ld.acquire + fence.proxy.async is correct for TMA readers in other CTAs.
   - Keep. LN-statistics prestage must be a fully unrolled predicated load array; weight conversion must load JB=8 float4 into
     registers before any shuffle; scalar red.add volume scales with split-K (16K per item ~4 us).
-  - Revival only through intra-CTA overlap of item i's epilogue with item i+1's mainloop - now lineage K's thesis.
+  - Counter mechanics reused by D in r12 (H49) as a per-image wait inside the GEMM1 epilogue, not as a whole-kernel dataflow.
 - id: I
   thesis: Top-row specialist (64,96 and 32,128) - a pass-1 kernel with fixed warp roles that puts the conv on the FMA pipe
     from TMA-staged x row bands (register-blocked patches, taps in registers), the GEMM on tcgen05 against a streamed W1',
     and the LN fold / A&S GELU / sumsq / h stores on epilogue warps, so pass 1 runs within 1.5x of the SM pipe bound; GRN
     scale and GEMM2 follow the notebook recipe.
-  status: paused
+  status: active
   started: r10
   best: null
   conclusions:
-  - Seeded r10 from pool I18 (I3 fallback). Ceiling about +0.006 of mean (+0.01 at the pipe bounds); the two rows have the
+  - Seeded r10 from pool I18 (I3 fallback). Ceiling about +0.008 of mean if both rows drop 30-40 %; the two rows have the
     largest absolute S headroom on the board.
   - r10 gate - per-row 1-D bulk copies are issue-bound (copy-only 578 us); one 3-D TMA box per stage (OOB zero fill for the
-    halo) overlaps fully - conv-only 233.8 us at 64,96 (2.2x the 102 us FMA bound, gate <= 250 passed, 180 success missed),
-    55.8 us at 32,128; +12 % at the 128-reg cap.
-  - The FMA pipe binds at 64,96 (conv + GELU FMA + stats ~200 us at 1.95 GHz) ahead of MUFU (133) and DRAM (~140); the balanced
-    erf must not move MUFU work onto FMA.
-  - STEP 2 (tcgen05 GEMM1 + epilogue warps, d released per k16 channel group, smem 186 KB + A ring) and STEP 3 are unbuilt;
-    projection 480-550 us rented at 64,96.
-  - Paused r11 in incubation by operator directive (clock frozen; not retirable); resumes at STEP 2 when top-row slots return.
+    halo) overlaps fully - conv-only 233.8 us at 64,96 (2.2x the 102 us FMA bound), 55.8 us at 32,128; +12 % at the 128-reg
+    cap.
+  - The FMA pipe binds at 64,96 (conv + GELU FMA + stats ~200 us at 1.95 GHz) ahead of MUFU (133) and DRAM (~140); r11 K -
+    MUFU-heavy epilogue warps slow the producer/MMA warps sharing their SMSP by 30-40 %.
+  - Resumed r12 (incubation clock restarts; paused r11 by directive) - STEP 2 (tcgen05 GEMM1 + epilogue warps) and the K0/K3/cuBLASLt
+    tail as E3; projection 480-650 us rented at 64,96.
+  - If lineage L's Toeplitz conv passes its gate, the conv producer of this pass can move to the tensor pipe.
 - id: J
   thesis: Cluster split-K cells for the low-M wide-C rows (2,768 and 8,768) - both GEMMs split over K across a thread-block
     cluster so 144 CTAs work instead of 24-96, partials reduced inside the cluster before the GELU (GEMM1) and before the
-    residual store (GEMM2), so the long serial K loops and the per-element scalar red.add disappear.
-  status: active
+    residual store (GEMM2).
+  status: paused
   started: r11
   best: null
   conclusions:
-  - Seeded r11 from pool I13 + I2. Ceiling arithmetic - 2,768 GEMM1 3.4 + 2 us on 24 CTAs -> ~0.6 mainloop + ~1.2 exchange
-    + ~0.4 epilogue; GEMM2 ~8 us on <= 24-48 units -> ~3-4; row ~24 -> ~17 rented (-30 %), 8,768 ~31 -> ~24 (-20 %), about
-    +0.005 of mean.
-  - Gate risk is the exchange (50-100 KB per CTA); DSMEM measured 12-18 B/clk/SM in r1, so the L2 route or bulk-reduce route
-    is the default.
+  - r11 gate failed on configuration, not idea - a 50 KB exchange at fan-in 4-6 took 1.63 us (> 1.5 line); its own probes
+    show KS2 cells (cluster of 2, 148 co-resident) at 0.54-0.66 us and fp16-packed partials under 1.5 us.
+  - Value shrank - 2,768 is no longer in the cheapest allocation (S 0.737) and 8,768 needs -9.7 %; KS2 gives 48 GEMM1 CTAs
+    at 2,768 and 192 > 148 at 8,768 with 98-token tiles.
+  - Paused r12 in incubation (not retirable); revisit after H49, which removes g and changes the GEMM2 that J would reduce.
 - id: K
   thesis: Persistent warp-specialised tcgen05 engine for the multi-tile wide-C rows (32,768, 16,768, 16,384, stretch 8,384)
     - fixed TMA / MMA / epilogue warp roles and two TMEM accumulators so the epilogue of tile i runs under the mainloop of
-    tile i+1 in both GEMMs, over balanced static tile lists of N >= 196.
-  status: active
+    tile i+1.
+  status: paused
   started: r11
   best: null
   conclusions:
-  - Seeded r11 from the leader story 'uniform engine quality' and H's revival note. Ceiling arithmetic - GEMM1 phase 20-28
-    us at 16,384 / 32,768 against ~10-14 us with the epilogue (the binding CUDA-core term) spread evenly and the mainloop
-    hidden; rows -15..-22 %, about +0.004-0.006 of mean.
-  - First gate is whether a 12-14 warp epilogue keeps >= 80 % of its rate while the MMA warp runs the next tile (issue-slot
-    and TMEM-port sharing).
+  - H47 refuted - co-running keeps 60-70 % (epilogue) and 54-65 % (MMA) of solo rates in every store variant; overlap saves
+    16-24 % of serial work; projection 21 us vs the <= 19.6 us line at 32,768.
+  - Limiter is issue/dispatch sharing inside each SMSP - the TMEM lane-quadrant rule forces epilogue warps onto all 4 schedulers,
+    so MUFU work slows the MMA warp's per-stage hand-off by 265-355 clk.
+  - STEP 0a KEY - straight-line 1SM issue 50 / 66 / 114 / 130 clk at N = 64 / 128 / 224 / 256 (ideal from N=128); pairs add
+    per-SM rate only at N=64.
+  - For a 2-tile CTA the overlap hides only one mainloop (~-1.3 us at 32,768); most of K's projected gain was balance (H41
+    territory).
+  - Paused r12 in incubation (not retirable). Revival levers - MUFU-free overlapped epilogue, one epilogue warp per SMSP,
+    fewer heavier MMA stages from resident slices.
+- id: L
+  thesis: Tensor-core depthwise conv for the HW >= 1024 rows - a Toeplitz formulation (per channel, 7 tap-row MMAs of shifted
+    x rows against banded weight matrices, x landed by a TFLOAT32 3-D TMA box into kind::tf32 or fp16 hi/lo) so the conv runs
+    on the tensor pipe at ~1.6-1.8x faster than its FMA bound and leaves the FMA pipe to the GELU.
+  status: active
+  started: r12
+  best: null
+  conclusions:
+  - Seeded r12 from pool I15 (new_design). Arithmetic - ~9-10x FLOP inflation against 16x the FMA rate (kind::tf32) gives
+    an MMA-bound conv of ~60 us at 64,96 rented vs I's 233.8 us FMA conv.
+  - Gate risks - row shifts that are not multiples of the 8-row swizzle atom (descriptor base offset), T construction per
+    channel, and the precision of TF32 x and taps on top of the d16 rounding (simulate first).

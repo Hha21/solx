@@ -1,0 +1,63 @@
+id: r12-l-e4-toeplitz-gate
+parents: [r0-convnext-coop-fp32-anchor]
+operation: new_design
+language: cuda_cpp
+niche:
+  mem: ldg128
+  st: direct
+  grid: persistent
+  launch: fused
+  tile: rows128
+  red: cta
+  cache: default
+  spec: all
+hypothesis: >-
+  H50 gate. A Toeplitz depthwise 7x7 conv on tcgen05 kind::f16 runs at 60 clk per N=112 MMA in isolation, but in a
+  full conv kernel it is shared-memory-bandwidth bound: 7.5 KB of operand reads per 60 clk is about 125 B/clk per SM.
+  The best full kernel (conv + fp16 d write) runs 155 us at 64,96 and 57.8 us at 32,128 rented, against gate lines of
+  100 / 25 us. The shipped code is the r0 anchor; the probe kernel is archived behind #if 0.
+expected_effect:
+  S: {pct: 0, confidence: high}
+  M: {pct: 0, confidence: high}
+  L: {pct: 0, confidence: high}
+resources_sm100a:
+  regs_per_thread: 128
+  smem_per_cta_bytes: 70208
+  threads_per_cta: 256
+  ctas_per_sm: 2
+  bytes_in_flight_per_sm: 65536
+  launches_per_call: 1
+knobs: {probe_tconv: "576 thr (16 convert/epilogue warps + TMA warp + MMA warp), 1 CTA/SM, 148 CTAs, 8-row TMA boxes, NSLOT 30-37 (64,96) / 65-78 (32,128), A double-buffered, TMEM 2x128 cols"}
+tests: [H50]
+findings:
+  - "STEP 0 precision sim (fp64 on B200, harness generators, 2 seeds per row, full pipeline: d16, fp16(W1), exact erf, h16, fp16(s_b*W2)); max |err| as a share of atol (seed 200/201), 0 beyond atol in every case. 64,96 (atol 3.8e-3): fp32 conv 57/59 %, TF32 x+taps 61/67 %, fp16 x+taps 61/67 %, hi/lo x 64/65 %, hi/lo taps 57/62 %, both 57/59 %. 32,128 (atol 3.2e-3): fp32 61/64 %, TF32 = fp16 79/72 %, hi/lo x 67/67 %, hi/lo taps 65/68 %, both 61/64 % [probe_b200]"
+  - "Precision verdict: TF32 and fp16 operands give bit-identical error here (same 10-bit mantissa, values within the fp16 range), so kind::f16 at twice the kind::tf32 rate is the format; TF32 has no use for this conv. Cheapest form at or under 75 %: single fp16 at 64,96 (67 %); hi/lo fp16 taps at 32,128 (68 %), because single fp16 reaches 79 % there [probe_b200]"
+  - "STEP 1 row shift solved without copies: A = x rows in fp16, K-major SWIZZLE_NONE with SBO = 128 (8-row core matrices of one K chunk contiguous) and LBO = 137*16 = 2192 (odd row count, conflict-free STS.128), so tap row i is start + 16*i B. SW128 A with start + 128*i and base_offset = (addr>>7)&7 also runs at the same MMA rate (timed only, not value-checked). Descriptor version bit 46 = 1; LBO is the K-direction stride and SBO the M/N-direction stride (the swapped assignment gave NaN) [probe_b200]"
+  - "Toeplitz B without materialising T: with output columns reversed (n' = N-1-w'), T[k][n'] = tap[i][k+n'-N] depends only on q+g' per core matrix. So LBO = SBO = 128 B over a strip of 2KS+N/8-1 core matrices reproduces the whole 128x112 B per tap row. Only 2 of 29 cores are nonzero per tap row; overlapping tap-row regions at a 16-core offset give 16 KB for all 7 rows (vs 200 KB dense), and about 900 fp16 values to rewrite per channel [probe_b200]"
+  - "Validation: d16 vs an fp64 conv of fp16-rounded x and taps (+bias) shows 0 elements beyond 1 fp16 ulp + 2e-6 at 64,96 (77M) and 32,128 (16.8M). max |d - fp32 conv| is 8.6e-3 / 7.8e-3, against 7.66e-3 / 5.25e-3 from fp16 rounding of d alone. HILO build: 14 deviations, all at tiny |d| (fp32 accumulation noise). The first metric (relative ulps) flagged 6.5k elements; all were |d| ~1e-4 values off by about 5e-7, which is tensor-core accumulation noise, not a bug [probe_b200]"
+  - "STEP 2 strip kernel (channel-major plane list per CTA, consecutive images of one channel stacked at period PP = 120 / 72 rows so M=128 tiles are 93 % / 89 % useful; OOB TMA rows supply the halo; T rewritten per segment). Rented, harness_time, at 1.81-1.83 GHz. v1 (one-thread TMA, 17-box wait per tile, per-thread STG.64): 64,96 173 us, NOMMA 161, NOSTORE 146. 1-D bulk producer: 188.5. Per-warp box ownership with EMPTY count 1: 181, NOSTORE 131.5 (stores were binding) [probe_b200]"
+  - "Uncoalesced epilogue stores cost about 50 us at 64,96 (each lane writes 56 B of a different row). Staging the 128-row d16 tile in smem and writing each plane's contiguous row run with cp.async.bulk S2G (at most 2 per tile) brought 181 down to 158.3 us. A 32-lane TMA producer gave 155.3; an aligned TMA box without halo columns gave 157.2 (no gain). 32,128: 57.8 us single, 60.6 hi/lo taps, 62.9 aligned [probe_b200]"
+  - "KEY limiter. Isolated MMA microbench (56 straight-line MMAs, 1 and 148 CTAs): 60.4 clk/MMA at N=112 (1.08x ideal) for every layout (no-swizzle aliased Toeplitz B, plain no-swizzle B, SW128 A with base offset, SW128/SW128); N=128 64.3; N=64 48.4 (1.5x ideal). In the kernel the rate falls to 98 clk/MMA with no x loads (NOLOAD 127.5 us; the epilogue alone takes 50.7 us) and 117-138 clk with loads. One N=112 MMA reads 4 KB of A plus 3.5 KB of B, about 125 B/clk, so the tensor core saturates the 128 B/clk shared-memory port. Staging TMA writes, conversion LDS/STS, epilogue STS and bulk-store reads all come out of MMA time [probe_b200]"
+  - "Operand smem traffic is about 28 B per output (7 tap rows x (N+7)/16 k-steps x (128+N)x32 B / (128 x N)): 2.15 GB per call at 64,96, about 62 us rented or 76 us at 1.5 GHz, before staging or epilogue traffic. MMA busy share in the full build is about 50 % (40 tiles x 56 x 60.4 clk against a 147 us span). STACK: the probe is not compiled into the shipped build; the anchor build has 0 B local [probe_b200, compile_b200]"
+  - "Gate verdict H50. Success line missed: 155 us > 100 at 64,96 and 57.8 us > 25 at 32,128 (2.3x). Refutation not fired at 64,96 (155 < 180; the row shift needs no extra smem or L2 traffic; single fp16 is at 67 % of atol). At 32,128 the conv sits 2.6x above its FMA bound and needs hi/lo taps for precision. Against I's FMA conv (233.8 us conv-only, no d write) the Toeplitz pass is 34 % faster but writes 154 MB of d16 [probe_b200]"
+  - "Structural dead end for fusion: the Toeplitz tile is 128 output rows of ONE channel. It cannot produce the [C][token-tile] d tile that a fused pass-1 GEMM1 needs (one image's d at C=96 is 2.4 MB). Lineage I would need a separate conv pass plus a d16 round trip (154 MB write + read at 64,96) and LN statistics computed in the consumer from its smem d tile. So 'move I's conv producer to the tensor pipe' does not hold as stated [INFERRED]"
+  - "CTA-local LN partials (the brief's design) conflict with M utilisation: covering all C channels of a token band forces bands of about 24-28 rows, so 3-4 bands with 6-row halos per 128-lane tile is 75-80 % useful against 93 % for channel-major strips. The probe writes d16 only; LN sums belong in the GEMM1 consumer [INFERRED]"
+  - "Dead ends / pitfalls: a LOADONLY diagnostic build (workers release boxes without converting) hangs, so diagnostic variants must keep warps in lockstep. Probe stdout is lost on a 120 s timeout, so run risky variants in subprocesses with timeouts. /tmp does not persist between probes. torch.backends.cudnn.conv.fp32_precision='ieee' is needed for an exact reference conv [probe_b200]"
+  - "Next levers if L continues (none reaches the 100 us line on paper): cta_group::2 pairs (per-SM operand bytes 7.5 -> 5.75 KB per MMA, -23 %); A from TMEM removes A smem reads but needs 7 x 64 + 2 x 112 = 672 TMEM cols at 64,96 (does not fit), while at 32,128 the transposed form (Toeplitz A in TMEM, x as N=64 B) needs 7 x 40 + 128 = 408 cols (fits); fusing the d16 write into a GEMM1 that consumes it is impossible (see above) [INFERRED]"
+  - "Shipped archive build: r0 anchor unchanged plus the probe behind #if 0. compile_b200: 128 regs, 0 B local. run_tests 16/16 PASS (rented, same container vs r11-merge-b: 64,96 5586 vs 855 us, 32,128 1649 vs 225 us, as expected for the anchor) [compile_b200, run_tests]"
+paths:
+  - {max_tokens: null, lang: cuda, width: 128, threads: 256, rows: 128, grid: persistent, mem: ldg, launches: 1, x: none, w: none, st: none, cluster: 1}
+runs_on:
+  H200: {runs: true, representative: false, note: "anchor only; the archived tcgen05 probe needs sm_100a"}
+  A100: {runs: true, representative: false, note: "anchor only"}
+  L40S: {runs: true, representative: false, note: "anchor only"}
+risks:
+  - "Ships nothing new: the archived solution is the r0 anchor (portal ~0.30); do not merge any row from it"
+  - "The #if 0 probe source is reference only; the 64,96 single-fp16 precision (67 % over 2 seeds) and the 32,128 hi/lo requirement are from simulation plus d16 validation, not a 10-round end-to-end log"
+measure_first: [H200]
+compliance:
+  single_stream: true
+  no_cross_call_state: true
+  fp32_math: true
+  no_threads_or_fork: true
+  no_precompiled_binaries: true

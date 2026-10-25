@@ -1,0 +1,94 @@
+id: r12-d-e1-h48-gate-parent
+parents:
+  - r11-d-e1-g2-mp2-bulk
+operation: structural_mutation
+language: cuda_cpp
+niche:
+  mem: tma-tensor
+  st: bulk
+  grid: persistent
+  launch: fused
+  tile: token
+  red: cta
+  cache: default
+  spec: dispatch:size
+hypothesis: >-
+  H48 is refuted at its STEP 0 gate. Removing the sc_kernel weight chain entirely changes nothing: no fp32 W1/W2 loads,
+  no conversion, no fp16 scratch writes. Stub (a) moved the five gate rows by -0.47 / -0.06 / +0.42 / +0.02 / +0.32 us,
+  about +0.05 us on average, where the gate needed -1.2. The weight loads are already in flight under the depthwise
+  conv, which takes 2.8-10.5 us after the planes land and is the real phase-A term on these rows. Owner-converted
+  resident weights cannot save time that is already hidden. Per the E1 directive, the parent ships unchanged: the
+  code is byte-identical apart from two comments.
+expected_effect:
+  S:
+    pct: 0
+    confidence: high
+  M:
+    pct: 0
+    confidence: high
+  L:
+    pct: 0
+    confidence: high
+resources_sm100a:
+  regs_per_thread: 168
+  smem_per_cta_bytes: 232448
+  threads_per_cta: 384
+  ctas_per_sm: 1
+  bytes_in_flight_per_sm: 196608
+  launches_per_call: 1
+knobs:
+  sc_rows: "unchanged r10/r11 kSCRows table (NS re-swept in r12: the table values win)"
+  TC_ONEMMA: 1
+  TC_BULK: 1
+  TC_STAMPS: 0
+  SC_STAMPS: 0
+dispatch:
+  - shapes: "2,768,7,7 8,768,7,7 16,768,7,7 32,768,7,7 8,384,14,14"
+    kernel: "tc_kernel (r11, unchanged)"
+    meta: {grid: "num SMs, cooperative"}
+  - shapes: "16,384,14,14"
+    kernel: "tc2_kernel<384,196> (r10, unchanged)"
+    meta: {}
+  - shapes: "C <= 192 rows, 1,160,449,7"
+    kernel: "sc_kernel (r10, unchanged)"
+    meta: {}
+  - shapes: "8,320 / 32,128 / 64,96"
+    kernel: "convnext_fused (r0 anchor, merge-only)"
+    meta: {}
+tests:
+  - H48
+findings:
+  - "Fast loop: an sc_kernel-only .cu (helpers + sc_kernel + sc_plan/launch, about 500 lines) builds 7 nvcc variants in parallel in 5.6 s and is called through ctypes (a WSArgs Structure, workspace from torch.empty, the current stream). harness_time over 5 rows x 4 variants x 3 rounds takes about 4 s. The parent-equivalent build matches the torch fp32 reference within 1.8-2.3e-3 on all 7 sc rows, with the same regs as the parent (168/168/122) and STACK 0 [probe_b200]"
+  - "STEP 0 gate, interleaved x3 (rented us, parent / stub a = no weight pass, garbage scratch / stub b = a + no GEMM1 A TMA / stub c = b + no GEMM2 A TMA): 1,192 18.17 / 17.70 / 17.52 / 17.52; 2,96 25.04 / 24.98 / 24.58 / 24.82; 4,192 28.46 / 28.89 / 28.31 / 28.60; 1,160 25.06 / 25.08 / 24.78 / 24.59; 8,192 42.30 / 42.62 / 41.89 / 41.99. Stub (a) vs parent: -0.47 / -0.06 / +0.42 / +0.02 / +0.32 us, mean +0.05 against the -1.2 us gate. GATE FAILED; H48 refuted. Even stub (b), which also skips the post-sync TMA of A, saves only 0.16-0.64 us (mean -0.39) [probe_b200]"
+  - "Stamps (globaltimer, after a 252 MB flush, CTA medians from the first CTA start, median of 5 calls; parent -> stub a), in us: weight loads issued / planes landed / conv end / phase-A end / sync-1 release. 1,192 1.79 / 2.30 / 5.12 / 5.89 -> 5.63 / 7.94 -> 7.17. 2,96 1.02 / 2.05 / 7.94 / 9.73 -> 9.47 / 11.52 -> 11.26. 4,192 1.79 / 2.30 / 8.45 / 9.47 -> 9.22 / 11.26 -> 11.01. 1,160 1.28 / 2.05 / 6.14 / 7.94 -> 7.68 / 9.73 -> 9.47. 8,192 2.82 / 3.33 / 13.82 / 15.36 -> 14.85 / 17.41 -> 17.66. The W1/W2 fp32 loads do not delay the plane copies (landing at 2.0-3.3 us is the same with or without them). The conversion after the conv is the only exposed weight term: 0.25-0.5 us of phase-A end, and 0.25-0.8 us at sync 1, which the cg barrier then absorbs. The 2.6-3.1 us chain in the r7 ledger predates r8's loads-first order [probe_b200]"
+  - "KEY: the sc rows' phase A is the depthwise conv, 2.8 / 5.9 / 6.2 / 4.1 / 10.5 us after the planes land at 1,192 / 2,96 / 4,192 / 1,160 / 8,192. That is roughly 5-10x its FMA bound (1,192 about 0.2 us, 8,192 about 1.6 us at 1.95 GHz) and about 3x a per-SM LDS estimate (8,192 about 2.6 us). The cause is latency at low occupancy: 1,192 runs 192 thread-items (6 warps per SM, 1 plane each) on 120 of 148 CTAs, and 8,192 runs 320 items of 4 serial planes [probe_b200, INFERRED]"
+  - "Lead (not shipped): moving the conv's scattered stores out of the loop (fp16 d staged in smem, then one warp per plane writing d16 and out = x + b2 with lane-contiguous stores from the plane copy; arithmetic and roundings unchanged, max diff vs the parent <= 3e-4 from red.add order). Interleaved x3, two independent runs, rented us: 4,96 -1.38 / -1.36; 1,160 -0.62 / -1.00; 2,96 -0.63 / -0.41; 8,192 -0.47 / -1.03; 1,96 -0.06 / -0.04; 1,192 +0.57 / -0.13; 4,192 +0.30 / -0.26. Regs fall 168 -> 107 at C=96/192. A timing-only stub without any conv stores bounds the store share at 0.1-2.5 us (8,192 -2.5, 4,96 -2.25, 1,160 -1.34). A shape-dispatched coalesced path on 4,96 / 1,160 / 2,96 / 8,192 is worth about -0.5..-1.4 us there (about +0.0005-0.001 of mean). It needs run_tests and a single-seed check before the merge [probe_b200]"
+  - "Dead end: NS (row strips) re-swept on all 7 sc rows, with and without coalescing (1,192 NS 10/14/28; 1,96 6/8/14; 2,96 3/4/7; 1,160 3/4/6; 4,96 3/4/7; 4,192 3/4/7; 8,192 3/4/7). The shipped NS is fastest on every row; more strips (more CTAs, fewer rows per item) cost +0.5..+3.4 us because of the extra halo copies and the shorter conv segments per thread [probe_b200]"
+  - "Next lever for the sc rows (r13): the conv itself, not the weights. Use all 12 warps per CTA with smaller items (split the 7-wide segment or the tap rows, or give the 28 idle CTAs at 1,192 a share), register-blocked patches reading taps once per lane, and the coalesced store path above. The ceiling is about -1.5 us at 1,192 and -5..-6 us at 8,192 / 4,96 if the conv reached ~2x its LDS bound [INFERRED]"
+  - "Budget used: 0 compile_b200, 0 run_tests (the shipped code is byte-identical to r11-d-e1-g2-mp2-bulk, which passed 16/16 including the portal-order re-runs), 7 probes. Precision: arithmetic unchanged, so the r8 10-round log stands (sc 79-89 % of atol, tc 59-65 %). Stamps and stubs were built only in probes; the shipped build has SC_STAMPS / TC_STAMPS = 0 [INFERRED]"
+  - "Pitfall: /tmp persisted between some probes in this session and not others (one probe found /tmp/s0 missing). Check for the file and re-embed the source when it is absent [probe_b200]"
+paths:
+  - {max_tokens: 1568, lang: cuda, width: 128, threads: 512, rows: 128, grid: persistent, mem: tma, launches: 1, x: none, w: none, st: none, cluster: 1, note: "tc_kernel / tc2 (r11, unchanged)"}
+  - {max_tokens: 12544, lang: cuda, width: 128, threads: 384, rows: 128, grid: persistent, mem: tma, launches: 1, x: none, w: none, st: none, cluster: 1, note: "sc_kernel unchanged on the C <= 192 rows and 1,160"}
+  - {max_tokens: null, lang: cuda, width: 128, threads: 256, rows: 128, grid: persistent, mem: ldg, launches: 1, x: none, w: none, st: none, cluster: 1, note: "r0 fp32 anchor on 8,320 / 32,128 / 64,96 (merge-only)"}
+runs_on:
+  H200:
+    runs: false
+    representative: false
+    note: "tcgen05/TMEM paths are sm_100a-only"
+  A100:
+    runs: false
+    representative: false
+  L40S:
+    runs: false
+    representative: false
+risks:
+  - "None new: the code is identical to the parent. The merge should keep r11-merge-b's picks"
+measure_first:
+  - B200
+compliance:
+  single_stream: true
+  no_cross_call_state: true
+  fp32_math: true
+  no_threads_or_fork: true
+  no_precompiled_binaries: true

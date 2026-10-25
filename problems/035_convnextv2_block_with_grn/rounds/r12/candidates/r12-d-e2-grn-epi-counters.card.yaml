@@ -1,0 +1,97 @@
+id: r12-d-e2-grn-epi-counters
+parents:
+  - r11-d-e1-g2-mp2-bulk
+operation: structural_mutation
+language: cuda_cpp
+niche:
+  mem: tma-tensor
+  st: bulk
+  grid: persistent
+  launch: fused
+  tile: token
+  red: cta
+  cache: default
+  spec: dispatch:size
+hypothesis: >-
+  H49, partly supported. The GEMM1 epilogue keeps fp32 h in its own TMEM columns (tcgen05.st, so no register cost)
+  while the tile publishes its gf sums on a per-image-group counter and waits for the group. It then stores
+  h' = fp16(h*(1+gw*gf*inv_b)) once, so g and the second GEMM2 accumulator disappear. The GEMM2 phase drops 30-55 %
+  (32,768: 11.3 -> 6.7 us). But the image wait (~2 us per tile) and the extra h' pass (1-2.5 us) cancel the removed
+  g pass, so the wide-C rows move -9 % at 32,768, -3 % at 16,768 and 0..+3 % elsewhere (rented, same GPU as
+  r11-merge-b).
+expected_effect:
+  S:
+    pct: 0
+    confidence: medium
+  M:
+    pct: 0
+    confidence: medium
+  L:
+    pct: -3
+    confidence: medium
+resources_sm100a:
+  regs_per_thread: 128
+  smem_per_cta_bytes: 227608
+  threads_per_cta: 512
+  ctas_per_sm: 1
+  bytes_in_flight_per_sm: 196608
+  launches_per_call: 1
+knobs:
+  tc_rows: "NI/KS/NI2/MP: 2,768 1/12/1/1; 8,768 2/6/2/1; 16,768 3/6/2/2; 32,768 3/3/2/2; 8,384 1/3/0/1; 16,384 1/3/0/1 (tc_kernel, not tc2)"
+  gemm2_stage: "MP x 16 KB W2 + NAT2 x 8 KB h' (24-48 KB), NS2 = min(8, 192 KB / stage), two TMEM buffers of MP x 128 cols"
+  image_counter: "g_img_cnt/g_img_dep module-level, one 128-B line per image group, target HT tiles, reset by the last departer"
+  TC_STAMPS: 0
+dispatch:
+  - shapes: "2,768,7,7 8,768,7,7 16,768,7,7 32,768,7,7"
+    kernel: "tc_kernel<768,49> (H49 epilogue, one-accumulator GEMM2 over h', whole-image bulk-reduce drain)"
+    meta: {grid: "num SMs, cooperative"}
+  - shapes: "8,384,14,14 16,384,14,14"
+    kernel: "tc_kernel<384,196> (H49 epilogue, float4 red.add drain)"
+    meta: {grid: "num SMs, cooperative"}
+  - shapes: "all other rows"
+    kernel: "convnext_fused (r0 anchor; merge-only candidate, take those rows from r11-merge-b)"
+    meta: {}
+tests:
+  - H49
+findings:
+  - "Parent paths read from the card: r11-d-e1 dispatches the four C=768 rows to tc_kernel<768,49> (MP=2 only at 32,768), 8,384 to tc_kernel<384,196> and 16,384 to tc2_kernel. No pair path exists in this source. The parent card records the flat-barrier review and the 1500-call stress test as done in r10, so they were not repeated. The new counters got their own 400-call stress (below) [get_kernel parent text]"
+  - "NOT DONE from STEP 0: clk-per-MMA-instruction stamps of D's mainloops against r11 K's table (50/66/114 clk), and the precomputed-descriptor unrolled k16 loop. The budget went to H49 itself [INFERRED]"
+  - "Design: fp32 h is written back into its own TMEM accumulator columns with tcgen05.st.32x32b.x16 and re-read after the wait. This avoids holding 48-80 fp32 per thread across the wait (that would spill at the 128-reg cap). No hreg array remains, so the shipped build has REG 128 / STACK 0 (768,49) and REG 114 / STACK 0 (384,196), checked with cuobjdump -res-usage on an nvcc sm_100a build of the identical device code [probe_b200, compile_b200]"
+  - "run_tests 16/16 PASS twice (portal-order re-runs included). Rented us, this vs r11-merge-b on the same GPU (final build / first build with 16,768 at KS3 MP1): 32,768 54.4 / 54.2 vs 59.6 (-8.8 / -9.0 %); 16,768 39.4 / 39.5 vs 40.6 (-3.1 / -2.8 %); 8,384 33.4 vs 33.6 (-0.6 %); 8,768 30.3 vs 30.1 (+0.7 %); 16,384 50.5 / 51.0 vs 50.1 (tc_kernel H49 vs r10 tc2, +0.7..+1.7 %); 2,768 24.1 / 23.8 vs 23.4 (+1.8..+3.0 %). The other 10 rows run the r0 anchor (merge-only) [run_tests]"
+  - "Stamps (stamped build, flushed, CTA median/max, us). GEMM2 phase sync2->end: 2,768 1.28; 8,768 2.30; 16,768 5.12; 32,768 6.66; 8,384 2.30; 16,384 4.86. The parent's were 1.5 / 3.3 / 7.3 / 11.3 (MP=2) / 3.0, so the GEMM2 stage time does fall without g (that refutation clause does not fire) [probe_b200]"
+  - "Per-tile GEMM1 epilogue (median us: pass 1 / image wait / pass 2). 2,768 1.28 / 1.95 / 0.96; 8,768 2.08 / 2.14 / 1.57; 16,768 2.98 / 2.30 / 2.34; 32,768 3.47 / 2.18 / 2.51 (max wait 10.7 on the 4 first-tile CTAs whose group needs second tiles); 8,384 3.46 / 1.79 / 2.43; 16,384 3.55 / 1.95 / 2.32. The sum equals or exceeds r9's post-accumulator time without g (2.05 / 3.36 / 4.77 / 5.17), so the epilogue gains nothing net; the row gains come from GEMM2 [probe_b200]"
+  - "Image-wait median 1.8-2.3 us: above the 1.5 us success line, below the 2.5 us refutation line. A no-wait timing stub (wrong results, timing only, never shipped) shows the whole wait costs only 0.9-1.4 us end-to-end (2,768 24.0->22.7, 8,768 30.2->29.3, 16,768 40.2->38.8, 32,768 54.6->53.2, 8,384 33.8->33.4, 16,384 51.1->49.9, harness_time x3). A perfect counter cannot reach the 10 % bar at 16,768 [probe_b200]"
+  - "Dead end: running the deferred W2 conversion inside the image-wait window (publish, then W2 work, then spin) was slower on every row (8,768 +2.4 us, 32,768 +2.0, 16,768 +1.6) and put tc_kernel<768,49> at STACK 88. The W2 pass is already hidden under the GEMM1 mainloop [probe_b200]"
+  - "GEMM2 tables after g removal (harness_time x3, same container): 16,768 KS6 MP2 38.5 vs KS3 MP1 40.0 (adopted; the two TMEM buffers now hold MP=2 units). Rejected: 8,768 KS12 MP2 30.6 / NI2=1 MP2 30.2 vs 30.2; 32,768 NI2=1 MP2 57.8 / KS6 MP2 56.7 vs 54.4; 8,384 KS6 35.7 vs 33.6; 16,384 KS2 52.2 vs 51.3 [probe_b200]"
+  - "PRECISION LOG (fp64 reference, harness generator rules, torch.manual_seed(200), 10 rounds per row, KS3 build): 2,768 1.674e-3 / 2.6e-3 (64 %), 0 beyond; 8,768 1.883e-3 / 2.9e-3 (65 %), 0; 16,768 1.891e-3 / 2.9e-3 (65 %), 0; 32,768 1.876e-3 / 2.9e-3 (65 %), 0; 8,384 1.863e-3 / 2.8e-3 (67 %), 0; 16,384 1.870e-3 / 3.3e-3 (57 %), 0. h' is rounded once from fp32 (h * s); gf uses fp32 h. The shipped 16,768 KS6 MP2 differs only in the fp32 split-K summation order (max diff vs KS3 < 1e-3, checked); 16/16 x 10 rounds pass in run_tests [probe_b200, run_tests]"
+  - "Counter stress: 400 consecutive calls each at 8,768, 32,768 and 16,384 (output NaN-filled before each call) gave worst |err| vs fp64 1.61e-3 / 1.81e-3 / 1.81e-3 and no NaN. The self-reset through the departure counter holds across calls and across the two instantiations sharing the counter cells [probe_b200]"
+  - "Verdict H49: success missed (needed >= 10 % at 32,768 and 16,768 plus >= 5 % at 8,768; got -9 / -3 / +1 %). Refutation not fired (32,768 is -9 %, so not < 4 % on both; image wait < 2.5 us; GEMM2 phase falls). Mechanism: removing g pays in GEMM2 (L2-bound stages carry 25-33 % fewer bytes) but not in GEMM1, where the per-image wait plus a second TMEM pass replace the g pass at about equal cost [INFERRED]"
+  - "Merge advice: take 32,768 from this kernel (-5.2 us rented, about -6 us portal, ~+0.001 of mean). 16,768 (-1.2 us) only if an interleaved merge timing confirms. Keep r11-merge-b for 2,768, 8,768, 8,384 and 16,384 (tc2). Next levers for D: overlap one tile's image wait with the next tile's pass 1 on 2-tile CTAs (32,768, 16,384; worth at most one wait, ~1-2 us), and a lighter pass 2 [INFERRED]"
+  - "Pitfall/tooling: /tmp persists between probes in one session here, and nvcc -shared of the tc-only file built in < 2 s, so source-string variants (str.replace on the saved .cu) give a seconds-long build-and-time loop through ctypes + harness_time [probe_b200]"
+paths:
+  - {max_tokens: 1568, lang: cuda, width: 128, threads: 512, rows: 128, grid: persistent, mem: tma, launches: 1, x: none, w: none, st: none, cluster: 1, note: "tc_kernel<768,49> / <384,196> with the H49 epilogue (per-image-group counter wait, h' stored once) and one-accumulator GEMM2"}
+  - {max_tokens: null, lang: cuda, width: 128, threads: 256, rows: 128, grid: persistent, mem: ldg, launches: 1, x: none, w: none, st: none, cluster: 1, note: "r0 fp32 anchor on every non-wide-C row (merge-only candidate)"}
+runs_on:
+  H200:
+    runs: false
+    representative: false
+    note: "tcgen05/TMEM, tcgen05.st and cp.reduce.async.bulk paths are sm_100a-only"
+  A100:
+    runs: false
+    representative: false
+  L40S:
+    runs: false
+    representative: false
+risks:
+  - "Only 32,768 clearly beats r11-merge-b. The other wide-C rows are within noise or slower and should not be merged"
+  - "The image wait is a cross-CTA spin inside a cooperative launch. It is deadlock-free only because tiles are image-major, publish before waiting, and all CTAs are co-resident. Any later change to tile order or grid size must keep those three properties"
+  - "The stamped build has STACK 32/120 B, so stamp numbers are relative; the shipped build is STACK 0"
+  - "The 16,768 KS6 MP2 change doubles that row's reduction bytes; its -1.2..-1.5 us is a single-container measurement"
+measure_first:
+  - B200
+compliance:
+  single_stream: true
+  no_cross_call_state: true
+  fp32_math: true
+  no_threads_or_fork: true
+  no_precompiled_binaries: true

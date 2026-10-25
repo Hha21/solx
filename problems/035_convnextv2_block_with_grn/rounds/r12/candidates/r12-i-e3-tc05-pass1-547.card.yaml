@@ -1,0 +1,68 @@
+id: r12-i-e3-tc05-pass1-547
+parents: [r10-i-e3-tmaconv-gate]
+operation: structural_mutation
+language: cuda_cpp
+niche:
+  mem: ldg128
+  st: direct
+  grid: persistent
+  launch: fused
+  tile: rows128
+  red: cta
+  cache: default
+  spec: all
+hypothesis: >-
+  H43 STEP 2: fixed-role pass 1 for 64,96 (8 conv warps feeding fp16 d into an MN-major SW128 B tile,
+  tcgen05 kind::f16 GEMM1 against a resident W1', epilogue warps doing the LN fold, A&S erfc GELU,
+  per-(image,k) sumsq and fp16 h stores) runs within 1.5x of the SM pipe bound, i.e. pass 1 <= 400 us rented.
+  Measured: correct on the first engine build, but 547 us (best of 4 structures), so the gate fails and the
+  > 520 us refutation line is crossed. Pass 1 is still 18 % faster than G's 668 us. The shipped code is the
+  r0 anchor; the pass-1 kernel is archived disabled in i_pass1_tc05.cu. Nothing here is B200-only beyond
+  what the archive needs (tcgen05).
+expected_effect:
+  S: {pct: 0, confidence: high}
+  M: {pct: 0, confidence: high}
+  L: {pct: 0, confidence: high}
+resources_sm100a:
+  regs_per_thread: 128
+  smem_per_cta_bytes: 70208
+  threads_per_cta: 256
+  ctas_per_sm: 2
+  bytes_in_flight_per_sm: 65536
+  launches_per_call: 1
+knobs:
+  shipped: "r0 anchor unchanged"
+  archived_pass1_64_96: "512 thr (8 conv + 8 epilogue warps), 1 CTA/SM, grid 148, tiles 2x112 tokens (N=224), x ring 3 x 30 KB (8 ch, 2-ch sub-boxes 120x8x2), W1' resident 72 KB no-swizzle, d 48 KB single buffer, TMEM 2 x 256-col slots, 1 KB/warp store staging, dyn smem 228864 B"
+tests: [H43]
+findings:
+  - "ENGINE VALIDATED first build: A = fp16(lnw*W1) resident in no-swizzle K-major core-matrix layout (LBO = 128 B along K, SBO = 1536 B along M, +256 B per k16, +24576 B per 128-row block; the swapped LBO/SBO is wrong); B = gate d writer (MN-major SW128, LBO = C*128 = 12288, SBO 1024, +2048 per k16); idesc (1<<4)|(1<<16)|(224>>3)<<17|(128>>4)<<24, N=224 accumulators in 2 slots of 256 TMEM columns. h vs same-rounding fp32 torch: max 1.996e-3 (fp16 output rounding of |h| up to ~9), rms 1.9e-4; vs fp32-weight reference max 2.6e-3; gsum rel 5.8e-6; const rows 384..391 correct [probe_b200]"
+  - "BUG FOUND (would also affect any ring shared by alternating consumer groups): two conv warp groups alternating items over a 3-stage ring with one barrier per stage deadlock/fault intermittently ('unspecified launch failure', mostly under harness_time cold L2). A group running one item ahead waits on parity (p+1) while phase p is pending and sees phase p-1 as complete, then corrupts arrival counts. Fix: barriers indexed it % (2*NS) so each barrier is only waited on by one group, in program order. Stable over 5 direct repeats and 4 harness_time runs after the fix [probe_b200]"
+  - "Register cap: 448 threads (14 warps) still compiles to 128 regs, not 144; registers appear to be allocated per SMSP (4 warps on one scheduler -> 16384/128). So 512 threads costs nothing more than 448 [probe_b200]"
+  - "v1 (dedicated producer + MMA warps, 4 epilogue warps, 448 thr), harness_time rented us: full 608, no epilogue maths/stores 357, conv FMAs skipped 534, both skipped 286 [probe_b200]"
+  - "v2 (8 epilogue warps; conv warps refill their own 2-channel TMA sub-box; epilogue warp 8 issues the MMAs behind per-slot named barriers): full 585-588; no dfree wait (racy, timing only) 578 -> the single-d-buffer stall costs ~8 us; GELU replaced by identity 567 -> the A&S GELU costs only ~18 us; conv skipped 521; conv skipped + no epilogue 255; no dfree + no epilogue 349 [probe_b200]"
+  - "Stores: per-lane STG.128 to 32 different h rows is expensive: no h stores 509, store-only (no maths) 560, store-only with a 1 KB/warp smem transpose (16 rows x 32 B per STG) 462; full with staging 546.6 (best, -40 us vs direct) [probe_b200]"
+  - "Dead end: 4x56-token tiles (box 64x10x2, 1.5x fewer x bytes per tile) with a 4-stage same-group ring (refill it+4) ran 677 us, slower than 547: the refill slack (one item per group) matters more than bytes per tile; the skeleton is bound by x-ring latency, not bandwidth [probe_b200]"
+  - "Diagnosis: the terms add almost serially: skeleton 255 us (x-stream: 3 x 30 KB in flight, refilled on consumption, ~2 us per round; the r10 gate copy-only was 118 us with 123 KB in flight), conv +100, epilogue maths +120-150, h stores +40-90 (staged). Issue-count estimate for conv + epilogue is ~300 us at perfect IPC, so 400 needed ~75 % issue efficiency; we reach ~55 % [probe_b200, INFERRED]"
+  - "H43 verdict: gate (pass 1 <= 400 us) FAILED; refutation clause (pass 1 > 520 us after tuning, i.e. < 22 % better than G's 668) FIRES at 547 us (-18 %). The role layout fits (128 regs, STACK 0 in the measured ipass2 builds, 224 KB smem with 8 conv warps), so the second refutation half does not fire [probe_b200]"
+  - "Value left: pass 1 547 + G's tail (K0 3 + K3 8 + cuBLASLt G2 186, r7 numbers) ~ 744 us projected for the 64,96 row vs r11-merge-b 857.7 us measured in the same container (-13 %); the success line (<= 650) is missed, but at ~+0.0015 of mean STEP 3 is still worth building as a plain improvement. Not the +0.006 H43 promised [INFERRED, run_tests]"
+  - "Next levers, in order: (1) a deeper x ring: smem is spent on resident W1' (72 KB); stream W1' per hidden block or shrink d, and use NS >= 5 with cross-group refill (it+NS consumed by the other group); (2) bigger store staging (2 KB/warp -> 8 rows x 64 B per STG); (3) packed f32x2 (FFMA2/FMUL2) in the LN fold and GELU, since x0/x1 column pairs are natural pairs; (4) the 32,128 instantiation was not built [INFERRED]"
+  - "Package: compile_b200 128 regs / 0 spill on the anchor; the archive TU is preprocessed away. run_tests 16/16 PASS with the anchor (same container: 64,96 5614 vs r11-merge-b 857.7 us; anchor rows only). run_tests used a stub for i_pass1_tc05.cu; the full archive file was compile-checked in compile_b200 (code inside #if 0 only) [compile_b200, run_tests]"
+  - "Not done: STEP 3 (K0/K3/cuBLASLt tail), the 10-round fp64 precision log (roundings match G r7's logged path: d16, fp16(lnw*W1), h16, A&S erfc; GRN sums now from fp32 g), stamps per tile, the 32,128 instantiation, cuobjdump STACK on an nvcc build of the pass-1 kernel (NVRTC resources showed STACK 0) [INFERRED]"
+  - "Pitfall: probe containers reset /tmp between probes unpredictably; embed full sources each time [probe_b200]"
+paths:
+  - {max_tokens: null, lang: cuda, width: 128, threads: 256, rows: 128, grid: persistent, mem: ldg, launches: 1, x: none, w: none, st: none, cluster: 1}
+runs_on:
+  H200: {runs: true, representative: false, note: "shipped code is the r0 anchor; target_hardware B200 only"}
+  A100: {runs: true, representative: false}
+  L40S: {runs: true, representative: false}
+risks:
+  - "Ships nothing new: every row runs the r0 anchor (portal ~0.30); its value is the validated tcgen05 pass-1 engine, the parity-aliasing fix and the ablation numbers"
+  - "The 547 us pass 1 is a rented-clock number; the portal ratio for this SIMT/issue-bound kernel is likely ~1.25-1.3"
+  - "The pass-1 h layout [B][392][HW] with constant rows assumes G's cuBLASLt hi/lo b2' recipe for the tail (unbuilt here)"
+measure_first: [H200]
+compliance:
+  single_stream: true
+  no_cross_call_state: true
+  fp32_math: true
+  no_threads_or_fork: true
+  no_precompiled_binaries: true
