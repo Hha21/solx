@@ -291,8 +291,9 @@ def evidence_sections(arc, effects=True):
 
 
 def cmd_ideas(a):
-    """Ideas tier of a portfolio round: independent idea sessions and a premise audit (no GPU), run in parallel; the
-    merged, shuffled pool goes to rounds/<round>/ideas/pool.json for `round.py lead --portfolio`."""
+    """Ideas tier of a portfolio round: independent idea sessions (no GPU) in parallel, then a premise audit that also
+    probes the best ideas' cheapest tests on the B200; the merged, shuffled pool goes to rounds/<round>/ideas/pool.json
+    for `round.py lead --portfolio`."""
     import portfolio
     arc = get_archive()
     d = rdir(a.round) / "ideas"
@@ -300,19 +301,16 @@ def cmd_ideas(a):
     evidence = evidence_sections(arc, effects=False) + [f"=== LINEAGES ===\n{portfolio.lineages_text()}"]
     static = prompts.static_prompt()
     jobs = [(f"ideas{i}-{m}", m, portfolio.IDEAS_PROTOCOL,
-             f"Round {a.round}: write 10 design ideas and 3 leader stories for this problem.")
+             f"Round {a.round}: write 10 design ideas and 3 leader stories for this problem.", evidence, ["--no-gpu"])
             for i, m in enumerate(x for x in a.idea_models.split(",") if x)]
-    if a.critic_model:
-        jobs.append(("critic", a.critic_model, portfolio.CRITIC_PROTOCOL,
-                     f"Round {a.round}: audit the premises this project relies on."))
 
     def one(job):
-        name, model, protocol, task = job
+        name, model, protocol, task, ev, tools = job
         (d / f"{name}.briefing.txt").write_text(static + "\n\n" + protocol)
-        prompt = "\n\n".join([f"=== TASK ===\n{task}"] + evidence)
+        prompt = "\n\n".join([f"=== TASK ===\n{task}"] + ev)
         (d / f"{name}.prompt.txt").write_text(prompt)
         out = run_claude(prompt, d / f"{name}.briefing.txt", model, a.effort,
-                         ["--name", name, "--round", a.round, "--dir", str(d), "--no-gpu"], d, name,
+                         ["--name", name, "--round", a.round, "--dir", str(d)] + tools, d, name,
                          a.session_timeout * 60, max_turns=20)
         text = out.get("result") or ""
         (d / f"{name}.reply.md").write_text(text)
@@ -324,6 +322,14 @@ def cmd_ideas(a):
     with ThreadPoolExecutor(max_workers=max(1, min(a.parallel, len(jobs)))) as pool:
         replies = dict(pool.map(one, jobs))
     p = portfolio.pool(replies, seed=hash(a.round) & 0xffff)
+    if a.critic_model:          # after the ideas, so the critic can probe their premises on the B200 before the lead
+        tools = (["--gpu-calls", "0", "--probes", str(a.critic_probes), "--b200-minutes", str(a.critic_b200_minutes)]
+                 if a.critic_probes else ["--no-gpu"])
+        name, text = one(("critic", a.critic_model, portfolio.CRITIC_PROTOCOL,
+                          f"Round {a.round}: audit the premises this project relies on, and probe the pool's best ideas.",
+                          evidence + [portfolio.pool_text(p)[0]], tools))
+        replies[name] = text
+        p = portfolio.pool(replies, seed=hash(a.round) & 0xffff)     # same seed and ideas: the ids do not change
     (d / "pool.json").write_text(json.dumps(p, indent=1))
     fams = sorted({str(i.get("family", "-")) for i in p["ideas"]})
     print(f"pool: {len(p['ideas'])} ideas in {len(fams)} families, {len(p['leader_stories'])} leader stories, "
@@ -994,10 +1000,12 @@ def main():
         q.add_argument("--resume", action="store_true", help="auto --use-plan --backend claude: continue this "
                        "round's sessions that ended without a candidate (e.g. cut off by the plan's session limit) "
                        "from their saved Claude session; tasks that already gave a candidate are skipped")
-    q = sub.add_parser("ideas", parents=[llm_args], help="portfolio round: idea sessions + premise audit (no GPU)")
+    q = sub.add_parser("ideas", parents=[llm_args], help="portfolio round: idea sessions, then a premise audit that probes them on the B200")
     q.add_argument("--round", required=True)
     q.add_argument("--idea-models", default="opus,sonnet,fable", help="one idea session per model (comma-separated)")
     q.add_argument("--critic-model", default="opus", help="model for the premise audit ('' for none)")
+    q.add_argument("--critic-probes", type=int, default=8, help="probe_b200 calls for the critic (0: no GPU)")
+    q.add_argument("--critic-b200-minutes", type=int, default=10, help="Modal B200 minutes for the critic's probes")
     q = sub.add_parser("research", parents=[llm_args], help="research phase for a new problem")
     q.add_argument("--remeasure", action="store_true", help="redo the B200 copy-floor and reference measurements")
     q.add_argument("--from-reply", action="store_true", help="finish from the saved research reply (no agent run)")

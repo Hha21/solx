@@ -72,12 +72,20 @@ the kind of error you are here to catch.)
    (with numbers), what changes if it is wrong, and the cheapest measurement that settles it. Flag hypotheses refuted
    or supported on one noisy result (portal noise is about +-0.008 score per submission; bench effects under ~3%
    need interleaved repeats). Fewer, solid objections beat many weak ones; "no doubtful premises" is a valid answer.
+4. Probe the pool. You see this round's IDEAS POOL and, when the rented B200 is attached, have probe_b200 (seconds per
+   probe; no compile_b200 or run_tests). For the ideas with the best expected value whose stated cheapest test fits in a
+   probe, and for your own doubtful premises, run the test and report the number, so the lead seeds lineages whose
+   premise has survived. Time only compile-time variants: runtime flags inside a timed kernel slow it and mislead (r11).
 This session returns an audit, not a kernel: ignore the OUTPUT CONTRACT and answer in this format:
 ### Audit
 (at most 400 words)
 ```json premises
 [{"claim": "...", "where": "ledger H7 / card section 4 / finding in <kernel id>", "verdict": "wrong|unsupported|overstated",
   "why": "...", "if_wrong": "...", "test": "..."}]
+```
+```json probes
+[{"idea": "I7 or a premise", "test": "what the probe measured", "result": "the number, with units",
+  "verdict": "holds|fails|unclear", "note": "what it means for the idea"}]
 ```"""
 
 LEAD_PROTOCOL = """=== RESEARCH LEAD PROTOCOL (PORTFOLIO) ===
@@ -216,7 +224,7 @@ def save_lineages(text):
 def pool(replies, seed=0):
     """Merge idea-session replies into one pool: ideas shuffled and renumbered (sources hidden from the lead)."""
     import reply
-    ideas, stories, premises, sources = [], [], [], {}
+    ideas, stories, premises, probes, sources = [], [], [], [], {}
     for name, text in replies.items():
         blocks = reply.named_blocks(text)
         for key, body in blocks.items():
@@ -232,12 +240,14 @@ def pool(replies, seed=0):
                 stories.extend(s for s in items if isinstance(s, dict))
             elif key.startswith("json") and "premises" in key:
                 premises.extend(p for p in items if isinstance(p, dict))
+            elif key.startswith("json") and "probes" in key:
+                probes.extend(p for p in items if isinstance(p, dict))
     random.Random(seed).shuffle(ideas)
     out = []
     for n, (src, idea) in enumerate(ideas, 1):
         sources[f"I{n}"] = src
         out.append(dict(id=f"I{n}", **{k: v for k, v in idea.items() if k != "id"}))
-    return dict(ideas=out, leader_stories=stories, premises=premises, sources=sources)
+    return dict(ideas=out, leader_stories=stories, premises=premises, probes=probes, sources=sources)
 
 
 def pool_text(p):
@@ -249,6 +259,9 @@ def pool_text(p):
                         for s in p.get("leader_stories") or [])
     audit = "\n".join(f"- [{q.get('verdict', '?')}] {q.get('claim', '')} ({q.get('where', '')}): {q.get('why', '')} | "
                       f"if wrong: {q.get('if_wrong', '')} | test: {q.get('test', '')}" for q in p.get("premises") or [])
+    probes = "\n".join(f"- [{q.get('verdict', '?')}] {q.get('idea', '')}: {q.get('test', '')} -> {q.get('result', '')}"
+                       f"{' | ' + q['note'] if q.get('note') else ''}" for q in p.get("probes") or [])
     return (f"=== IDEAS POOL ({len(p.get('ideas') or [])} ideas; order and sources hidden) ===\n{ideas or '(none)'}\n\n"
             f"Leader stories:\n{stories or '(none)'}",
-            f"=== PREMISE AUDIT (critic) ===\n{audit or '(no doubtful premises reported)'}")
+            f"=== PREMISE AUDIT (critic) ===\n{audit or '(no doubtful premises reported)'}\n\n"
+            f"Premise probes (critic, measured on the rented B200):\n{probes or '(none run)'}")
