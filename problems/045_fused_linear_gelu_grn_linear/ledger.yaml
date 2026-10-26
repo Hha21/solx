@@ -1,0 +1,46 @@
+constraints:
+- 'No deliberate delay before launch (CPU busy-wait, sleep, extra host work) and nothing else meant to change when our kernel reaches the GPU relative to the harness''s flush memset. It exploits the timing methodology, not kernel speed. Off-limits unless NVIDIA approves.'
+- 'No discard/invalidate of cache lines (discard.global.L2 etc.), even on our own inputs: it targets the harness''s measurement, not kernel speed. Off-limits unless NVIDIA approves.'
+- Never touch memory we do not own; no state carried between calls except a scratch counter that is correct for every call.
+- 'No overlap with the harness''s own kernels (no PDL against the flush memset, no other streams): it hides work from the timed window.'
+- 'Clusters only on small one-wave grids or where a GEMM tile needs them (2SM pairs).'
+- 'Eviction-priority operations only on the current call''s own input/output buffers, inside our kernel.'
+- 'No environment variables set from the solution (e.g. CUBLAS_EMULATE_SINGLE_PRECISION) without operator approval.'
+hypotheses:
+- id: H1
+  statement: Every size is compute-bound for any fp32-accurate engine; the GEMM engine (SIMT vs 3xTF32 vs FP16x3 tcgen05) decides the score more than any memory-side tuning.
+  status: open
+  evidence:
+  - 'arithmetic: 262 kFLOP/token vs 1 KB/token; SIMT 0.93 ms vs 36 us copy at 64,56,56'
+  - 'r0-simt-3k: 2191 us at 64,56,56 (61x copy)'
+- id: H2
+  statement: Split-precision tensor-core GEMMs (3xTF32 or FP16x3, fp32 accumulate) meet the tolerance with zero failing elements; any 1- or 2-term scheme and BF16x3 fail.
+  status: open
+  evidence:
+  - 'probe_b200 emulation: 3xTF32 and FP16x3 max err 1.8-2.3e-3, 0% fail; BF16x3 0.8-2.2% fail; TF32 96% fail; TF32 with W-only split 95%'
+  - 'margin is thin: the fp32 reference itself is 1.3-1.5e-3 from fp64'
+- id: H3
+  statement: FP16x3 on kind::f16 beats 3xTF32 on kind::tf32 by ~2x MMA rate, outweighing the in-kernel split/convert cost.
+  status: open
+  evidence:
+  - 'emulation shows identical error for both (probe_b200)'
+- id: H4
+  statement: For N <= ~18k tokens (all S and M) a single persistent kernel that keeps h on chip (TMEM+smem) across a grid barrier beats recompute and multi-launch designs.
+  status: open
+  evidence:
+  - 'arithmetic: 148 x (256 KB TMEM) ~ 37.9 MB vs h = N x 2 KB'
+- id: H5
+  statement: At L, recomputing GEMM1 (+50% FLOPs) beats storing h (+2 KB/token of traffic) once GEMMs run on tensor cores.
+  status: open
+  evidence:
+  - 'arithmetic at 64,56,56: recompute ~+44-88 us (FP16x3/3xTF32) vs store ~+100 us at 8 TB/s'
+- id: H6
+  statement: At S the first kernel is limited by too few CTAs (13-49) running long serial chunk loops; splitting work over hidden chunks or smaller token tiles to fill 148 SMs gives >5x at S.
+  status: open
+  evidence:
+  - 'r0-simt-3k: 137-143 us flat from 784 to 6272 tokens'
+- id: H7
+  statement: Folding s_b = 1 + gw*nf into a per-batch W2 (and gb into the bias) is within tolerance and removes the per-element affine from the hot loop.
+  status: open
+  evidence:
+  - 'algebra exact; rounding difference ~1 ulp of x2'

@@ -1,0 +1,464 @@
+=== TASK ===
+Research phase for L1/045_fused_linear_gelu_grn_linear.
+
+=== PROBLEM ===
+L1/045_fused_linear_gelu_grn_linear: 14 workloads, variable axes ['batch_size', 'height', 'width']; bands by size: S <= 3.7 MB < M <= 13.4 MB < L
+           1,28,28       1.33 MB  band S
+           8,14,14       2.14 MB  band S
+           4,28,28       3.74 MB  band S
+          16,14,14       3.74 MB  band S
+           2,56,56       6.95 MB  band M
+          32,14,14       6.95 MB  band M
+          64,14,14      13.38 MB  band M
+           4,56,56      13.38 MB  band M
+          16,28,28      13.38 MB  band M
+          32,28,28      26.22 MB  band L
+          64,28,28      51.91 MB  band L
+          16,56,56      51.91 MB  band L
+          32,56,56     103.29 MB  band L
+          64,56,56     206.05 MB  band L
+
+=== definition.json ===
+{
+    "name": "045_fused_linear_gelu_grn_linear",
+    "hf_id": "facebook/convnextv2-base-22k-224",
+    "description": "Fused MLP pathway for ConvNextV2: expansion linear (dim -> 4*dim), GELU activation, Global Response Normalization (GRN) with L2 norm and channel-wise normalization, and projection linear (4*dim -> dim). Input/output in NHWC format.",
+    "axes": {
+        "batch_size": {
+            "type": "var"
+        },
+        "height": {
+            "type": "var"
+        },
+        "width": {
+            "type": "var"
+        },
+        "dim": {
+            "type": "const",
+            "value": 128
+        },
+        "hidden_dim": {
+            "type": "const",
+            "value": 512
+        }
+    },
+    "custom_inputs_entrypoint": null,
+    "inputs": {
+        "hidden_states": {
+            "shape": [
+                "batch_size",
+                "height",
+                "width",
+                "dim"
+            ],
+            "dtype": "float32",
+            "description": "Input tensor in NHWC format"
+        },
+        "pwconv1_weight": {
+            "shape": [
+                "hidden_dim",
+                "dim"
+            ],
+            "dtype": "float32",
+            "description": "Expansion linear weight matrix"
+        },
+        "pwconv1_bias": {
+            "shape": [
+                "hidden_dim"
+            ],
+            "dtype": "float32",
+            "description": "Expansion linear bias"
+        },
+        "grn_weight": {
+            "shape": [
+                "1",
+                "1",
+                "1",
+                "hidden_dim"
+            ],
+            "dtype": "float32",
+            "description": "GRN learnable weight"
+        },
+        "grn_bias": {
+            "shape": [
+                "1",
+                "1",
+                "1",
+                "hidden_dim"
+            ],
+            "dtype": "float32",
+            "description": "GRN learnable bias"
+        },
+        "pwconv2_weight": {
+            "shape": [
+                "dim",
+                "hidden_dim"
+            ],
+            "dtype": "float32",
+            "description": "Projection linear weight matrix"
+        },
+        "pwconv2_bias": {
+            "shape": [
+                "dim"
+            ],
+            "dtype": "float32",
+            "description": "Projection linear bias"
+        },
+        "eps": {
+            "shape": null,
+            "dtype": "float32",
+            "description": "Epsilon for numerical stability in GRN"
+        }
+    },
+    "outputs": {
+        "output": {
+            "shape": [
+                "batch_size",
+                "height",
+                "width",
+                "dim"
+            ],
+            "dtype": "float32",
+            "description": "Output tensor in NHWC format"
+        }
+    },
+    "reference": "import torch\nimport torch.nn.functional as F\n\n@torch.no_grad()\ndef run(\n    hidden_states: torch.Tensor,\n    pwconv1_weight: torch.Tensor,\n    pwconv1_bias: torch.Tensor,\n    grn_weight: torch.Tensor,\n    grn_bias: torch.Tensor,\n    pwconv2_weight: torch.Tensor,\n    pwconv2_bias: torch.Tensor,\n    eps: float,\n):\n    # Expansion linear: (B, H, W, dim) -> (B, H, W, hidden_dim)\n    # F.linear computes x @ weight.T + bias\n    x = F.linear(hidden_states, pwconv1_weight, pwconv1_bias)\n    \n    # GELU activation\n    x = F.gelu(x)\n    \n    # Global Response Normalization (GRN)\n    # Compute L2 norm across spatial dimensions (H, W)\n    # Shape: (B, H, W, hidden_dim) -> (B, 1, 1, hidden_dim)\n    global_features = torch.linalg.vector_norm(x, ord=2, dim=(1, 2), keepdim=True)\n    \n    # Normalize by channel-wise mean: (B, 1, 1, hidden_dim) -> (B, 1, 1, hidden_dim)\n    norm_features = global_features / (global_features.mean(dim=-1, keepdim=True) + eps)\n    \n    # Apply learnable affine transformation with residual connection\n    # weight * (input * norm_features) + bias + input\n    x = grn_weight * (x * norm_features) + grn_bias + x\n    \n    # Projection linear: (B, H, W, hidden_dim) -> (B, H, W, dim)\n    output = F.linear(x, pwconv2_weight, pwconv2_bias)\n    \n    return output\n"
+}
+
+
+=== reference.py ===
+import torch
+import torch.nn.functional as F
+
+@torch.no_grad()
+def run(
+    hidden_states: torch.Tensor,
+    pwconv1_weight: torch.Tensor,
+    pwconv1_bias: torch.Tensor,
+    grn_weight: torch.Tensor,
+    grn_bias: torch.Tensor,
+    pwconv2_weight: torch.Tensor,
+    pwconv2_bias: torch.Tensor,
+    eps: float,
+):
+    # Expansion linear: (B, H, W, dim) -> (B, H, W, hidden_dim)
+    # F.linear computes x @ weight.T + bias
+    x = F.linear(hidden_states, pwconv1_weight, pwconv1_bias)
+    
+    # GELU activation
+    x = F.gelu(x)
+    
+    # Global Response Normalization (GRN)
+    # Compute L2 norm across spatial dimensions (H, W)
+    # Shape: (B, H, W, hidden_dim) -> (B, 1, 1, hidden_dim)
+    global_features = torch.linalg.vector_norm(x, ord=2, dim=(1, 2), keepdim=True)
+    
+    # Normalize by channel-wise mean: (B, 1, 1, hidden_dim) -> (B, 1, 1, hidden_dim)
+    norm_features = global_features / (global_features.mean(dim=-1, keepdim=True) + eps)
+    
+    # Apply learnable affine transformation with residual connection
+    # weight * (input * norm_features) + bias + input
+    x = grn_weight * (x * norm_features) + grn_bias + x
+    
+    # Projection linear: (B, H, W, hidden_dim) -> (B, H, W, dim)
+    output = F.linear(x, pwconv2_weight, pwconv2_bias)
+    
+    return output
+
+
+=== workload.jsonl (first 3 lines) ===
+{"uuid": "b0e06cb5-b90b-5764-9bbc-a2dca8f41bda", "axes": {"batch_size": 4, "height": 28, "width": 28}, "inputs": {"hidden_states": {"type": "random"}, "pwconv1_weight": {"type": "random"}, "pwconv1_bias": {"type": "random"}, "grn_weight": {"type": "random"}, "grn_bias": {"type": "random"}, "pwconv2_weight": {"type": "random"}, "pwconv2_bias": {"type": "random"}, "eps": {"type": "scalar", "value": 1e-06}}, "tolerance": {"max_atol": 0.0029, "max_rtol": 1e-05}}
+{"uuid": "d7c9be48-70a7-5328-ab10-cfb3fd99f373", "axes": {"batch_size": 16, "height": 14, "width": 14}, "inputs": {"hidden_states": {"type": "random"}, "pwconv1_weight": {"type": "random"}, "pwconv1_bias": {"type": "random"}, "grn_weight": {"type": "random"}, "grn_bias": {"type": "random"}, "pwconv2_weight": {"type": "random"}, "pwconv2_bias": {"type": "random"}, "eps": {"type": "scalar", "value": 1e-06}}, "tolerance": {"max_atol": 0.0028, "max_rtol": 1e-05}}
+{"uuid": "3e8e0bce-6193-5984-9ed1-d22f78a4614d", "axes": {"batch_size": 64, "height": 14, "width": 14}, "inputs": {"hidden_states": {"type": "random"}, "pwconv1_weight": {"type": "random"}, "pwconv1_bias": {"type": "random"}, "grn_weight": {"type": "random"}, "grn_bias": {"type": "random"}, "pwconv2_weight": {"type": "random"}, "pwconv2_bias": {"type": "random"}, "eps": {"type": "scalar", "value": 1e-06}}, "tolerance": {"max_atol": 0.0034, "max_rtol": 1e-05}}
+
+=== MEASUREMENTS ON THE RENTED B200 (unlocked clocks; the portal locks SM 1500 MHz) ===
+| workload | band | traffic MB (in + out) | plain stream floor µs (rented B200) | PyTorch reference µs | reference / floor |
+|---|---|---|---|---|---|
+| 1,28,28 | S | 0.93 + 0.40 | 2.53 | 106.48 | 42.1x |
+| 8,14,14 | S | 1.33 + 0.80 | 2.69 | 107.68 | 40.1x |
+| 4,28,28 | S | 2.14 + 1.61 | 3.07 | 115.52 | 37.6x |
+| 16,14,14 | S | 2.14 + 1.61 | 3.04 | 112.75 | 37.1x |
+| 2,56,56 | M | 3.74 + 3.21 | 3.65 | 136.66 | 37.5x |
+| 32,14,14 | M | 3.74 + 3.21 | 3.78 | 127.50 | 33.8x |
+| 64,14,14 | M | 6.95 + 6.42 | 4.83 | 201.57 | 41.7x |
+| 4,56,56 | M | 6.95 + 6.42 | 4.82 | 210.69 | 43.7x |
+| 16,28,28 | M | 6.95 + 6.42 | 4.74 | 213.87 | 45.2x |
+| 32,28,28 | L | 13.38 + 12.85 | 6.91 | 404.30 | 58.5x |
+| 64,28,28 | L | 26.22 + 25.69 | 11.14 | 821.97 | 73.8x |
+| 16,56,56 | L | 26.22 + 25.69 | 10.98 | 815.81 | 74.3x |
+| 32,56,56 | L | 51.91 + 51.38 | 19.58 | 1559.26 | 79.6x |
+| 64,56,56 | L | 103.29 + 102.76 | 35.84 | 3028.23 | 84.5x |
+
+=== EXAMPLE: the finished problem card of another problem (format and depth to aim for) ===
+# Problem card: L1 #38 `038_flux_multi_head_rmsnorm_qk`
+
+Leaderboard data is from the public API (evaluation stack v1.1), fetched 2026-10-03. Definition and workloads are from
+`$SOLX/SOL-ExecBench/data/benchmark/L1/038_flux_multi_head_rmsnorm_qk/` on CSF3.
+
+## 1. Semantics
+
+Reference (verbatim, `definition.json`), from FLUX.2-dev:
+
+```python
+@torch.no_grad()
+def run(query, key, weight_q, weight_k, eps):
+    input_dtype = query.dtype
+    q_variance = query.to(torch.float32).pow(2).mean(dim=-1, keepdim=True)
+    query_norm = query * torch.rsqrt(q_variance + eps)
+    k_variance = key.to(torch.float32).pow(2).mean(dim=-1, keepdim=True)
+    key_norm = key * torch.rsqrt(k_variance + eps)
+    query_norm = query_norm * weight_q.unsqueeze(0).unsqueeze(0)
+    key_norm = key_norm * weight_k.unsqueeze(0).unsqueeze(0)
+    return query_norm.to(input_dtype), key_norm.to(input_dtype)
+```
+
+- DPS signature: `run(query, key, weight_q, weight_k, eps, query_norm, key_norm)`.
+- `query`, `key`, `query_norm`, `key_norm`: `[B, S, 48, 128]` fp32, contiguous. `weight_q`, `weight_k`: `[48, 128]`
+  fp32. `eps`: Python float, 1e-6 in every workload.
+- View each tensor as `[R, 128]` with `R = B·S·48` rows. Row r uses weight row `h = r % 48`, and
+  `y[r,:] = x[r,:] · rsqrt(mean(x[r,:]²) + eps) · w[h,:]`. Rows are independent and every byte is touched once.
+  Q and K are two independent streams of the same shape.
+- `R` is always a multiple of 48, so tiles of 1, 2, 4, 8 or 16 rows (any divisor of 48) need no row mask and keep a
+  fixed head pattern. 32 or 64 rows need masking when `B·S` is odd (the 1×131 workload). A tile of 48 rows is exactly
+  one token, and its weight tile is the whole `[48,128]` matrix.
+- Traffic per call: read Q and K, write two outputs = `B·S·48·128·4·4 = B·S·98,304` bytes. The weights add 48 KB,
+  fetched once from DRAM and then served from L2.
+
+## 2. Numerics and the 1e-5 tolerance
+
+- Tolerance: `|out − ref| ≤ 1e-5 + 1e-5·|ref|` for at least 99% of elements, with no NaN/Inf and not all zeros
+  [PAPER: correctness.py, workload.jsonl]. The fp32 ulp is 2^-23 ≈ 1.19e-7 relative, so the budget is **about 84 ulp
+  relative**, or 1e-5 absolute for tiny outputs.
+- Inputs are `randn`; the weights are also `randn` (the names `weight_q`/`weight_k` miss the "norm weight → ones"
+  heuristic), so |y| reaches about 20 and some weights are close to 0 [PAPER: io.py].
+- Error sources, all far inside the budget [INFERRED]: sum of 128 squares in any order (tree reduction ≤ about 7 ulp
+  worst case, typically under 1); `rsqrt.approx.f32`, the PTX that Triton's `tl.math.rsqrt` and CUDA's `rsqrtf`
+  produce, has maximum relative error 2^-22.9 [SPEC: PTX ISA]; Triton's fp32 `/` lowers to `div.full.f32`
+  (approximate, ≤ 2 ulp) [VERIFIED-CSF3], so write `* (1.0 / 128)`, which is exact; `(x·r)·w` versus `x·(r·w)` differs
+  by ≤ 1 ulp. Total ≤ about 10 ulp.
+- What would fail: bf16/fp16/TF32 storage or compute (bf16 rounding alone is 2^-9 relative, about 16,000 fp32 ulp). It is also forbidden as a precision
+  downgrade. Leaving rows unwritten (outputs arrive as zeros) fails too.
+- Keep everything fp32. No compensated summation is needed.
+
+## 3. The 16 workloads (sorted by size)
+
+`floor8` = bytes / 8 TB/s. `T_sol model` assumes SOLAR's per-workload time is proportional to bytes, scaled so the
+geometric mean is 9.195 µs [INFERRED]. A100/L40S columns are the best of 72 PoC variants per workload (PoC, CSF3,
+`poc/results/rehearsal_sim/table.csv`); `eff` = bytes / 2.039 TB/s / time.
+
+| wl# | uuid | B | S | B·S | rows per tensor | MB | floor8 µs | T_sol model µs | Q+K rows per SM | A100 best µs (eff) | L40S best µs |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 9 | dcdec775 | 1 | 128 | 128 | 6,144 | 12.6 | 1.57 | 0.91 | 83 | 9.8 (0.63) | 18.4 |
+| 12 | e4d4aebe | 1 | 131 | 131 | 6,288 | 12.9 | 1.61 | 0.93 | 85 | 9.9 (0.64) | 21.4 |
+| 0 | c47946fe | 2 | 128 | 256 | 12,288 | 25.2 | 3.15 | 1.81 | 166 | 17.6 (0.70) | 36.6 |
+| 15 | 3565f3a6 | 1 | 256 | 256 | 12,288 | 25.2 | 3.15 | 1.81 | 166 | 16.9 (0.73) | 37.1 |
+| 5 | 388488d1 | 2 | 293 | 586 | 28,128 | 57.6 | 7.20 | 4.14 | 380 | 37.2 (0.76) | 88.7 |
+| 4 | fbd78167 | 8 | 128 | 1024 | 49,152 | 100.7 | 12.58 | 7.24 | 664 | 61.0 (0.81) | 156.8 |
+| 7 | 3d08c934 | 1 | 1024 | 1024 | 49,152 | 100.7 | 12.58 | 7.24 | 664 | 61.6 (0.80) | 161.4 |
+| 8 | 13ac723d | 4 | 256 | 1024 | 49,152 | 100.7 | 12.58 | 7.24 | 664 | 61.8 (0.80) | 158.8 |
+| 11 | 93b2fe42 | 4 | 512 | 2048 | 98,304 | 201.3 | 25.17 | 14.48 | 1,328 | 121.4 (0.81) | 314.1 |
+| 13 | 277f8cdf | 8 | 256 | 2048 | 98,304 | 201.3 | 25.17 | 14.48 | 1,328 | 121.9 (0.81) | 315.8 |
+| 2 | 0648abad | 4 | 1024 | 4096 | 196,608 | 402.7 | 50.33 | 28.96 | 2,657 | 248.3 (0.80) | 622.0 |
+| 6 | d6f8d507 | 16 | 256 | 4096 | 196,608 | 402.7 | 50.33 | 28.96 | 2,657 | 247.9 (0.80) | 620.8 |
+| 10 | ce51aff5 | 32 | 128 | 4096 | 196,608 | 402.7 | 50.33 | 28.96 | 2,657 | 247.7 (0.80) | 622.3 |
+| 3 | 0f5618d6 | 8 | 773 | 6184 | 296,832 | 607.9 | 75.99 | 43.72 | 4,011 | 366.7 (0.81) | 937.2 |
+| 1 | 62bb15e8 | 4 | 1657 | 6628 | 318,144 | 651.6 | 81.44 | 46.86 | 4,299 | 391.0 (0.82) | 997.3 |
+| 14 | 473ba98e | 1 | 8192 | 8192 | 393,216 | 805.3 | 100.66 | 57.92 | 5,314 | 480.0 (0.82) | 1,227.1 |
+
+Floors over the 16 workloads: geometric mean **15.98 µs**, arithmetic mean **32.1 µs**, median 25.2 µs [INFERRED by
+arithmetic]. Only shapes matter, so dispatch keys on `B·S`, the number of tokens (the 3 workloads of 1024 tokens
+behave the same).
+
+Size bands for specialists and dispatch (our convention; the "Character" column is INFERRED from the §6 model):
+
+| Band | Workloads | MB | Character |
+|---|---|---|---|
+| S | 9, 12, 0, 15, 5 | 12.6–57.6 | latency-bound: fixed costs are about 30–50% of t |
+| M | 4, 7, 8, 11, 13 | 101–201 | mixed |
+| L | 2, 6, 10, 3, 1, 14 | 403–805 | bandwidth-bound: sustained DRAM bandwidth decides |
+
+## 4. Leaderboard anchors (B200, v1.1, 2026-10-03)
+
+| Entry | Aggregate latency | Score |
+|---|---|---|
+| SOL bound (SOLAR) | 9.195 µs | 1.0 |
+| #1 Infinigence AI (2026-10-02) | 22.158 µs | 0.6275 |
+| #2 Databricks | 22.909 µs | 0.6160 |
+| #3 RIAC as well | 22.960 µs | 0.6151 |
+| #9 doubleAI | 23.938 µs | 0.5983 |
+| #20 ac4k | 25.548 µs | 0.5733 |
+| #21 Cursor | 26.947 µs | 0.5531 |
+| Scoring Baseline (hidden, PyTorch-only agentic) | 31.762 µs | 0.5 |
+| Reference implementation | 239.569 µs | 0.0876 |
+
+Places 1–20 lie within 15% of each other. Every top-20 entry has `fast_1_count` = 16/16 (read as: all workloads
+faster than the baseline); #21 has 12/16. Other teams' code
+is not downloadable. The field is active: entries are dated as recently as 2026-10-02.
+
+## 5. Floors, SOLAR and the aggregate (updated with portal data, 6 October)
+
+- The read+write floor at 8 TB/s is 16.0 µs (geometric mean), so the leader runs at **72% of the floor** (70.5% of the
+  15.6 µs floor at the locked-clock peak of 8.18 TB/s). [INFERRED]
+- The aggregate latency is the geometric mean of workload latencies and the score the arithmetic mean of workload
+  scores [VERIFIED: portal pages; see harness_scoring.md §5].
+- Per-workload Tb and Tsol, recovered from our five submission pages [VERIFIED for Tb, derived for Tsol]:
+
+| Workloads (B·S) | Tb µs | Tsol µs | Tsol / 8 TB/s floor | Score if exactly at 8 TB/s |
+|---|---|---|---|---|
+| 128, 131 | 9.3–9.4 | 1.24–1.29 | 0.77–0.82 | 0.96 |
+| 256 (×2) | 10.4–10.5 | 1.94–1.99 | 0.62 | 0.88 |
+| 586 | 17.5 | 4.24 | 0.59 | 0.82 |
+| 1024 (×3) | 22.4–22.5 | 6.8–7.0 | 0.55 | 0.73 |
+| 2048 (×2) | 37.4–37.6 | 13.4–13.5 | 0.53 | 0.67 |
+| 4096 (×3) | 66.5–66.7 | 26.7–26.8 | 0.53 | 0.63 |
+| 6184, 6628 | 102.7, 107.2 | 40.0, 42.8 | 0.53 | 0.63 |
+| 8192 | 123.4 | 53.0 | 0.53 | 0.60 |
+
+- SOLAR is about 0.53× the read+write floor on medium and large inputs (it behaves as if bandwidth were about
+  15 TB/s or half the bytes moved) and closer to the floor on the smallest. **Score 1.0 is unreachable.** Exactly
+  8 TB/s everywhere scores **0.736**; 8 TB/s plus 1.5 µs fixed per call scores about **0.68**. Latency depends only on
+  B·S (the three B·S = 4096 shapes time identically), so 16 workloads are really 10 sizes.
+- Score headroom per workload is far larger on small inputs (ceiling 0.82–0.96) than large ones (0.60–0.64).
+
+## 6. Score targets
+
+Model [INFERRED]: Tsol_i ∝ bytes (geometric mean 9.195 µs); Tb_i = a + bytes/BW_b fitted to a geometric mean of
+31.762 µs for a ∈ {3, 4, 5} µs; the leader is fitted as c + bytes/BW_l to (22.158 µs, 0.6275). The leader then comes
+out as about 0–1.2 µs fixed plus 5.8–6.5 TB/s. Results barely depend on a:
+
+| Target score | Uniform speed-up over the leader | Geomean latency | Simple aggregate formula |
+|---|---|---|---|
+| 0.6275 (tie #1) | 1.00× | 22.2 µs | 22.6 µs |
+| **0.65** | **5.5% faster** | **about 20.95 µs** | 21.35 µs |
+| **0.70** | **16% faster** | **about 18.5 µs** | 18.87 µs |
+| 0.75 | ≈ the 8 TB/s floor everywhere | about 16 µs | 16.7 µs |
+
+Reference point: a kernel at "1.5 µs + bytes / 7.2 TB/s" scores about 0.655 (geomean 20.96 µs).
+
+Sensitivity per workload, at leader-like times (same model):
+
+| Band | Leader-like t (µs) | Δ mean score for −1 µs on one workload | Δ mean score for −10% on one workload |
+|---|---|---|---|
+| S (12.6–57.6 MB) | 2.7–10 | +0.0065 … +0.0025 | +0.0017 … +0.0024 |
+| M (101–201 MB) | 17–33 | +0.0015 … +0.0008 | +0.0026 … +0.0027 |
+| L (403–805 MB) | 66–131 | +0.0004 … +0.0002 | +0.0027 |
+
+Read this as: **relative** speed-ups are worth about the same in every band, and 1 µs off a small workload is worth
+about 20× a µs off a large one. Shaving fixed costs and raising sustained bandwidth are both needed.
+
+## 7. What the proof of concept learned (PoC, CSF3)
+
+The PoC kernel (`poc/kernels/rmsnorm_qk.py`) is one Triton design with knobs ROWS, NUM_WARPS, NUM_STAGES, FUSE (one
+launch for Q+K), PERSIST, PROGS_PER_SM and EVICT. 72 variants were run through NVIDIA's harness on A100 and L40S; all
+passed, with 0.15% run-to-run noise.
+
+- Best A100 variant v028 (ROWS=32, 2 warps, persistent 8 per SM, fused): geomean 82.8 µs, **76% of the A100 floor**.
+  It reaches about 80–82% of peak bandwidth on large workloads and **about 60%** on the smallest. Best L40S variant
+  v050 (ROWS=8, 1 warp, unfused, one-shot): 73% of the L40S floor.
+- Picking the best variant per workload gains only 1.4% (A100) and 2.3% (L40S). **The gap is in the design, not the
+  knobs.**
+- A100 and L40S agree on the broad ranking (Spearman 0.77) but not on the winner. The emulator helped a lot when the
+  cheap source resembled the target (HBM) and little on L40S (GDDR6).
+- **First B200 result (6 October, portal #61435):** v028 scored **0.451 at 35.9 µs**, faster than the scoring
+  baseline on only 5 of 16 workloads, and no faster than on H200 (36.4 µs). Likely cause: on sm_100a v028 needs 149
+  registers, so only 6 of its 8 persistent programs per SM fit, giving a second wave (see playbook, anti-patterns).
+  Lesson: H200 timings cannot see sm_100a register growth; check the sm_100a compile before trusting them.
+  [portal; VERIFIED-CSF3 for the register counts; INFERRED for the cause]
+- **Generation 2 on B200 (7 October; portal #61457–#61463):** dropping v039's persistent loop was the win.
+  `g2-os-r16w8` and `g2-os-r8w4` (one-shot, one launch, evict hints, 32 regs) score **0.577 at 25.3 µs**, beat the
+  baseline on 15/16 workloads, and are fastest at every size: S 3.40 TB/s, M 5.69, L **6.40** (baseline 6.14).
+  A dispatcher over all measured kernels gains nothing (0.577). Weight-stationary (+cp.async) 0.537, TMA +
+  weight-stationary 0.537, TMA 0.510: on B200 these were slower at every size; loading weights from L1/L2 each tile
+  is cheap, and TMA rings add about 1–1.5 µs fixed cost. Fit on S/M sizes, `t = fixed + bytes/BW`:
+  one-shot **3.2 µs + 6.7 TB/s**, v039 3.7 + 5.9, TMA 4.5 + 5.8, TMA+wstat 3.9 + 6.2. **Remaining gap to the leader:**
+  L/M from 6.4 to about 7 TB/s, and S fixed cost from 3.2 µs toward 1–2 µs.
+- **256-bit loads work (7 October, portal #62013):** `r3-cute-ldg256-os-r16`, a CuTe DSL
+
+=== EXAMPLE: that problem's ledger (copy its constraints; write your own hypotheses) ===
+# Hypothesis ledger for #38, maintained by the research lead (round.py lead) and read by every design session.
+# status: open | supported | refuted | parked. evidence cites kernels, portal submissions, probes or findings.
+# Seeded 8 October from rounds r1-r10 and the portal results; updated by the research lead for r11, r12 and r13 (8 October).
+
+constraints:
+- 'No deliberate delay before launch (CPU busy-wait, sleep, extra host work) and nothing else meant to change when our kernel reaches the GPU relative to the harness''s flush memset: a kernel that arrives ~60 us late, after the 73 us flush, measures ~0.4 us faster at small sizes on the same code (#84 r1 E1). It exploits the timing methodology, not kernel speed. Off-limits unless NVIDIA approves.'
+- 'No discard/invalidate of cache lines (discard.global.L2 etc.), even on our own inputs: it targets the harness''s measurement,
+  not kernel speed. Off-limits unless NVIDIA approves.'
+- Never touch memory we do not own; no state carried between calls except a scratch counter that is correct for every call.
+- 'No overlap with the harness''s own kernels (no PDL against the flush memset, no other streams): it hides work from the
+  timed window.'
+- 'Clusters only at <= 300 tokens (H16): clustered large grids lost 2-5% on the portal and seemed to slow later plain launches.'
+- 'Eviction-priority operations (createpolicy, applypriority.L2::evict_normal) only on the current call''s own input/output
+  buffers, inside our kernel. Any candidate that uses applypriority goes to the operator for a legitimacy check before a
+  portal slot (r13, H21).'
+hypotheses:
+- id: H1
+  statement: Output stores marked L2 evict_last keep output in L2 past the end of the timed window, so medium sizes gain most.
+  status: supported
+  evidence:
+  - 'portal: r5 0.609 vs r3 0.588 (M -8%)'
+  - 'probe r10: evict_last stores beat plain stores by 8-19% at 128-1024 tokens, 2.5-5% at 4096-8192'
+  - 'probe r10: the saving is capped at 3-4 us (~25-30 MB) from 1024 tokens up; partial/fractional evict_last is no better
+    (see H15)'
+  - 'r12 E1: after a CLEAN flush all store policies tie at 586-1024 tokens; the EL gain exists only after the dirty flush
+    (non-EL stores pay 2.7/5.0 us dirty cost at 586/1024, EL 1.2/1.9). EL on the first output beats EL on the last. So the
+    mechanism is fewer in-window dirty write-backs, not output parked past the window; the statement''s wording is wrong
+    but the effect stands'
+- id: H2
+  statement: evict_first on stores and evict_last on weights hurt on B200.
+  status: supported
+  evidence:
+  - 'portal: r2 0.576 (hinted 256-bit) = g2 0.577 (hinted 128-bit); d1 0.582 (no hints)'
+  - quack sm100 regression
+  - 'portal r7 vs c1 at L (same code except x evict_first + nc weights): +1.9..+2.6%; evict_first on x costs at L too'
+- id: H3
+  statement: 256-bit loads/stores help medium and large sizes a little.
+  status: supported
+  evidence:
+  - 'portal: r3 (256-bit, no hints) vs d1 (128-bit, no hints): M -2.4%, L -1.2%'
+- id: H4
+  statement: CTA launch/retire overhead is a bottleneck, so fewer, fatter CTAs or one resident wave help.
+  status: refuted
+  evidence:
+  - 'r14 A1 (CUPTI, 7 interleaved reps): c2 dispatch has the best R at every size; R=3 wins only at 1024 tokens; R=2 is worst everywhere'
+  - 'probe r10: one-wave grids tie at 12.6-101 MB and lose 11-15% above 200 MB'
+  - 'portal: r8 512-thread CTAs at L +3.2%'
+  - 'probe r10: all 768 CTAs of the 12.6 MB grid start within 0.06 us; the empty-grid span overlaps fully with memory work
+    at L'
+  - 'probe r11 E3(1): empty-kernel CUPTI floor ~1.4 us at any block size; 768x256 1.63 us; launch params/API/smem/priority
+    move it by < 0.03 us'
+- id: H5
+  statement: TMA / bulk-copy pipelines cut SM instructions per byte and win at the portal's 1500 MHz SM clock.
+  status: refuted
+  evidence:
+  - 'probe r10: bulk stores 27% slower than STG.256 at 805 MB; bulk loads +3%; TMA + mbarrier setup adds ~0.8 us at 12.6 MB'
+  - 'portal: g2-tma 0.510, g2-tmaws 0.537; bench r10-bulk1d-ring-stel predicted 0.5815 (its L was within 1.3% of c2 with
+    EL stores; S +23%, M +9% from the ring prologue)'
+  - 'r13 note: refuted as a bandwidth lever only. Whether the async proxy allocates in L2 differently against the dirty
+    residue was never measured (H23)'
+- id: H6
+  statement: Persistent grids with work stealing remove the tail and beat one-shot.
+  status: refuted
+  evidence:
+  - 'probe r10: one failing atomic per CTA costs ~1 us at 12.6 MB; pipelined stealing +9-10% at S/M, +0.7% at L; static persistent
+    3% worse than stealing at L'
+  - 'portal: v039, g2-ws, g2-tma all slower; bench r10-ws-l-steal-disp predicted 0.605'
+- id: H7
+  statement: The harness's zero-fill flush leaves dirty lines in L2; their write-back during our kernel costs ~0.5 us at S
+    and ~4 us (about 30-40 MB) at M/L, and the cost lands on reads, not writes.
+  status: supported
+  evidence:
+  - 'probe r10: in-kernel span after zero flush vs read-only flush: 12.6 MB 3.07 vs 2.56 us, 25 MB 4.10 vs 3.58, 100 MB 16.6
+    vs 12.3'
+  - 'probe r10: read-only kernels +7..11 us at 100-400 MB after a zero flush, copy +5..6 us, write-only +-1 us'
+  - 'r12 E1 (c2 paths, dirty minus clean, bench): 586 tok 1.2 us (13%), 1024 2.0 (14%), 2048 4.6 (16%); r10: ~5 us at L
+    (4-5%). This is the single largest identified pool: half of it is worth +0.02 (predict_score 0.634), all of it +0.04'
+  - 'no legitimate kernel-side mechanism found yet; load hints do not avoid it at >= 1024 tokens (H8, H18); the mechanism
+    model is H22'
+- id: H8
+  statement: evict_first on the streamed loads makes later allocations evict our own clean lines instead of dirty flush lines,
+    cutting H7's write-backs.
+  status: refuted
+  evidence:
+  - 'probe r10: read-only kernel -13 to -15% with evict_first loads, but the full kernel with evict_last stores gains only
+    1-2% at 256-1024 tokens (8% once at 586), 0 to +1.5% above; .cs/.lu/no_allocate/nc+EF all within +-2%'
+  - 'bench r10-

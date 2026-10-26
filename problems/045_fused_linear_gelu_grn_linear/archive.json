@@ -1,0 +1,29 @@
+{
+ "r0-simt-3k": {
+  "card": "id: r0-simt-3k\nparents: []\noperation: new_design\nlanguage: cuda_cpp\nniche:\n  mem: ldg128\n  st: direct\n  grid: oneshot\n  launch: split\n  tile: rows64\n  red: cta\n  cache: default\n  spec: all\nhypothesis: >-\n  Baseline anchor: exact fp32 SIMT with GEMM1 recomputed after a per-batch GRN statistics pass (three launches).\n  Correctness first; its portal page yields Tb and Tsol per workload. It is compute- and latency-bound everywhere.\nexpected_effect:\n  S:\n    pct: 0\n    confidence: medium\n  M:\n    pct: 0\n    confidence: medium\n  L:\n    pct: 0\n    confidence: medium\nresources_sm100a:\n  regs_per_thread: 128\n  smem_per_cta_bytes: 86016\n  threads_per_cta: 256\n  ctas_per_sm: 2\n  bytes_in_flight_per_sm: 67584\n  launches_per_call: 3\nknobs:\n  TM: 64\n  NC: 64\n  NT: 256\ntests: [H1, H6]\nfindings:\n  - \"run_tests: 14/14 pass; 137-143 us flat for 784-6272 tokens, 220 us at 12544, 2191 us at 200704 tokens (61x copy) [run_tests]\"\n  - \"precision: TF32 fails 96% of elements, TF32 with only W split 95%, BF16x3 0.8-2.2% (fails), 3xTF32 and FP16x3 0% with max err 1.8-2.3e-3 vs atol ~3e-3 [probe_b200]\"\n  - \"fp32 torch reference vs fp64: max err 1.3-1.5e-3, half the atol budget [probe_b200]\"\n  - \"cuBLAS fp32 GEMM1 at M=200704: 592 us; GEMM2 500 us; TF32 GEMM1 85 us; cuBLAS BF16x9 emulation 289/390 us (more accurate than fp32) [probe_b200]\"\n  - \"compile sm_100a: k_main 128 regs, k_stats 80 regs, k_grn 32 regs, 0 spills [compile_b200]\"\npaths:\n  - {max_tokens: null, lang: cuda, width: 128, threads: 256, rows: 64, grid: oneshot, mem: ldg, launches: 3, st: none}\nruns_on:\n  H200:\n    runs: true\n    representative: false\n    note: \"SIMT fp32 compute-bound; clock ratio differs from B200 portal\"\n  A100:\n    runs: true\n    representative: false\n  L40S:\n    runs: true\n    representative: false\nrisks:\n  - \"Very slow (compute-bound fp32 SIMT, only 13-98 CTAs at S); scores will be near 0 against any tensor-core baseline\"\n  - \"Three launches; torch::empty workspace allocations each call (no kernel launches)\"\nmeasure_first: [B200]\ncompliance:\n  single_stream: true\n  no_cross_call_state: true\n  fp32_math: true\n  no_threads_or_fork: true\n  no_precompiled_binaries: true\n",
+  "id": "r0-simt-3k",
+  "language": "cuda_cpp",
+  "niche": {
+   "cache": "default",
+   "grid": "oneshot",
+   "launch": "split",
+   "mem": "ldg128",
+   "red": "cta",
+   "spec": "all",
+   "st": "direct",
+   "tile": "rows64"
+  },
+  "operation": "new_design",
+  "parents": [],
+  "round": "r0",
+  "solution": "problems/045_fused_linear_gelu_grn_linear/rounds/r0/candidates/r0-simt-3k.json",
+  "status": "proposed",
+  "task": {
+   "band": "all",
+   "niche": "research:first-kernel",
+   "operation": "new_design",
+   "parents": []
+  },
+  "timings": {}
+ }
+}

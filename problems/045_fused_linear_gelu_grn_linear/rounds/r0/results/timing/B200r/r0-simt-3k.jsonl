@@ -1,0 +1,14 @@
+{"workload": {"axes": {"batch_size": 4, "height": 28, "width": 28}}, "evaluation": {"status": "PASSED", "log": "", "performance": {"latency_ms": 0.13784}}}
+{"workload": {"axes": {"batch_size": 16, "height": 14, "width": 14}}, "evaluation": {"status": "PASSED", "log": "", "performance": {"latency_ms": 0.13725}}}
+{"workload": {"axes": {"batch_size": 64, "height": 14, "width": 14}}, "evaluation": {"status": "PASSED", "log": "", "performance": {"latency_ms": 0.22069999999999998}}}
+{"workload": {"axes": {"batch_size": 2, "height": 56, "width": 56}}, "evaluation": {"status": "PASSED", "log": "", "performance": {"latency_ms": 0.14385}}}
+{"workload": {"axes": {"batch_size": 64, "height": 56, "width": 56}}, "evaluation": {"status": "PASSED", "log": "", "performance": {"latency_ms": 2.1910700000000003}}}
+{"workload": {"axes": {"batch_size": 32, "height": 28, "width": 28}}, "evaluation": {"status": "PASSED", "log": "", "performance": {"latency_ms": 0.32425}}}
+{"workload": {"axes": {"batch_size": 64, "height": 28, "width": 28}}, "evaluation": {"status": "PASSED", "log": "", "performance": {"latency_ms": 0.61405}}}
+{"workload": {"axes": {"batch_size": 4, "height": 56, "width": 56}}, "evaluation": {"status": "PASSED", "log": "", "performance": {"latency_ms": 0.22138999999999998}}}
+{"workload": {"axes": {"batch_size": 8, "height": 14, "width": 14}}, "evaluation": {"status": "PASSED", "log": "", "performance": {"latency_ms": 0.13712}}}
+{"workload": {"axes": {"batch_size": 32, "height": 14, "width": 14}}, "evaluation": {"status": "PASSED", "log": "", "performance": {"latency_ms": 0.13885}}}
+{"workload": {"axes": {"batch_size": 16, "height": 28, "width": 28}}, "evaluation": {"status": "PASSED", "log": "", "performance": {"latency_ms": 0.22036}}}
+{"workload": {"axes": {"batch_size": 32, "height": 56, "width": 56}}, "evaluation": {"status": "PASSED", "log": "", "performance": {"latency_ms": 1.1124}}}
+{"workload": {"axes": {"batch_size": 1, "height": 28, "width": 28}}, "evaluation": {"status": "PASSED", "log": "", "performance": {"latency_ms": 0.13949}}}
+{"workload": {"axes": {"batch_size": 16, "height": 56, "width": 56}}, "evaluation": {"status": "PASSED", "log": "", "performance": {"latency_ms": 0.6141599999999999}}}
