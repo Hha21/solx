@@ -1,0 +1,90 @@
+# Lineage conclusions from this project's L2 #129 (ConvNeXtV2 block with GRN, B200, rounds r1-r13)
+
+Written by the #129 research leads; copied verbatim. #129 = depthwise 7x7 conv + LayerNorm + Linear C->4C + GELU +
+GRN + Linear 4C->C + residual, fp32, NCHW, 16 sizes; final portal score 0.7555 (first on the live board). Reference
+only: use, adapt or ignore.
+
+## A (retired, started r1): Phase-separated pipeline of plain launches (bulk/TMA-staged dwconv+LN, cuBLASLt FP16 GEMMs, lean one-round elementwise kernels, fp16 materialised hidden) that wins by per-phase efficiency; the control lineage and carrier of conv/epilogue techniques.
+- Retired r9. A 5-6 launch pipeline runs at portal ratio 1.40-1.55 on S/M rows against 1.20-1.32 for single launches.
+- Keep. Each custom launch is a 2-3 dependent-round chain (6-17 us), not a 2 us launch; launch count is a first-order axis on S/M rows.
+- Keep. K2 is FMA/INT issue of the exact erf, not stream-bound; only a GEMM-epilogue GELU removes it.
+- Keep. cuBLASLt FP16 1.4-2.1x faster than TF32; its GELU epilogue is the tanh form (rejected); swap-AB batched NCHW GEMM2 right at HW >= 784 only.
+- Keep. Bulk-plane conv and the TMA 3-D box ring are the conv carriers; every pick needs an interleaved same-container control.
+
+## B (retired, started r1): One cooperative launch with every phase fused (FP16 mma.sync, fp16 hidden in L2), aiming at S rows <= 24 us rented by cutting the per-phase chain between the two grid barriers.
+- Retired r8; D's sc_kernel runs the same structure faster on the tcgen05 engine.
+- Keep. Single-launch coop beats a launch pipeline on the portal even where the bench says otherwise.
+- Keep. Barrier microbench r4 (flat counter 0.86-1.07 us); r13 critic - one monotonic counter polled directly is the cheapest form (1.21 us marginal), separate flag lines and private flags are slower.
+- Keep. Per-tile (H27) and image-level (H38) dataflows lost for per-item serial-chain reasons.
+- Pitfalls. runtime guards around mma.sync ~470 clk per k-block; register-direct erff epilogues 16 us per tile; a release arrive with loads in flight stalls.
+
+## C (retired, started r1): On-chip hidden with no global intermediates (hidden tile in shared memory across one grid barrier, weight slices ingested from L2, GEMM2 split-K reduced with red.add into a prefilled output).
+- Retired r3. H13 (16-CTA clusters, DSMEM ~12 B/clk/SM) and H20 (mma.sync one-barrier on-chip hidden, 30.8 us at 1,192) refuted.
+- Keep. One-shot cp.async.bulk into smem after the flush ~120 GB/s/SM; converting inside the ring is 2-2.5x slower.
+- Keep. TFLOAT32 TMA maps round to nearest even (H14); red.global.add.f32 reaches 4.1-4.4 TB/s from 256-512 CTAs.
+- Keep. Cold __ldg of small vectors at point of use adds a DRAM round each; bulk-load them at entry.
+- r12 arithmetic - a tcgen05 on-chip-hidden revival for the wide-C rows dies on split-K reduction volume; the C=96 rows are re-tested by lineage M with resident weights.
+
+## D (active, started r3): Cooperative single-launch specialist (bulk-plane conv, per-tile GRN statistics, split-K GEMM2) on a hand-written tcgen05 kind::f16 swap-AB engine; the six wide-C rows (tc_kernel) and the C <= 192 rows, 1,160 and 4,96 (sc_kernel).
+- Holds 12 rows in r12-merge (0.7425); H49 took 32,768 (-9 % rented, portal 77.4 -> 69.8); portal ratios 1.20-1.32.
+- r12 H49 - no-g pays in GEMM2 (phase -30..-55 %), not GEMM1 (pass 1 2-3.5 + wait ~2 + pass 2 1-2.5 us per tile); a perfect wait saves only 0.9-1.4 us; fp32 h parked in TMEM by tcgen05.st keeps STACK 0; counters stress-tested 400 calls.
+- r12 H48 refuted - the sc weight chain is already hidden; the sc phase-A term is the conv (2.8-10.5 us after landing, 5-10x FMA bound, 6 warps/SM); coalesced conv stores drop regs 168 -> 107 and gave -0.5..-1.4 us on 4 rows; more NS strips lose.
+- Remaining - wide-C per-tile fixed costs and 2-tile tails (r13 E1), sc conv occupancy and post-sync chain (r13 E2), phase-A W1 stream (no cheaper form found).
+- Recipes and dead ends - SW128 descriptors, all-warp 512-thr epilogue, staged coalesced stores, release/acquire + fence.proxy.async counters with departure reset, [B200] only, check STACK on every build; dead - lighter epilogue arithmetic, 2-deep tcgen05.ld, smem g, W2 prefetch, pairs at B <= 8, bulk weight pass, in-ring W1 conversion, W2 work inside the image wait.
+
+## E (retired, started r5): Library tcgen05 with fused epilogues (CUTLASS 4.4 sm100 builder GEMMs with EVT epilogues; TF32 operands straight from fp32 memory).
+- Retired r8 (H30 refuted). Per-image batching re-reads W1; TF32 doubles the bytes.
+- Keep. EVT nodes that instantiate on sm100 1Sm - ColBroadcast, RowBroadcast, multiply_add, GELU (erf), RowReduction non-final.
+- Keep. CUTLASS tfloat32_t on fp32 memory rounds to nearest; split-K as batch mode works on sm100.
+- Unresolved. CUPTI sequence-matching errors on multi-kernel library paths (14/16 twice).
+
+## F (retired, started r6): Library-lean four-launch pipeline for the HW<=784 rows (cluster-of-8 LN statistics, cuBLASLt FP16 GEMM1, one-launch GRN kernel, cuBLASLt swap-AB GEMM2).
+- Retired r8 (H32 refuted); D beat F on every row it targeted.
+- Keep. cuBLASLt GELU epilogue is tanh (fails own-atol); folding gb into the fp16 hidden fails; exact erf on fp32 pre-activation and b2' = W2.gb + b2 required.
+- Corrected r13 - the '1.8 us plain-vs-cooperative' saving came from K3's multi-wave configuration; the critic's probe shows launch mode costs nothing (148x512x227 KB, 1.92-2.06 vs 1.90-2.08 us).
+- Keep. Cluster-of-8 LN exchange 0.4-2.4 us; L2 weight prefetch at entry no effect; conv and weight conversion serialise inside a CTA.
+- Precision log for all 9 F paths (0 beyond atol, 59-76 %).
+
+## G (paused, started r7): Fused pass-1 persistent kernel for the HW >= 1024 rows (CUDA-core conv + LN stats into an smem fp16 d tile as GEMM1 B, epilogue warps with LN fold, exact GELU, sumsq, fp16 hidden), then K3 + cuBLASLt GEMM2.
+- Holds 4 rows - 64,96 (1066 portal) and 32,128 (287) from r7 g_pass1; 8,320 (74.6) and 4,96 (46.5) from r9 g_tc; 4-launch pipeline at portal ratio 1.26-1.27.
+- r10 H42 refuted - custom GEMM2 serial chain before the first MMA; K3 + cuBLASLt G2 stay.
+- Remaining at 8,320 rented - K0 ~4 / P1 ~39 / K3 8.9 / G2 11.3 (3.8 TB/s); the epilogue is ~2x its issue bound.
+- Unbuilt revival - fold K3 into g_tc behind a counter barrier (pool I23, about +0.0023); top rows handed to lineage I.
+- Precision logged for all 4 shipped rows (61-82 % of atol).
+
+## H (retired, started r8): Image-counter dataflow in one persistent tcgen05 kernel (static work queue, per-image readiness counters instead of grid barriers).
+- Retired r10. H38 refuted (+58-98 % vs D); summed item CTA-time exceeds D's rows.
+- Keep. Queue mechanics cheap; counters self-reset through a departure counter; lint rejects __nanosleep.
+- Keep. CUTLASS-style release (bar.sync then red.release.gpu) + consumer ld.acquire + fence.proxy.async is correct for TMA readers.
+- Keep. Fully unrolled predicated load arrays; load JB=8 float4 before shuffles; scalar red.add volume scales with split-K.
+- Counter mechanics live on in D's H49 per-image wait.
+
+## I (active, started r12): Top-row specialist (64,96 and 32,128) - pass-1 kernel with fixed warp roles, conv on the FMA pipe from TMA-staged x bands, tcgen05 GEMM1 against a streamed W1', epilogue warps for LN fold / A&S GELU / sumsq / h stores; GRN scale and GEMM2 by the notebook recipe.
+- Ceiling about +0.003-0.005 of mean (dMean/dT 0.10 and 0.41 x1e-4 per us at 64,96 / 32,128).
+- r10 gate - one 3-D TMA box per stage overlaps copies; conv-only 233.8 us at 64,96 (2.2x FMA bound), 55.8 at 32,128.
+- r12 STEP 2 - tcgen05 pass 1 547 us at 64,96 (G r7 668), on a ~255 us skeleton bound by x-ring latency (3 x 30 KB in flight); the K0/K3/cuBLASLt tail is not built, so no row ships yet.
+- MUFU-heavy epilogue warps slow producer/MMA warps sharing their SMSP by 30-40 % (K r11); lineage L closed the tensor-pipe conv, so the conv stays on the FMA pipe.
+- r13 (incubation continuation) ships the tail on both rows with a 10-round precision log, then tries a deeper x ring.
+
+## J (paused, started r11): Cluster split-K cells for the low-M wide-C rows (2,768 and 8,768).
+- r11 gate failed on configuration (50 KB exchange at fan-in 4-6, 1.63 us); KS2 cells 0.54-0.66 us.
+- Value shrank - 2,768 S 0.737; KS2 fills only 48 CTAs at 2,768; H49 removed g from GEMM2.
+- r13 E1's token-range tiles fill the SMs at 2,768/8,768 without clusters; revisit only if they fail there.
+
+## K (paused, started r11): Persistent warp-specialised tcgen05 engine with two TMEM accumulators overlapping epilogue and mainloop on the multi-tile wide-C rows.
+- H47 refuted - co-running keeps 60-70 % (epilogue) and 54-65 % (MMA) of solo rates.
+- Limiter is issue/dispatch sharing inside each SMSP (TMEM lane-quadrant rule).
+- STEP 0a - straight-line 1SM issue 50 / 66 / 114 / 130 clk at N = 64 / 128 / 224 / 256; critic r13 - the small-N excess is the ~123 B/clk smem operand port.
+- Most of K's projected gain was balance, now tested directly by D r13 E1.
+
+## L (retired, started r12): Tensor-core Toeplitz depthwise conv for the HW >= 1024 rows.
+- Retired r13 in incubation on a measured hardware fact - MMA operand reads saturate the ~123-128 B/clk smem port (N=112 MMA 60 clk isolated, 98-138 in-kernel), so the pass ran 155 / 57.8 us against the <= 100 / 25 premise.
+- Keep. Toeplitz B without materialising T (reversed columns, LBO = SBO = 128 B), 16 KB for 7 tap rows; d16 within 1 fp16 ulp.
+- Keep. A Toeplitz tile is 128 rows of one channel, so it cannot feed a fused [C][token] GEMM1 tile; a separate pass costs a 154 MB d16 round trip.
+- Keep. Uncoalesced 56-B row stores cost ~50 us at 64,96; staged tile + cp.async.bulk S2G fixes it.
+- Value cap - pairs or A in TMEM at 32,128 are worth <= +0.0015 of mean.
+
+## M (active, started r13): Token-stationary one-launch tcgen05 kernel for the C=96 rows (1,96, 2,96, 4,96; stretch 1,160) - each CTA owns 64-128 tokens, converts the whole fp32 W1/W2 into resident fp16 smem (no scratch, no sync 1), keeps the fp32 hidden in TMEM, waits only on per-image GRN counters, and writes NCHW out once.
+- Seeded r13 from pool I22/I30 (S-row-specialist leader story) as the round's new design.
+- Differs from refuted H20 (r2 C - mma.sync, smem hidden, grid barrier, 30.8 us) by the tcgen05 engine, a TMEM-resident hidden, resident C=96 weights (144 KB fp16) and per-image counters instead of two grid barriers.
+- Ceiling about +0.011 of mean if 1,96 / 2,96 / 4,96 reach 13 / 14 / 26 us rented (D sc 18.2 / 25.0 / 37.6).

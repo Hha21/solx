@@ -31,7 +31,7 @@ import archive
 import planner
 import problem
 
-LIVE_FIRST = {"035_convnextv2_block_with_grn": 0.750880}   # live board #1 by problem (the user's figures, 2026-10-20);
+LIVE_FIRST = {"035_convnextv2_block_with_grn": 0.750880, "045_fused_linear_gelu_grn_linear": 0.854141}   # live board #1 by problem (the user's figures, 2026-10-20);
                                                              # other problems use the saved board; --live-first overrides
 MARGIN = 0.002               # aim this far above the live #1
 # configs/arch/B200.yaml in SOLAR: 1.5 GHz; DRAM 8 TB/s nominal = 5111.6 B/cycle (7.67 TB/s at 1.5 GHz); MACs per cycle.
