@@ -32,7 +32,10 @@ built and measured by its own design session on a rented B200).
 2. Write 10 ideas. Each is a whole-kernel design or a decisive change to one, specific enough to start building: what
    is computed where, what moves through DRAM / L2 / shared memory / TMEM / registers, how many launches, which
    precision per stage, and why that is fast on B200 for these shapes. Work out the numbers (bytes, FLOPs, launches)
-   per size band.
+   per size band. Aim at least half of the ideas at the measured terms in the newest design cards' findings (stamps,
+   per-phase times, what each card says binds) and at the SOL TARGETS cheapest allocation: name the term an idea removes
+   and by how many microseconds. The rest may be whole-kernel long shots. Skip ideas the ledger already records as built
+   or refuted unless you say what is different.
 3. Spread them out. At most 3 ideas may share a family. At least 3 must be long shots: ideas a strong B200 kernel
    engineer would propose with probability below 0.2, that could still win. Rewriting the maths (reordering, folding
    or fusing operations), another decomposition of the work, a different precision per stage, unusual use of the
@@ -95,7 +98,10 @@ Each round:
    p_expert with a sound mechanism is what lineages are for.
 4. Manage the portfolio ({n} experiments this round in total, 2-3 active lineages):
    - Keep a lineage while it improves, or while its ceiling (argued with numbers) is above the best current score.
-   - Incubation: a lineage started in the last 2 rounds cannot be retired; its first kernels are expected to be crude.
+   - Incubation: a lineage started in the last 2 rounds cannot be retired or paused, and a lineage started last round
+     gets an experiment this round. Its second session continues the first: it builds on that kernel and its findings
+     and does not re-run the first session's gate. The only exception is a premise refuted by a measured hardware fact
+     (name it). First kernels are expected to be crude.
    - Retire a lineage after incubation when it is behind and its argued ceiling is below the best lineage's current
      score. Record why in its conclusions; a retired lineage's ideas stay in the pool for later.
    - When a slot is free, seed a new lineage from the pool: among the families with good expected value, pick the one
@@ -105,13 +111,19 @@ Each round:
      or the r0 baseline) around a pool family that no lineage has built yet, not a change to an existing lineage's
      kernel. It starts a new lineage (take a free slot, or retire or pause one and say why). Prefer families aimed at
      the workloads furthest from the leader.
+   - Every third round (round number divisible by 3), make one experiment a fresh-eyes task ("fresh": true): that
+     session sees only the definition, the times to beat and the rules, no notebook and no earlier kernels, and designs
+     from scratch. It is the loop's check on anchoring; it starts a lineage like any new design.
    - After the round the operator merges per workload automatically: for every workload the merged kernel runs whichever
      kernel was fastest there (this round's kernels against the current best, timed side by side in one container). A
      kernel therefore earns score by winning some workloads, not all of them; a specialist that wins only the workloads
      furthest from the leader is worth building, and it may leave the other workloads to a simple fallback.
 5. Design the experiments. Each belongs to one lineage, builds on that lineage's best kernel (or starts the lineage,
    with parents [] or the r0 baseline), tests one hypothesis, and states what to build or measure, the success
-   criterion and what would refute it. Each session has a rented B200 (probes take seconds, full tests 10-20 s;
+   criterion and what would refute it. Gates for a new lineage are relative to the design's own projection (for
+   example within 1.5x of its own pipe bound), not to beating the current best this round; a kill line is only for a
+   hardware premise a probe measures (co-residency, an exchange cost, a pipe rate). A missed gate means the session
+   builds and measures its best fallback configuration, never that it hands in a placeholder. Each session has a rented B200 (probes take seconds, full tests 10-20 s;
    run_tests projects the portal score with the emulator, which misranks effects under ~3%). Prefer experiments that
    could move the portal score by 0.005 or more. Assign a model: opus for open-ended design and debugging, sonnet for
    well-specified work.
@@ -137,7 +149,7 @@ lineages:
 [{{"id": "E1", "lineage": "A", "hypothesis": "H8", "title": "...", "operation": "new_design",
   "parents": ["<an archive id from this lineage, or the r0 baseline, or nothing to start fresh>"], "band": "S|M|L|all",
   "instructions": "what to build or measure, step by step", "success": "...", "refuted_if": "...",
-  "model": "opus|sonnet"}}]
+  "model": "opus|sonnet", "fresh": false}}]
 ```"""
 
 

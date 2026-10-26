@@ -167,9 +167,13 @@ def in_flight(arc):
 EXPLORE_COMMON = (
     " This is an EXPLORATION task: the goal is to learn whether this idea can move some size band by 3% or more on the "
     "portal, not to edge out the current best by 0.1%. You may discard the parent's design entirely; it is given for "
-    "reference. Test the idea's core assumption with probe_b200 first (seconds per probe). If the idea does not pan "
-    "out, still return your best version of it as the candidate and record what you learned in the card's findings: "
-    "negative results are valuable and go into the lab notebook for later rounds. CUDA C++ uses the two-file layout.")
+    "reference. Test the idea's core assumption with probe_b200 first (seconds per probe). A missed gate or success "
+    "line is not a reason to stop: switch to the best configuration your own probes found (or the experiment's next "
+    "variant), build it into a full kernel and measure it with run_tests, and use the rest of the budget on it. Hand "
+    "in a measured kernel that implements this experiment's design on at least one workload (others may fall back); "
+    "the r0 baseline or the unchanged parent is not a valid candidate unless a measured hardware fact rules the design "
+    "out (name it, with the probe's number). Record what you learned in the card's findings: negative results are "
+    "valuable and go into the lab notebook for later rounds. CUDA C++ uses the two-file layout.")
 MEMORY_NOTE = (" Keep the kernel copy-like (memory-bound): the portal locks the SM clock lower than the test bench and "
                "penalises extra SM work per byte (the problem card).")
 
