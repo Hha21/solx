@@ -105,8 +105,10 @@ TOOLS = [
         "licence. Call with no name for the list. Learn techniques from them; do not copy them wholesale.",
         "parameters": {"type": "object", "properties": {"name": {"type": "string"}}}}},
     {"type": "function", "function": {"name": "get_kernel", "description":
-        "Source, design card, measurements and sm_100a statistics of an archive kernel, by id.",
-        "parameters": {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]}}},
+        "Source, design card, measurements and sm_100a statistics of an archive kernel, by id. A large kernel returns "
+        "its card and a file index first; read a file with part=\"<path>\" or lines with part=\"<path>:120-480\".",
+        "parameters": {"type": "object", "properties": {"id": {"type": "string"}, "part": {"type": "string"}},
+                       "required": ["id"]}}},
 ]
 
 
@@ -447,7 +449,7 @@ class Session:
             return f"invalid JSON arguments: {e}"
         if fn == "get_kernel":
             rec = self.arc.get(args.get("id", ""))
-            return prompts.parent_block(rec) if rec and rec.get("solution") else \
+            return prompts.kernel_view(rec, args.get("part") or "") if rec and rec.get("solution") else \
                 f"unknown id {args.get('id')!r}; ids: {', '.join(sorted(self.arc))}"
         if fn == "predict_score":
             return predict(args, self.best, self.anc)

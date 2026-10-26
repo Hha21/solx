@@ -99,8 +99,8 @@ server = MCPServer("solx", instructions="Tools for designing SOL-ExecBench kerne
 
 if not A.fresh:
     @server.tool(description=describe("get_kernel"))
-    def get_kernel(id: str) -> str:
-        return call("get_kernel", {"id": id})
+    def get_kernel(id: str, part: str = "") -> str:
+        return call("get_kernel", {"id": id, "part": part})
 
 
 @server.tool(description=describe("read_example"))

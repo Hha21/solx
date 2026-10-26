@@ -76,9 +76,9 @@ def b200_workload_table(vid):
     return "\n".join(out)
 
 
-def parent_block(rec):
+def parent_block(rec, sources=True):
     sol = json.loads((ROOT / rec["solution"]).read_text())
-    src = "\n\n".join(f"--- file {s['path']} ---\n{s['content']}" for s in sol["sources"])
+    src = "\n\n".join(f"--- file {s['path']} ---\n{s['content']}" for s in sol["sources"]) if sources else "(see parts)"
     meas = "; ".join(f"{g} {fmt(band_geomeans(t))}" for g, t in rec.get("timings", {}).items() if t)
     b200 = rec.get("b200") or {}
     static = json.dumps(rec.get("static_sm100") or [])
@@ -89,6 +89,42 @@ def parent_block(rec):
             f"{b200_workload_table(rec['id'])}\n"
             f"sm_100a static features: {static}\n"
             f"source:\n{src}\n")
+
+
+GET_KERNEL_MAX = 60000      # characters per get_kernel answer; MCP clients refuse much larger tool results
+
+
+def kernel_view(rec, part=""):
+    """get_kernel's answer: the whole kernel if it fits, else the card and a file index; part picks a file or lines."""
+    files = {s["path"]: s["content"] for s in json.loads((ROOT / rec["solution"]).read_text())["sources"]}
+    if not part:
+        full = parent_block(rec)
+        if len(full) <= GET_KERNEL_MAX:
+            return full
+        part = "card"
+    if part == "card":
+        index = "\n".join(f"  {p}: {len(c.splitlines())} lines, {len(c)} chars" for p, c in files.items())
+        return (parent_block(rec, sources=False) + "files (read one with part=\"<path>\" or a line range with "
+                f"part=\"<path>:<first>-<last>\"; at most {GET_KERNEL_MAX} characters per call):\n{index}\n")
+    path, _, rng = part.partition(":")
+    if path not in files:
+        return f"unknown part {part!r} of {rec['id']}; parts: card, " + ", ".join(files)
+    lines = files[path].splitlines()
+    first, last = 1, len(lines)
+    if rng:
+        try:
+            first, last = (int(x) for x in rng.split("-", 1))
+        except ValueError:
+            return f"line range must look like {path}:120-480"
+    out, n = [], 0
+    for i in range(max(first, 1), min(last, len(lines)) + 1):
+        if n + len(lines[i - 1]) + 1 > GET_KERNEL_MAX:
+            last = i - 1
+            break
+        out.append(lines[i - 1])
+        n += len(lines[i - 1]) + 1
+    more = f"; continue with part=\"{path}:{last + 1}-{len(lines)}\"" if last < len(lines) else ""
+    return f"--- {rec['id']} file {path}, lines {first}-{last} of {len(lines)}{more} ---\n" + "\n".join(out) + "\n"
 
 
 def lab_notebook(arc, limit=160, per_round=12):
