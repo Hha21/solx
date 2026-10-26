@@ -18,7 +18,7 @@ snapshot, except #129, which is the live board.
 
 | Board | Problem | Best | Public #1 |
 |---|---|---|---|
-| **L2 #129** | **`035_convnextv2_block_with_grn`** (7x7 depthwise conv, LayerNorm, MLP with GELU and GRN, residual; fp32; 16 sizes) | **0.7392** (`r10-merge`) | 0.7509 |
+| **L2 #129** | **`035_convnextv2_block_with_grn`** (7x7 depthwise conv, LayerNorm, MLP with GELU and GRN, residual; fp32; 16 sizes) | **0.7425** (`r12-merge`) | 0.7509 |
 | L1 #35 | `035_flux_ada_layer_norm_zero_modulation_extraction` | 0.6941 | 0.7945 |
 | L1 #88 | `088_rotary_position_embedding_application` | 0.6827 | 0.6978 |
 | L1 #85 | `085_geglu_activation` | 0.6755 | 0.6905 |
@@ -27,7 +27,7 @@ snapshot, except #129, which is the live board.
 | FlashInfer #218 | `009_gemm_n5120_k2048` | 0.4870 | 0.5356 |
 | L1 #30 | `030_attention_output_projection_with_residual` | 0.4529 | 0.5464 |
 
-### #129: 0.30 to 0.74 in ten rounds
+### #129: 0.30 to 0.74 in twelve rounds
 
 | Round | Submission | What changed | Portal |
 |---|---|---|---|
@@ -41,6 +41,8 @@ snapshot, except #129, which is the live board.
 | r8 | `r8-merge` | D runs its GEMM1 epilogue on all 16 warps; G extends to two more sizes; new lineage H (a dataflow work queue) is refuted | 0.7313 |
 | r9 | `r9-merge` | D defers its W2 pass and uses a flat grid barrier; D's GEMM2 runs as tcgen05 CTA pairs at 32,768; G moves GEMM1 to tcgen05 at 8,320 | 0.7359 |
 | r10 | `r10-merge` | a fresh ideas pool; D finds and removes a register spill in its 768-channel kernel and balances its tiles; G's custom GEMM2 and new lineage I are refuted | 0.7392 |
+| r11 | `r11-merge-b` | Opus lead, a big swing on the wide-channel sizes: new lineages J and K stop at their gates; D shares one GEMM2 input stage between two output tiles | 0.7404 |
+| r12 | `r12-merge` | D moves the GRN scaling into the GEMM1 epilogue behind per-image counters; tensor-core conv (L) and tcgen05 pass 1 (I) miss their gates | 0.7425 |
 
 Nine lineages (A-I) have been started so far. The lead has retired A, B, C, E, F and H, and I's first gate failed in
 r10. The current submission routes the 16 sizes across seven kernels from lineages D and G.
@@ -81,22 +83,29 @@ flowchart TB
 
 - **Lineages.** Refining a single kernel under portal noise turns into a noisy hill-climb that settles on the first
   design that works. The lead instead keeps several lineages: independent designs that share findings but not code.
-  It starts a new design in most rounds and gives each new idea a round or two to mature before judging it. Because of
-  the merge, a specialist that wins only a few sizes is still worth keeping.
-- **Research lead.** Once per round, a Fable agent reads the ideas pool, the lab notebook (every portal result, and
-  every finding earlier sessions recorded, dead ends included), the archive and the hypothesis ledger. It plans the
-  round's experiments. Each one tests a hypothesis and states what would count as success and what would refute it.
+  It starts a new design in most rounds. A new lineage's second session resumes its first session's conversation
+  (`"continue"` in the plan), and a missed gate means building the best fallback configuration, not handing in a
+  placeholder. Every third round one session is fresh-eyes: only the definition, the times to beat and the rules.
+  Because of the merge, a specialist that wins only a few sizes is still worth keeping.
+- **Ideas and critic.** Idea sessions write a fresh pool each round, aimed partly at the terms the newest session
+  reports measured. A critic then audits the project's premises and tests the best ideas' cheapest assumptions with up
+  to 8 probes on the B200, so the lead seeds only ideas whose premise survived.
+- **Research lead.** Once per round, an Opus (earlier Fable) agent reads the ideas pool and the critic's probes, the lab
+  notebook (every portal result, and every finding earlier sessions recorded, dead ends included), the archive, the
+  hypothesis ledger and the per-size SOL targets. It plans the round's experiments, each testing a hypothesis with a
+  success line and a refutation line, and returns the ledger as a diff.
 - **Design sessions.** Each experiment is a headless Claude Code session on the user's Claude plan, with our tools
   served over MCP. A session first tests its idea's core assumption with quick probes on the rented B200 (an NVRTC
   kernel in about a second, timed the way NVIDIA's harness times it). It then builds the kernel and runs NVIDIA's
-  harness on it: correctness at all sizes, run twice in the portal's order. It hands in one kernel with a design card
+  harness on it: correctness at all sizes, run twice in the portal's order. Probes run in a working directory that
+  persists for the whole session, so sources are written once. It hands in one kernel with a design card
   (hypothesis, per-path design, resources, findings, precision log).
 - **Per-size merge.** `loop/merge.py` wraps each kernel's sources in its own namespace and generates a binding that
   dispatches on the input shape. A manifest lets later merges take the parts apart again. The merge step times the
   best portal kernel and every new candidate alternately in one Modal container, since drift between containers is
   5-12 µs per size, larger than many real gains. It then projects each candidate's portal time using the
   portal/bench ratio that the candidate's own lineage shows on the portal. Projection vs result: r7 0.7208 vs 0.7207,
-  r8 0.7333 vs 0.7313, r9 0.7351 vs 0.7359, r10 0.7392 vs 0.7392.
+  r8 0.7333 vs 0.7313, r9 0.7351 vs 0.7359, r10 0.7392 vs 0.7392, r11 0.7408 vs 0.7404, r12 0.7415 vs 0.7425.
 - **Rules.** Before each submission, the operator checks the merged code against the leaderboard rules: no state
   carried between calls, accumulators zeroed inside each call, no PDL, no stream or graph tricks, and diagnostics
   compiled out.
