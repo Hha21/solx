@@ -397,15 +397,18 @@ def cmd_lead(a):
         (sdir / "reply.md").write_text(text)
         (sdir / "lead.claude.json").write_text(json.dumps({k: v for k, v in out.items() if k != "result"}, indent=1))
     blocks = reply.named_blocks(text) or {m.group(1).strip(): m.group(2) for m in reply.FENCE.finditer(text)}
-    ledger = next((v for k, v in blocks.items() if k.startswith("yaml") and "ledger" in k), None)
+    changes = next((v for k, v in blocks.items() if k.startswith("yaml") and "ledger-changes" in k), None)
+    ledger = changes or next((v for k, v in blocks.items() if k.startswith("yaml") and "ledger" in k), None)
     tasks_js = next((v for k, v in blocks.items() if k.startswith("json") and "tasks" in k), None)
     if not (ledger and tasks_js):
         raise SystemExit(f"lead reply had no ledger or tasks block; see {sdir / 'reply.md'}")
     try:                                                    # must parse before it replaces the ledger
-        problem.current().ledger.write_text(load_ledger_text(ledger))
+        led = problem.current().ledger
+        led.write_text(apply_ledger_changes(led.read_text() if led.exists() else "", load_ledger_text(ledger))
+                       if changes else load_ledger_text(ledger))
     except Exception as e:                                  # keep the old ledger and the plan; save the raw text
         (sdir / "ledger.raw.yaml").write_text(ledger)
-        print(f"lead ledger is not valid YAML ({str(e)[:200]}); kept the old ledger, raw text in {sdir / 'ledger.raw.yaml'}")
+        print(f"lead ledger is not valid ({str(e)[:200]}); kept the old ledger, raw text in {sdir / 'ledger.raw.yaml'}")
     lins = None
     if a.portfolio:
         lin_text = next((v for k, v in blocks.items() if k.startswith("yaml") and "lineages" in k), None)
@@ -470,6 +473,35 @@ def register(arc, round_id, text, t):
                         solution=str((where / f"{cid}.json").relative_to(ROOT)),
                         status="proposed" if ok else "rejected: " + "; ".join(problems + hits), timings={})
         print(f"  {cid}: {arc[cid]['status']}")
+
+
+LEDGER_STATUSES = {"open", "supported", "refuted", "parked"}
+
+
+def apply_ledger_changes(current, changes):
+    """Apply the lead's ```yaml ledger-changes``` diff to the ledger text: new or changed hypotheses replace their id's
+    entry (or are appended), a notes list replaces the notes; constraints and unlisted entries are never touched."""
+    import yaml
+    led = yaml.safe_load(current) or {}
+    ch = yaml.safe_load(changes) or {}
+    if not isinstance(ch, dict):
+        raise ValueError("ledger-changes must be a mapping with hypotheses and/or notes")
+    hyps = list(led.get("hypotheses") or [])
+    pos = {h.get("id"): i for i, h in enumerate(hyps)}
+    for h in ch.get("hypotheses") or []:
+        if not (isinstance(h, dict) and h.get("id") and h.get("statement")):
+            raise ValueError(f"a changed hypothesis needs an id and a statement: {str(h)[:120]}")
+        if h.get("status") not in LEDGER_STATUSES:
+            raise ValueError(f"{h['id']}: status {h.get('status')!r} is not one of {sorted(LEDGER_STATUSES)}")
+        if h["id"] in pos:
+            hyps[pos[h["id"]]] = h
+        else:
+            pos[h["id"]] = len(hyps)
+            hyps.append(h)
+    out = {"constraints": led.get("constraints") or [],
+           "notes": ch["notes"] if isinstance(ch.get("notes"), list) else led.get("notes") or [],
+           "hypotheses": hyps}
+    return yaml.safe_dump(out, sort_keys=False, allow_unicode=True, width=120)
 
 
 def load_ledger_text(text):

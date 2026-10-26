@@ -137,7 +137,9 @@ Each round:
    could move the portal score by 0.005 or more. Assign a model: opus for open-ended design and debugging, sonnet for
    well-specified work.
 6. Update the ledger and the lineages: thesis, status, best kernel, and at most 5 short conclusion lines each (all
-   sessions read every lineage's conclusions).
+   sessions read every lineage's conclusions). The ledger is updated by a diff: list only the hypotheses you add or
+   change, each complete (id, statement, status, evidence); a status moves only with new evidence cited in that entry.
+   Constraints are the operator's and cannot be changed here.
 Output, in this order:
 ### Assessment
 (at most 300 words: where the remaining score is, what each lineage has taught us, what this round tests and why)
@@ -151,8 +153,15 @@ lineages:
     conclusions:
       - one short line
 ```
-```yaml ledger
-(the complete updated ledger, same schema; copy the constraints verbatim)
+```yaml ledger-changes
+hypotheses:          # only new or changed entries, each complete; unlisted entries stay as they are
+  - id: H51
+    statement: ...
+    status: open     # open | supported | refuted | parked
+    evidence:
+      - ...
+notes:               # optional: the complete new notes list, only if you change it
+  - ...
 ```
 ```json tasks
 [{{"id": "E1", "lineage": "A", "hypothesis": "H8", "title": "...", "operation": "new_design",
