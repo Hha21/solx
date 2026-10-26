@@ -434,7 +434,8 @@ def cmd_lead(a):
                           instructions=(f"Experiment {e.get('id')} (tests {e.get('hypothesis')}): {e.get('title', '')}. "
                                         f"{e.get('instructions', '')} Success: {e.get('success', '')} Refuted if: "
                                         f"{e.get('refuted_if', '')}" + planner.explore_common() +
-                                        " Set the card's tests: field to the hypothesis id(s).")))
+                                        " Set the card's tests: field to the hypothesis id(s)."),
+                          fresh=bool(e.get("fresh")), **({"continue": e["continue"]} if e.get("continue") in arc else {})))
     best = planner.best_kernel(arc) or {"id": None, "b200": {"score": None}}
     (d / "plan.json").write_text(json.dumps(dict(best=best["id"], best_score=best["b200"]["score"], tasks=tasks,
                                                  lead=dict(model=a.lead_model, cost_usd=out.get("total_cost_usd"))),
