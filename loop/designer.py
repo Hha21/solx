@@ -50,7 +50,9 @@ cheap GPU against the current best kernel, and the projected B200 score. 4. Revi
 - get_kernel returns any archive kernel's source, design card and measurements; read_example shows annotated
   excerpts of the best public B200 norm kernels (see b200_sota.md).
 - Budget: {gpu_calls} GPU calls (compile_b200 + run_tests) and {turns} turns. GPU calls queue on one shared GPU; a test
-  takes 1-4 minutes, a compile under 1. Pass complete files every time; nothing persists between calls.
+  takes 1-4 minutes, a compile under 1. compile_b200 and run_tests need complete files every time. probe_b200 runs in
+  a working directory that persists for this session, across probes and containers: write your kernel sources there
+  once and change them with short Python edits in later probes instead of resending them.
 - Finish with a reply that makes no tool call and contains exactly one candidate in the OUTPUT CONTRACT format. Put
   what you measured into the design card (hypothesis, expected_effect), and list what you learned under findings,
   dead ends included: later sessions read them in the lab notebook. Submit the best version you tested, with its
@@ -193,11 +195,12 @@ class ModalB200:
     round stops the GPU tools (sessions are told to finish) rather than letting spend run on.
     """
 
-    def __init__(self, round_id, ref_solution, budget_minutes=60):
+    def __init__(self, round_id, ref_solution, budget_minutes=60, workspace=None):
         import modal
         import b200_modal
         b200_modal.load_token()
         self.name, self.ref_solution, self.budget_s = f"{round_id}-modal", ref_solution, budget_minutes * 60
+        self.workspace = workspace                    # probe_b200's persistent working directory on the B200
         self.problem = b200_modal.problem_ref()
         self._ctx = b200_modal.app.run()
         self._ctx.__enter__()
@@ -214,6 +217,8 @@ class ModalB200:
             rid = f"{kind}-{self.n:03d}"
         t0 = time.time()
         req = dict(id=rid, kind=kind, solution=sol, problem=self.problem, **extra)
+        if kind == "probe" and self.workspace:
+            req["workspace"] = self.workspace
         try:
             res = self.fn.remote(req)
         except Exception as e:

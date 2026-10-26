@@ -121,12 +121,13 @@ def problem_ref():
     p = problem.current()
     return f"{p.level}/{p.name}"
 cache = modal.Volume.from_name("solx-b200-cache", create_if_missing=True)
+work = modal.Volume.from_name("solx-b200-work", create_if_missing=True)   # per-session probe workspaces
 
 
 # scaledown_window: keep a finished container warm this long for the next call. LLM turns usually take longer than
 # this, so a short window bills less idle time than it loses to cold starts.
 @app.function(gpu=GPU, cpu=8.0, memory=32768, timeout=1800, scaledown_window=30, max_containers=1, block_network=True,
-              volumes={"/cache": cache})
+              volumes={"/cache": cache, "/work": work})
 def handle(req: dict) -> dict:
     """One request on the B200: compile / test (as loop/toolserver.py), or probe (run a short Python script)."""
     import subprocess
@@ -134,6 +135,11 @@ def handle(req: dict) -> dict:
     import time
     d = Path(tempfile.mkdtemp())
     if req.get("kind") == "probe":
+        ws = str(req.get("workspace") or "").strip("/")
+        if ws and ".." not in ws:                   # the session's files persist between probes (and containers)
+            work.reload()
+            d = Path("/work") / ws
+            d.mkdir(parents=True, exist_ok=True)
         (d / "probe.py").write_text(req["script"])
         env = {**os.environ, **RUNTIME_ENV, "PYTHONPATH": "/sol-execbench/src:/solx/loop"}
         t0 = time.time()
@@ -143,6 +149,8 @@ def handle(req: dict) -> dict:
             out, err, rc = p.stdout, p.stderr, p.returncode
         except subprocess.TimeoutExpired as e:
             out, err, rc = (e.stdout or b"").decode(errors="replace"), "timed out", -1
+        if ws and ".." not in ws:
+            work.commit()
         return dict(id=req.get("id"), kind="probe", gpu="NVIDIA B200", returncode=rc, seconds=round(time.time() - t0, 1),
                     stdout=out[-6000:], stderr=err[-3000:])
     (d / "req.json").write_text(json.dumps(req))

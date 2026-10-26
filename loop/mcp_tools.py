@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import archive  # noqa: E402
 import designer  # noqa: E402
 import planner  # noqa: E402
+import problem  # noqa: E402
 
 from mcp.server.mcpserver import MCPServer  # noqa: E402
 
@@ -61,7 +62,8 @@ LOG = A.dir / f"{A.name}.tools.jsonl"
 def gpu_server():
     """Open the Modal B200 on first use and time the reference kernel there (once per session)."""
     if SESSION.server is None:
-        srv = designer.ModalB200(A.round, BEST["solution"] if BEST else None, budget_minutes=A.b200_minutes)
+        srv = designer.ModalB200(A.round, BEST["solution"] if BEST else None, budget_minutes=A.b200_minutes,
+                                 workspace=f"{problem.current().name}/{A.round}/{A.name}")
         atexit.register(srv.stop)
         srv.wait_alive(0)
         SESSION.server = srv
