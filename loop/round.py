@@ -89,6 +89,25 @@ get_kernel, read_example). No other tools are available. When you are done, your
 candidate in the OUTPUT CONTRACT format (fenced blocks), with its design card including paths and findings."""
 
 
+CONTINUE_NOTE = """This is your next session on the same lineage, one round later. Everything you did last round is
+above; your kernel and findings are in the archive (get_kernel reads them). The tools are fresh, with this round's GPU
+budget. Do not re-run last round's gate or re-validate what you already validated: build on your kernel, follow this
+round's experiment below, and hand in exactly one candidate (a new name) in the OUTPUT CONTRACT format, with findings
+covering what you measured in this session."""
+
+
+def session_of(arc, cid):
+    """The claude session id of the design session that handed in archive kernel `cid`, or None."""
+    rec = arc.get(cid) or {}
+    d = rdir(str(rec.get("round", "")))
+    for rep in sorted((d / "replies").glob("*.reply.md")) if rec else []:
+        if any(cid in (c.get("card") or "") for c in reply.candidates(rep.read_text())):
+            info = d / "sessions" / f"{rep.name[:-len('.reply.md')]}.claude.json"
+            if info.exists():
+                return json.loads(info.read_text()).get("session_id")
+    return None
+
+
 RESUME_NOTE = """Your session was cut off (by a usage limit, or by the rented B200 dropping out: tool calls failing with
 "function ... is stopped"); the tools work again, with a fresh GPU budget for this resumed part, so spend it on
 finishing, not on starting over. Everything you did before is above; if you handed in a placeholder candidate because
@@ -177,9 +196,15 @@ def claude_sessions(round_id, jobs, static, a, sdir):
         model = t.get("model") or a.session_model
         brief = sdir / "briefing_fresh.txt" if t.get("fresh") else system_file
         prev = sdir / f"{name}.claude.json"
+        cont = session_of(get_archive(), t["continue"]) if t.get("continue") else None
         if getattr(a, "resume", False) and prev.exists() and json.loads(prev.read_text()).get("session_id"):
             out = run_claude(RESUME_NOTE, brief, model, a.effort, mcp_args, sdir, name, a.session_timeout * 60,
                              resume=json.loads(prev.read_text())["session_id"], max_turns=a.max_turns)
+        elif cont:              # a lineage's second session resumes its first (portfolio incubation)
+            print(f"{name}: continuing the session that made {t['continue']}", flush=True)
+            out = run_claude(f"{CONTINUE_NOTE}\n\n=== THIS ROUND'S EXPERIMENT ===\n{t.get('instructions', '')}", brief,
+                             model, a.effort, mcp_args, sdir, name, a.session_timeout * 60, resume=cont,
+                             max_turns=a.max_turns)
         else:
             out = run_claude(dyn, brief, model, a.effort, mcp_args, sdir, name, a.session_timeout * 60,
                              max_turns=a.max_turns)
