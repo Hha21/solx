@@ -1,0 +1,41 @@
+id: r13-merge
+parents:
+- r12-merge
+- r13-d-e1-balanced-ranges-h49
+- r13-d-e2-sc-stripconv-512
+- r13-i-e3-rows-tail
+- r13-m-e4-token-stationary
+operation: repair
+language: cuda_cpp
+niche:
+  cache: default
+  grid: oneshot
+  launch: split
+  mem: bulk1d
+  red: warp
+  spec: dispatch:size
+  st: direct
+  tile: rows8
+hypothesis: 'Operator per-workload merge: Per-workload merge (loop/merge.py, kernels unchanged) of r12-merge with r13-d-e1-balanced-ranges-h49,
+  r13-d-e2-sc-stripconv-512, r13-i-e3-rows-tail, r13-m-e4-token-stationary on 1,160,449,7, 1,192,28,28, 1,96,56,56, 16,384,14,14,
+  2,96,56,56, 32,128,64,64, 4,192,28,28, 4,96,56,56, 64,96,112,112, 8,192,28,28, where they beat it side by side. Projected
+  portal score 0.7563 (best 0.7425).'
+dispatch:
+- kernel: r10-d-e1-balanced-nostack
+  shapes: 8,768,7,7 16,768,7,7
+- kernel: r11-d-e1-g2-mp2-bulk
+  shapes: 2,768,7,7
+- kernel: r12-d-e2-grn-epi-counters
+  shapes: 32,768,7,7
+- kernel: r13-d-e1-balanced-ranges-h49
+  shapes: 16,384,14,14
+- kernel: r13-d-e2-sc-stripconv-512
+  shapes: 1,160,449,7 4,96,56,56 1,96,56,56 4,192,28,28 1,192,28,28 8,192,28,28
+- kernel: r13-i-e3-rows-tail
+  shapes: 64,96,112,112 32,128,64,64
+- kernel: r13-m-e4-token-stationary
+  shapes: 2,96,56,56
+- kernel: r8-d-e1-allwarp-epi
+  shapes: 8,384,14,14
+- kernel: r9-g-e3-tc05-p1s
+  shapes: 8,320,32,32

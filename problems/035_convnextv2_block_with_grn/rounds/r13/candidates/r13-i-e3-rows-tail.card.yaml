@@ -1,0 +1,68 @@
+id: r13-i-e3-rows-tail
+parents: [r12-i-e3-tc05-pass1-547]
+operation: structural_mutation
+language: cuda_cpp
+niche:
+  mem: tma-tensor
+  st: direct
+  grid: persistent
+  launch: split
+  tile: rows2
+  red: cta
+  cache: default
+  spec: dispatch:size
+hypothesis: >-
+  H43 rows: r12's tcgen05 pass 1 (fixed warp roles, TMA x ring, resident W1', 8 epilogue warps with LN fold, A&S erfc
+  GELU, sumsq and staged fp16 h stores), followed by the notebook tail (K0 weight prep plus gsum zeroing in the call; K3
+  per-image fp16 W2_b with b2' hi/lo columns; cuBLASLt batched swap-AB GEMM2 with beta 1 on x). It beats G's mma.sync
+  pipeline at 64,96 and 32,128 because the pass-1 gain is not eaten by the tail.
+  Measured, same container vs r12-merge: 744.1 vs 854.8 us (-12.9 %) and 182.3 vs 225.6 us (-19.2 %).
+  Both success lines (<= 780 / <= 215) are met, with 0 beyond-atol elements in the 10-round fp64 log on both rows.
+  Merge-only candidate: the other 14 rows run the r0 anchor.
+expected_effect:
+  S: {pct: 0, confidence: high}
+  M: {pct: 0, confidence: high}
+  L: {pct: -16, confidence: medium}
+resources_sm100a:
+  regs_per_thread: 128
+  smem_per_cta_bytes: 230656
+  threads_per_cta: 512
+  ctas_per_sm: 1
+  bytes_in_flight_per_sm: 92160
+  launches_per_call: 4
+knobs:
+  row_64_96: "pass 1 Cfg<96,112,112,PW7>: tiles 2x112 = 224 tokens (N=224), 2 TMEM slots of 256 cols, x ring 3 x 30 KB, W1' 72 KB resident, smem 228864 B"
+  row_32_128: "pass 1 Cfg<128,64,64,PW4>: tiles 2x64 = 128 tokens (N=128), 4 TMEM slots of 128 cols, x ring 3 x 18 KB, W1' 128 KB resident, smem 230656 B"
+  tail: "K0 grid 4C/16 x 512; K3 grid (B, C/16) x 512, __launch_bounds__(512,2); cuBLASLt top-1 heuristic, 32 MB workspace, plan cached per shape"
+tests: [H43]
+findings:
+  - "run_tests 16/16 PASS (portal-order re-runs included). Same container vs r12-merge (rented us): 64,96 744.1 vs 854.8 (-12.9 %), 32,128 182.3 vs 225.6 (-19.2 %). Success lines met (<= 780 / <= 215); the refutation clause (neither row >= 5 % better) does not fire. The other 14 rows run the r0 anchor (merge-only); the emulator's 0.366 refers to the whole kernel and is meaningless for the merge [run_tests]"
+  - "harness_time x3 on the extension build (CUPTI retry wrapper, never needed): 64,96 749.3 / 748.8 / 748.7 us; 32,128 183.5 / 183.7 / 183.5 us. No CUPTI first-kernel drop seen on this 4-launch path [probe_b200]"
+  - "Row decomposition at 64,96: pass 1 547 us (r12) + tail ~197 us (K0 + K3 + cuBLASLt G2, consistent with G r7's 3 + 8 + 186) = 744. At 32,128, 182 us total (G r7 tail 2.8 + 7.5 + 48 -> pass 1 ~124 us vs G's 171) [run_tests, INFERRED]"
+  - "PRECISION LOG (fp64 torch reference, harness generator rules: randn, weight matrices / sqrt(shape[-1]) incl. dw /sqrt(7) and grn_weight /sqrt(4C), LN weight 1 / bias 0, other biases randn; torch.manual_seed(200), 10 rounds per row, shipped arithmetic): 64,96 max|err| 2.320e-3 vs atol 3.8e-3 (61 %), 0 beyond atol + 1e-5|ref|; 32,128 2.282e-3 vs 3.2e-3 (71 %), 0 beyond. Both maxima equal G r7's logged values, as expected from identical roundings (d16, fp16(lnw*W1), h16, fp16(s_b*W2), b2' hi/lo, A&S erfc); the GRN sums come from fp32 g [probe_b200]"
+  - "Resources (cuobjdump -res-usage on the built extension, nvcc sm_100a): ipass<Cfg96> 128 regs STACK 0; ipass<Cfg128> 124 regs STACK 0; ik0 28 regs STACK 0; ik3 64 regs STACK 0; compile_b200 reports 0 B local on all six kernels [probe_b200, compile_b200]"
+  - "Generalisation notes that worked first build: (1) the MMA issue rule 'issue block jb at tile start if jb < NSLOT, else after draining the slot predecessor in the same tile' covers both 2 slots x N=224 (NB=3) and 4 slots x N=128 (NB=4); (2) dfull doubled by tile parity, so a slow epilogue warp can never alias a dfull phase (all waits robust to phase-ahead); (3) W1' K-major no-swizzle with SBO = 16*C bytes and block stride 256*C bytes holds for C = 128 (W1' 128 KB resident still leaves room for a 3 x 18 KB ring); (4) CUtensorMap passed as __grid_constant__ and encoded every call with cuTensorMapEncodeTiled (-lcuda); (5) the cuBLASLt plan is cached per (B, C, HW), with C != D (C = x, D = out) and beta 1 [run_tests]"
+  - "STEP 4 skeleton test (pool I28), 64,96, timing-only NVRTC build (conv FMAs and epilogue maths/stores skipped): W1' in smem NS=3 256.6 us; W1' out of smem (garbage A) NS=3 238.9, NS=4 236.8, NS=5 245.0. Full kernel with W1' out of smem: NS=3 550.2, NS=5 546.5, vs 548.9 normal. Ring depth does not move the skeleton, which refutes r12's 'x-ring latency' reading. The skeleton (> 180 us line) is bound by the x box traffic itself (~1.3 GB of L2->SM TMA reads at 4.3x amplification, ~5.5 TB/s) and the per-tile chain, not by bytes in flight. Not pursued further, per the experiment rule [probe_b200]"
+  - "Merge recommendation: take 64,96 and 32,128 from this kernel. Projected portal at G's 4-launch ratio ~1.26: 64,96 ~935 vs 1077 us, 32,128 ~230 vs 288 us; roughly +0.003-0.004 of mean (10 % on one row ~ +0.0011-0.0014) [INFERRED]"
+  - "Next levers for these rows: x traffic per token (taller tiles need more smem than W1' leaves; W1' could move to a streamed or 2-CTA-shared form), the epilogue issue rate (FFMA2 on column pairs), and GEMM2 (cuBLASLt 186 us at 64,96 moves 0.9 GB at ~5 TB/s; a fused GEMM2 is H42 territory, refuted at 8,320 for serial-chain reasons) [INFERRED]"
+  - "Process note: one compile_b200 call used a placeholder kernel.cu to check i_rows.cu alone (the anchor TU then failed to parse, as intended); budget used 2 GPU calls + 6 probes [compile_b200]"
+paths:
+  - {shape: "64,96,112,112", lang: cuda, width: 128, threads: 512, rows: 2, grid: persistent, mem: tma, launches: 4, x: none, w: none, st: none, cluster: 1}
+  - {shape: "32,128,64,64", lang: cuda, width: 128, threads: 512, rows: 2, grid: persistent, mem: tma, launches: 4, x: none, w: none, st: none, cluster: 1}
+  - {max_tokens: null, lang: cuda, width: 128, threads: 256, rows: 128, grid: persistent, mem: ldg, launches: 1, x: none, w: none, st: none, cluster: 1}
+runs_on:
+  H200: {runs: false, representative: false, note: "tcgen05 / sm_100a only; target_hardware B200"}
+  A100: {runs: false, representative: false}
+  L40S: {runs: false, representative: false}
+risks:
+  - "Merge-only: the 14 non-target rows run the r0 anchor (~0.30); only the 64,96 and 32,128 rows are meant for the merge"
+  - "Four launches per call (K0, pass 1, K3, cuBLASLt G2): portal ratio expected ~1.26 like G's pipeline; the S/M launch penalty does not apply at these sizes"
+  - "cuBLASLt heuristic top-1 is cached per shape; a different library build on the portal could pick another algorithm (same as G's shipped rows)"
+  - "Workspace per call 1.3 GB at 64,96 (fp16 h 629 MB + W2_b + 32 MB cuBLASLt), allocated with torch.empty (no launch)"
+measure_first: [H200]
+compliance:
+  single_stream: true
+  no_cross_call_state: true
+  fp32_math: true
+  no_threads_or_fork: true
+  no_precompiled_binaries: true

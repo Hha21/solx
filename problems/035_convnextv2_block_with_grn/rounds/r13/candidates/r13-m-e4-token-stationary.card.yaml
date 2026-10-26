@@ -1,0 +1,88 @@
+id: r13-m-e4-token-stationary
+parents: []
+operation: new_design
+language: cuda_cpp
+niche:
+  mem: cpasync
+  st: direct
+  grid: oneshot
+  launch: fused
+  tile: token
+  red: cta
+  cache: default
+  spec: dispatch:size
+hypothesis: >-
+  H55 token-stationary: one cooperative tcgen05 launch per C=96 row. Each CTA owns 8x8-token patches (64 tokens; 2 per CTA at 4,96),
+  converts a 1/G slice of W1/W2 into fp16 smem byte images in a workspace (one weight counter), keeps the fp32 hidden in TMEM across a
+  per-image GRN counter wait and writes NCHW once. Measured (rented, same container as r12-merge, x3): 2,96 20.7-21.2 vs 25.2 us
+  (-16..-18 %), 4,96 34.0-34.3 vs 37.0 (-7.4..-8.2 %), 1,96 20.5-20.8 vs 18.4 (+11..+13 %, loses: only 49 SMs busy). Success lines
+  (17 / 28 / 14 us) missed; the refutation clause does not fire. Merge 2,96 only; 4,96 is under the 10 % new-lineage bar.
+expected_effect:
+  S:
+    pct: -17
+    confidence: medium
+  M:
+    pct: -8
+    confidence: medium
+  L:
+    pct: 0
+    confidence: high
+resources_sm100a:
+  regs_per_thread: 128
+  smem_per_cta_bytes: 226432
+  threads_per_cta: 512
+  ctas_per_sm: 1
+  bytes_in_flight_per_sm: 87552
+  launches_per_call: 1
+knobs:
+  tile_tokens: 64
+  patch: 8x8
+  T: "1 at B<=2, 2 at B=4"
+  grid: "49 / 98 / 98 for 1,96 / 2,96 / 4,96"
+  conv_warps: 12
+  slice_warps: 4
+  tmem_cols: "256 (T=1) / 512 (T=2)"
+  x_plane_stride_bytes: 912
+dispatch:
+  - {rows: "1,96,56,56 2,96,56,56 4,96,56,56", kernel: m_kernel, meta: {T: "1/1/2", grid: "49/98/98"}}
+  - {rows: "all others", kernel: convnext_fused (r0 anchor, merge-only), meta: {}}
+tests: [H55]
+findings:
+  - "premise probe: ingest + fp16 conversion of all 295 KB of fp32 W1+W2 per CTA costs ~3.4 us above the ~2 us launch floor (5.3-5.5 us total at 49/98/148 CTAs); 147 KB costs ~2 us; grid-size independent, so per-SM bound (~75-90 GB/s/SM with LDG.128). Borderline against the <= 4 us premise and still on the critical path, so the shipped build uses the fallback: grid-wide fp16 weight images plus one counter [probe_b200]"
+  - "fallback as built: warps 12-15 write this CTA's 1/G slice as exact smem byte images (W1 80 KB packed SW128, W2 72 KB) plus a b2' = W2.gb slice, then one red.release; one thread polls and bulk-copies W1 into smem behind the conv, and the W2 image goes into the freed x buffer behind GEMM1. Gain over per-CTA self-conversion: 2,96 21.9 vs 22.3, 4,96 33.2 vs 35.1, 1,96 21.0 vs 21.95 us [probe_b200]"
+  - "tcgen05 engine correct on the first build: swap-AB GEMM1 with K=96 (6 k16 steps); k 64..95 of hidden blocks 0 and 1 share one SW128 K-major atom, block 1 reading it at start +64 B (80 KB instead of 96). GEMM2 uses M=128 with only 96 valid A rows; rows 96..127 overrun into the next atom harmlessly (unused D lanes). idesc and descriptors follow the H/G/D notebook recipes [probe_b200]"
+  - "TMA SWIZZLE_128B with a 64-B inner box -> illegal address (the smem image is not dense 64-B rows). SWIZZLE_64B with a 64-B box gives dense rows with phys = L ^ (((L>>7)&3)<<4); that leaves a 2-way bank conflict for the conv lane map [probe_b200]"
+  - "dead end: shared-memory float atomicAdd with 12-32 threads per address (W1 u/v row sums, W2.gb) cost 19 + 20 us; shuffle reductions took the row from 59.9 to 29.9 us. Uncoalesced 4-lanes-per-row W1 loads also delayed the vector bulk copies (bar_v at 7.4 us vs 3.6 coalesced) [probe_b200]"
+  - "applying the LN affine to the conv output in registers (a16 = fp16(LN(d)), after a 2-barrier statistics step) instead of the W1 u/v fold removes every W1 row reduction; 2,96 21.6 us at that point [probe_b200]"
+  - "x halo by per-warp cp.async 16-B granules into a padded plane (stride 912 B, 4 channels x row parity conflict-free with no swizzle, OOB zero fill via src-size 0): 2,96 21.1 vs 21.6 (12 per-warp TMA boxes), 1,96 20.7 vs 21.0; 4,96 unchanged [probe_b200]"
+  - "packed f32x2 A&S GELU (FFMA2/FMUL2/FADD2, 2 MUFU per element): -0.4..-0.5 us on all three rows. Replacing the MUFU rcp with a bit-trick seed + 3 packed Newton steps: +0.5..+1.3 us, so the epilogue is issue-bound, not MUFU-bound [probe_b200]"
+  - "dead end: moving the W2 load+convert into the GEMM1 MMA window: 23.5 vs 22.0 us and STACK 8. Dead end: three GEMM1 commits (epilogue starts on block 0) plus GEMM2 issued per 128-k block of h': tie at 1,96 / 2,96, -0.2 us at 4,96, so the MMAs are off the critical path. x-residual prefetch before epilogue 2: within noise [probe_b200]"
+  - "ablations at 2,96 (21.7 us base, harness time): no conv -2.5 us (4,96: -5.4), no GELU -2.0 (-3.5), no epilogue-2 maths -0.6, no output stores -1.3, no image-counter spin -0.5, no gsum read -0.65. Skeleton without SIMT maths ~16.5 us vs the 10-11 us projection: STEP 0 gate missed; the per-CTA chain is launch (~2) + entry ingest (~3-4) + conv (~2.5) + GELU epilogue (~2) + publish/wait (~1.5) + GRN/epilogue 2 (~1.3) + GEMM2/stores (~2) [probe_b200]"
+  - "pitfall: globaltimer stamps (even written to smem) distort the T=1 build (conv phase 15 us, total 32 vs 21 us unstamped); T=2 stamps were sane. Phase costs above come from harness-time ablations, not stamps [probe_b200]"
+  - "run_tests x3 vs r12-merge, same container (us, this vs ref): 2,96 20.9/20.7/21.2 vs 25.2; 4,96 34.3/34.0/34.2 vs 37.0; 1,96 20.8/20.5/20.6 vs 18.4; 16/16 pass each time incl. portal-order re-runs (first sample = same build with scalar GELU) [run_tests]"
+  - "PRECISION LOG (fp64 reference, harness generator rules: randn, weight matrices / sqrt(shape[-1]), LN weight 1 / bias 0, all biases incl. grn_bias randn; torch.manual_seed(200), 10 rounds per row; shipped arithmetic): 1,96 max|err| 2.038e-3 vs atol 2.7e-3 (75 %), 0 beyond; 2,96 2.098e-3 vs 2.7e-3 (78 %), 0 beyond; 4,96 2.098e-3 vs 2.8e-3 (75 %), 0 beyond. Roundings: a16 = fp16(LN(d)), fp16 W1, fp16 W2, h' = fp16(h * s) once (fp32 h kept in TMEM), b2' = b2 + W2.gb in fp32 [probe_b200]"
+  - "counters: module-level __device__ g_mctr (gsum-zeroed flag, departure, per-image, weight counter), reset by the last departer; gsum is zeroed by CTA 0 in-call before the flag release and every red.add waits on the flag. 400-call stress cycling 1/2/4,96 with fresh inputs: 0 failures; spins are plain ld.acquire loops [probe_b200]"
+  - "resources (cuobjdump -res-usage on the shipped file, nvcc 13 sm_100a, -O3 --use_fast_math): m_kernel<1> and m_kernel<2> REG 128 STACK 0 LOCAL 0; dynamic smem 226432 B; no stamps in the shipped build. The official compile_b200 call was rejected because the entry file was missing [probe_b200]"
+  - "H55 verdict: success lines missed (2,96 20.7-21.2 > 17; 4,96 34.0-34.3 > 28; 1,96 20.5-20.8 > 14); not refuted (faster than r12-merge at both 2,96 and 4,96). The token-stationary chain is bound by per-CTA SIMT work (conv + GELU ~4.5 us per 64-token patch) and latency rounds, not by ingest or MMA. 1,96 loses because only 49 SMs work; 4,96 runs 2 patches serially on 98 SMs with 50 SMs idle [INFERRED]"
+  - "next levers: 32-token 4x8 tiles (N=32 MMAs; 98 CTAs at 1,96; 392 tiles over 148 SMs at 4,96 cuts the worst SM from 128 to 96 tokens; est. 1,96 ~17.5, 4,96 ~31 us rented); a cheaper conv (2.5 us for ~1.2 us of FMA at 3 warps/SMSP); the 1,160 stretch (410 KB weights) not attempted [INFERRED]"
+paths:
+  - {max_tokens: 3136, lang: cuda, width: 128, threads: 512, rows: 64, grid: oneshot, mem: cpasync, launches: 1, x: none, w: none, st: none, cluster: 1}
+  - {max_tokens: 6272, lang: cuda, width: 128, threads: 512, rows: 64, grid: oneshot, mem: cpasync, launches: 1, x: none, w: none, st: none, cluster: 1}
+  - {max_tokens: 12544, lang: cuda, width: 128, threads: 512, rows: 128, grid: oneshot, mem: cpasync, launches: 1, x: none, w: none, st: none, cluster: 1}
+  - {max_tokens: null, lang: cuda, width: 128, threads: 256, rows: 128, grid: persistent, mem: ldg, launches: 1, x: none, w: none, st: none, cluster: 1}
+runs_on:
+  H200: {runs: false, representative: false, note: "tcgen05/TMEM are sm_100a only; target_hardware [B200]"}
+  A100: {runs: false, representative: false}
+  L40S: {runs: false, representative: false}
+risks:
+  - "1,96 is slower than r12-merge (+11-13 %) and 4,96 gains only ~8 %: merge should take 2,96 only"
+  - "cooperative launch at 226 KB smem and 512 threads needs 98 co-resident CTAs (1 per SM); co-residency is required by the image-counter and weight-counter waits"
+  - "portal ratio expected like D's single-launch sc_kernel (1.20-1.27); a 2,96 portal of ~25-27 us vs 32.8 is a projection, not measured"
+  - "the 13 non-C=96 rows run the r0 fp32 anchor (merge-only candidate)"
+measure_first: [B200]
+compliance:
+  single_stream: true
+  no_cross_call_state: true
+  fp32_math: true
+  no_threads_or_fork: true
+  no_precompiled_binaries: true

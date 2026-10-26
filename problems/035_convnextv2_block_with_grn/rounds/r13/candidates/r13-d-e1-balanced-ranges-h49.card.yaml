@@ -1,0 +1,100 @@
+id: r13-d-e1-balanced-ranges-h49
+parents:
+  - r12-d-e2-grn-epi-counters
+operation: structural_mutation
+language: cuda_cpp
+niche:
+  mem: tma-tensor
+  st: bulk
+  grid: persistent
+  launch: fused
+  tile: token
+  red: cta
+  cache: default
+  spec: dispatch:size
+hypothesis: >-
+  H53, supported on 16,384 only. Static token ranges for the GEMM1 tiles let a tile straddle images, so every CTA
+  gets one balanced tile. Each tile adds its per-(image,k) sumsq into gsq, publishes on every image it touches, and
+  rebuilds inv_b from gsq with a CTA reduction. At 16,384 this removes the 2-tile tail: 46.4 vs 50.5 us for
+  r12-merge's tc2 (-8.3 %), and 46.1 vs 50.9 against r12's tc_kernel in one container. At 8,384 it only ties
+  (-0.2..-0.3 us), because the straddle costs (~1.2-1.6 us of reduction, waits on 2 images) cancel the balance.
+  Balanced 7x7 tables tied or lost, so 7x7 keeps whole-image tiles. Key side finding: a fence.acq_rel.gpu +
+  red.relaxed publish costs 8-15 us at 14x14 compared with red.release.gpu.
+expected_effect:
+  S:
+    pct: 0
+    confidence: medium
+  M:
+    pct: 0
+    confidence: medium
+  L:
+    pct: -1
+    confidence: medium
+resources_sm100a:
+  regs_per_thread: 128
+  smem_per_cta_bytes: 227608
+  threads_per_cta: 512
+  ctas_per_sm: 1
+  bytes_in_flight_per_sm: 196608
+  launches_per_call: 1
+knobs:
+  tc_rows: "R/KS/NI2/MP: 2,768 56/12/1/1; 8,768 112/6/2/1; 16,768 168/6/2/2; 32,768 168/3/2/2 (whole-image, r12 tables); 8,384 136/3/0/1 and 16,384 272/3/0/1 (balanced, one GEMM1 tile per CTA, 144 tiles)"
+  gemm1_ring: "one tile per CTA: NST1 from the full 192 KB ring (epilogue smem used only after every stage is consumed); N1 = 272 as two MMAs 128 + 144"
+  counters: "red.release.gpu publish; whole ranges: one cell per range (target HT); straddling: one cell per touched image (target HT x ranges touching it); single ld.acquire poll loop; back-to-back departure atomics; last departer resets"
+  TC_STAMPS: 0
+dispatch:
+  - shapes: "16,384,14,14 (take); 8,384,14,14 (tie)"
+    kernel: "tc_kernel<384,196> with balanced straddling ranges"
+    meta: {grid: "num SMs, cooperative"}
+  - shapes: "2,768 8,768 16,768 32,768 (7x7)"
+    kernel: "tc_kernel<768,49> whole-image ranges (r12 semantics; measured 2-3 us slower than r12's kernel, keep r12-merge paths)"
+    meta: {grid: "num SMs, cooperative"}
+  - shapes: "all other rows"
+    kernel: "convnext_fused (r0 anchor; merge-only candidate)"
+    meta: {}
+tests:
+  - H53
+  - H56
+findings:
+  - "STEP 0 (H56, cache hints, own workspace buffers only per the operator rule; x, weights and out excluded). h1 = L2 evict_last on the d16, fp16 W1/W2 scratch and h' stores; h2 = h1 + evict_first on the GEMM2 h' TMA loads. harness_time interleaved x3: 16,384 60.58 / 60.24 / 60.29; 8,768 33.15 / 32.77 / 32.78; 32,768 61.30 / 60.97 / 61.31 us (none / h1 / h2). Best gain 0.38 us, under the keep bar (>= 0.7 us on two rows); not shipped [probe_b200]"
+  - "H31 port-rule pricing per k16 (max(N/2, (4096+32N)/123) clk): N=272 136 (MMA-bound), N=136 69, N=160 80, N=80 54, N=176 88. The balanced tables were chosen for epilogue balance, not MMA rate; in 1-tile CTAs all 16 warps run the epilogue [INFERRED]"
+  - "Balanced vs whole-image tables in the same code, same container (harness_time x3): 16,384 R=272 60.6 vs R=200 66.9 (-6.3); 8,384 R=136 40.9 vs 42.3 (-1.4); 8,768 R=80 33.15 vs R=112 32.80; 16,768 R=152 43.1 vs R=168 42.9; 32,768 R=152 (2 tiles, 288 tiles) 68.9 vs R=168 61.2; 2,768 R=24 26.35 vs R=56 25.25. Balance pays only at 14x14; 7x7 keeps whole-image tiles [probe_b200]"
+  - "Straddle cost: after the wait, each tile rebuilds inv_b from gsq (sqrt-sum over 4C per touched image). Measured 1.2-2.2 us per tile; a stub without those loads was 1-2 us faster end to end on every row. One-round scalar loads saved 0.5-1 us; predicated float4 loads (<= 2 LDG.128 per image per thread) saved another 0.2-0.6 us. The rest is L2 latency plus the CTA reduction [probe_b200]"
+  - "KEY (counter signalling): publishing with fence.acq_rel.gpu + red.relaxed.gpu instead of red.release.gpu cost 8-15 us at 14x14 (same container: 8,384 42.29 -> 34.46, 16,384 67.09 -> 51.90) and nothing at 7x7. In-kernel globaltimer spans did not show it: the timed span grew to 14-22 us more than the stamped span at 14x14. Always publish with red.release; trust harness_time over stamps for this kind of change [probe_b200]"
+  - "Per-image serial spins and serial departure atomics (one round trip each) cost about 1 us per extra image per tile on the 7x7 multi-image tiles; the shipped build uses one cell per whole-image range plus a single poll loop [probe_b200]"
+  - "Final A/B against r12's exact tc_kernel source in one container (red.release publish): 8,384 balanced 33.44 vs r12 33.77; 16,384 balanced 46.14 vs r12 50.94. The 7x7 rows stayed slower than r12 (8,768 +1.8, 32,768 +4.5 us in the per-image-cell variant); with the one-cell fix run_tests still shows 32,768 57.7 vs 54.7 and 8,768 32.5 vs 30.6. The remaining 7x7 gap is unexplained; the GEMM1 phase per tile matches r12 in structure, so suspect the extra per-thread work (4-slot selects, float4 sqb, per-thread gsum loads), not the counters [probe_b200, run_tests]"
+  - "run_tests 16/16 PASS twice (portal-order re-runs included). Final build vs r12-merge: 16,384 46.4 vs 50.5 (-8.3 %), 8,384 33.7 vs 33.9, 16,768 40.9 vs 40.8, 8,768 32.5 vs 30.6, 32,768 57.7 vs 54.7, 2,768 24.8 vs 22.7; other rows run the r0 anchor (merge-only). The reference times were byte-identical in both runs, so they look cached rather than re-measured; same-container probe A/B is the trustworthy comparison [run_tests]"
+  - "Verdict H53: 16,384 meets its line (-4.1 run_tests / -4.8 probe vs <= -3 us); 8,384 misses (-0.2..-0.3 vs <= -1.5); no 7x7 row reaches -1 us. The refutation clause does not fire (16,384 moved by more than 0.5 us) [run_tests, probe_b200]"
+  - "GEMM2 re-tune for one-tile-per-CTA 14x14 rows: KS 3 stays best (8,384 KS4 44.8, KS2 42.0 vs KS3 40.5; 16,384 KS2 60.1, KS4 68.1 vs KS3 59.2, same container, pre-fix publish) [probe_b200]"
+  - "PRECISION LOG (fp64 reference, harness generators, torch.manual_seed(200), 10 rounds, build with the shipped arithmetic; the final build changes only the counter signalling): 2,768 1.674e-3 / 2.6e-3 (64 %), 8,768 1.883e-3 / 2.9e-3 (65 %), 16,768 1.892e-3 (65 %), 32,768 1.876e-3 (65 %), 8,384 1.863e-3 / 2.8e-3 (67 %), 16,384 1.870e-3 / 3.3e-3 (57 %); 0 elements beyond atol on every row [probe_b200]"
+  - "Counter stress: 400 NaN-prefilled calls at 16,384 / 32,768 / 8,384 gave worst |err| 1.73e-3 / 1.79e-3 / 1.62e-3 and 0 NaN on the build with per-image cells and the fence publish. The 400-call loop was NOT re-run on the final build (probe /tmp kept being recycled); the final build passed run_tests 16/16 x 10 rounds plus portal-order re-runs [probe_b200, run_tests]"
+  - "Resources: compile_b200 of the final tc device code: tc_kernel<768,49> 128 regs, 0 B local; tc_kernel<384,196> 109 regs, 0 B local. cuobjdump on earlier builds of this code: REG 128/109, STACK 0. The stamped build has STACK 32-56 (relative numbers only) [compile_b200, probe_b200]"
+  - "Merge advice: take 16,384 from this kernel (portal estimate about -5 us at D's 1.2-1.3 ratio, +0.0015-0.002 of mean). Keep r12-merge paths for 8,384 (tie) and all 7x7 rows (this build is slower there) [INFERRED]"
+  - "Pitfall: probe containers lost /tmp between most calls in this session; stage-and-reuse only worked across 1-2 consecutive probes. Put the complete source in the same probe that builds and times it, and use triple-double-quoted outer strings when the embedded text contains ''' [probe_b200]"
+paths:
+  - {max_tokens: 1568, lang: cuda, width: 128, threads: 512, rows: 128, grid: persistent, mem: tma, launches: 1, x: none, w: none, st: none, cluster: 1, note: "tc_kernel<384,196> balanced straddling token ranges at 8,384 / 16,384 (one GEMM1 tile per CTA); tc_kernel<768,49> whole-image ranges at 7x7"}
+  - {max_tokens: null, lang: cuda, width: 128, threads: 256, rows: 128, grid: persistent, mem: ldg, launches: 1, x: none, w: none, st: none, cluster: 1, note: "r0 fp32 anchor on every other row (merge-only candidate)"}
+runs_on:
+  H200:
+    runs: false
+    representative: false
+    note: "tcgen05/TMEM and cp.reduce.async.bulk paths are sm_100a-only"
+  A100:
+    runs: false
+    representative: false
+  L40S:
+    runs: false
+    representative: false
+risks:
+  - "Only 16,384 beats r12-merge; the 7x7 rows of this build are 2-3 us slower than r12's kernel and must not be merged"
+  - "The final counter logic (one cell per whole range, batched polling and departures) was not put through the 400-call stress loop; it passed run_tests 16/16 x 10 rounds and the portal-order re-runs"
+  - "Straddling waits rely on tiles sharing an image being < P tile indices apart and every CTA being co-resident (host check plus cooperative launch); a table change that breaks this could deadlock"
+  - "run_tests reference times look cached, so its per-row deltas carry cross-host error; the probe A/B against r12 in one container supports the 16,384 gain (-4.8 us)"
+measure_first:
+  - B200
+compliance:
+  single_stream: true
+  no_cross_call_state: true
+  fp32_math: true
+  no_threads_or_fork: true
+  no_precompiled_binaries: true

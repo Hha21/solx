@@ -1,0 +1,103 @@
+id: r13-d-e2-sc-stripconv-512
+parents:
+  - r12-d-e1-h48-gate-parent
+operation: structural_mutation
+language: cuda_cpp
+niche:
+  mem: tma-tensor
+  st: bulk
+  grid: persistent
+  launch: fused
+  tile: token
+  red: cta
+  cache: default
+  spec: dispatch:size
+hypothesis: >-
+  H54 supported. sc_kernel's conv was limited by instruction issue, not by idle warps: the clamped 7-wide loop
+  spent about 170 instructions per output. The rewrite uses one plane per item, 1x4 register-blocked segments with
+  the 49 taps in registers and three LDS.128 per input row, writes fp32 d to smem, and then stores fp16 d and
+  out = x + b2 with coalesced vector stores. Conv after landing fell 2.82 -> 1.54 us at 1,192 and 10.5 -> 6.7 us at
+  8,192. GEMM1 also got 1-4 us shorter once the scattered conv stores were gone. Per-row 512 threads (12 epilogue
+  warps) helps 4,96 / 8,192 / 1,160 / 2,96, and the monotonic-counter barrier adds 0.1-0.5 us. In the same
+  container, all seven sc rows ran 7-14 % faster than r12-merge.
+expected_effect:
+  S:
+    pct: -9
+    confidence: medium
+  M:
+    pct: -6
+    confidence: medium
+  L:
+    pct: 0
+    confidence: high
+resources_sm100a:
+  regs_per_thread: 108
+  smem_per_cta_bytes: 231744
+  threads_per_cta: 512
+  ctas_per_sm: 1
+  bytes_in_flight_per_sm: 196608
+  launches_per_call: 1
+knobs:
+  sc_threads: "384 at 1,192 / 1,96 / 4,192; 512 at 2,96 / 4,96 / 8,192 / 1,160"
+  RB: "host cost model: 1 at 1,192 / 2,96 / 1,96 / 4,96 / 4,192 (384 thr), 2 at 8,192"
+  NST2: "6 at 384 thr, 5 at 512 thr (warps 12-15 stage in ring bytes 160-170 KB)"
+  barrier: "sc_kernel: monotonic 64-bit counter g_sc_bar (no reset cell); tc_kernel / tc2 unchanged"
+  SC_STAMPS: 0
+  TC_STAMPS: 0
+dispatch:
+  - shapes: "1,192 1,96 4,192 (W%4==0, 384 thr) and 2,96 4,96 8,192 (512 thr)"
+    kernel: "sc_kernel<C,W,PG,NT> with the strip conv"
+    meta: {grid: "num SMs, cooperative"}
+  - shapes: "1,160,449,7"
+    kernel: "sc_kernel<160,7,4,512> (7-wide conv into smem d, coalesced store pass)"
+    meta: {grid: "num SMs, cooperative"}
+  - shapes: "wide-C rows"
+    kernel: "tc_kernel / tc2_kernel (r11/r12, unchanged)"
+    meta: {}
+  - shapes: "8,320 / 32,128 / 64,96"
+    kernel: "convnext_fused (r0 anchor, merge-only)"
+    meta: {}
+tests:
+  - H54
+  - H52
+findings:
+  - "Core mechanism: the old sc conv was limited by instruction issue (clamp/select address arithmetic, about 170 instructions per output, about 2 us per single-plane item at 1.95 GHz even with 10 warps/SM at 8,192). Occupancy was not the limit. The new conv uses about 60-70 instructions per output (49 FFMA + 5.25 LDS.128 + taps amortised over RB rows) [probe_b200, INFERRED]"
+  - "Stamps (globaltimer after a 252 MB flush, CTA medians, median of 5; parent-equivalent / new 384 / new 512 thr), in us. Conv only after planes land: 1,192 2.82 / 1.54 / 1.54; 1,96 3.58 / 2.05 / 2.30; 2,96 5.89 / 4.10 / 3.58; 1,160 3.84 / 2.56 / 2.30; 4,96 10.24 / 7.17 / 5.38; 4,192 5.89 / 4.35 / 4.35; 8,192 10.50 / 7.17 / 6.66. Conv + stores + stats: 1,192 3.33 -> 2.30; 8,192 11.52 -> 8.96. Success lines: <= 1.6 us at 1,192 met (1.54); <= 6 us at 8,192 missed (6.66). The refutation clause (< 25 % shrink at both) does not fire: 1,192 shrank 45 %, 8,192 37 % [probe_b200]"
+  - "Side effect: GEMM1 (sync-1 release to G1 max) fell from 7.4 to 3.6 us at 1,192, from 16.4 to 12.8 at 8,192 and from 12.8 to 7.9 at 4,192. The parent's scattered 2-byte d16 stores apparently slowed the TMA reads of D that follow [probe_b200]"
+  - "Interleaved x3 via harness_time (sc-only ctypes build, rented us; P = parent-equivalent, N = new conv + cg barrier, M = new conv + monotonic barrier; 3 / 5 = 384 / 512 thr): 1,192 P 18.38 N3 17.17 N5 17.24 M3 16.98 M5 17.07; 1,96 18.33 / 16.96 / 17.23 / 16.94 / 17.25; 2,96 25.15 / 23.31 / 23.07 / 23.09 / 23.03; 1,160 25.47 / 23.98 / 23.76 / 23.94 / 23.66; 4,96 37.90 / 34.65 / 32.39 / 34.32 / 32.19; 4,192 29.26 / 27.65 / 28.07 / 27.46 / 27.80; 8,192 42.60 / 39.55 / 39.48 / 39.56 / 38.99. Shipped picks (M3 or M5 per row) gain 1.3-5.7 us on all 7 rows [probe_b200]"
+  - "STEP 2: 512 threads (12 epilogue/drain warps, NG = 3 per TMEM quadrant, extra staging in ring bytes 160-170 KB, 5-stage GEMM2 ring) wins at 4,96 (-2.3 us vs 384), 8,192 (-0.6), 1,160 (-0.2) and 2,96 (-0.1). It loses 0.1-0.4 us at 1,192 / 1,96 / 4,192, which stay at 384 (shape-keyed table) [probe_b200]"
+  - "STEP 4 (H52): a single monotonic 64-bit arrival counter (atom.add.release.gpu, target = (old/N+1)*N, ld.acquire poll, no reset cell) against cg grid.sync: -0.1..-0.6 us on 6 of 7 rows, tie at 1,96. Release time (phase-A end max to release max) is 1.03 us vs 1.28 us for cg at 1,192 and 8,192. It is shipped on sc_kernel only. This is the first sc-row barrier that beats cg; the r9 flat reset-cell barrier lost 1-2 us here [probe_b200]"
+  - "run_tests 16/16 PASS, including the portal-order re-runs. Same GPU as r12-merge (rented us): 1,192 17.0 vs 18.3 (-7.0 %); 1,96 16.8 vs 18.4 (-9.0 %); 2,96 22.9 vs 25.1 (-8.7 %); 1,160 23.7 vs 26.0 (-8.8 %); 4,96 32.0 vs 37.1 (-13.6 %); 4,192 27.3 vs 29.7 (-8.0 %); 8,192 39.2 vs 42.5 (-7.7 %). The success line (>= 1.5 us on at least 3 of the 5 named rows) is met on all 5. tc rows are unchanged code (within noise: 8,768 -0.1 %, 16,384 -0.9 %; 32,768 +9.6 % compares against a newer r12 tc path, so take that row from r12-merge). 8,320 / 64,96 / 32,128 run the r0 anchor (merge-only) [run_tests]"
+  - "PRECISION (fresh 10-round log: torch.manual_seed(200), harness generators, fp64 reference, shipped per-row configs). The LN-partial summation order changed, and so did the sumsq / gf order at 512 threads; the per-output conv tap order is unchanged, so d is bit-equal except for signed zero. Max |err| vs own atol, beyond-atol count: 1,192 2.027e-3 / 2.4e-3 (84 %), 0; 1,96 2.266e-3 / 2.7e-3 (84 %), 0; 2,96 2.266e-3 (84 %), 0; 1,160 2.238e-3 / 2.6e-3 (86 %), 0; 4,96 2.310e-3 / 2.8e-3 (82 %), 0; 4,192 2.215e-3 / 2.5e-3 (89 %), 0; 8,192 2.381e-3 / 3.0e-3 (79 %), 0. Identical to the r8 log maxima; the parent build gives the same numbers [probe_b200]"
+  - "Resources (compile_b200 on the shipped files): sc_kernel <192,28,16,384/512> 96 regs, <96,56,4,384/512> 93, <160,7,4,512> 108, all 0 B local. A cuobjdump -res-usage probe of the identical sc device code showed STACK 0 for every instantiation. tc/tc2 unchanged (104/110/71/92 regs, 0 local) [compile_b200, probe_b200]"
+  - "Dead end confirmed: more row strips (NS) lose on every row (r12). The gain comes from cheaper instructions per output, not from more copies or more CTAs [probe_b200]"
+  - "NOT DONE: STEP 3 (tc_kernel<384,196> conv after landing at 8,384 / 16,384); no turns left. The tc conv uses the same clamped 7-wide pattern (branch on rows, select on columns), so the same rewrite probably applies; estimated 0.6-1.5 us of conv there, not measured [INFERRED]"
+  - "Next levers for sc rows: (1) the 1x4 conv at 8,192 / 4,96 is still 2-3x its FMA bound; try 1x8 segments with 2 output rows per item (taps reused across rows in registers); (2) GEMM1 at 8,192 / 4,192 (12-13 us) is now the largest sc phase; (3) port the strip conv to tc_kernel<384,196> (STEP 3) [INFERRED]"
+  - "Pitfall: the anchor's '#define NT 256' collides with any struct field named NT; the field is now NTH. /tmp was wiped between some probes this session (r12 behaved the same way) [run_tests, probe_b200]"
+paths:
+  - {max_tokens: 1568, lang: cuda, width: 128, threads: 512, rows: 128, grid: persistent, mem: tma, launches: 1, x: none, w: none, st: none, cluster: 1, note: "tc_kernel / tc2 unchanged on the wide-C rows"}
+  - {max_tokens: 12544, lang: cuda, width: 128, threads: 512, rows: 128, grid: persistent, mem: tma, launches: 1, x: none, w: none, st: none, cluster: 1, note: "sc_kernel strip conv; 384 thr at 1,192 / 1,96 / 4,192, 512 thr elsewhere; monotonic-counter barrier"}
+  - {max_tokens: null, lang: cuda, width: 128, threads: 256, rows: 128, grid: persistent, mem: ldg, launches: 1, x: none, w: none, st: none, cluster: 1, note: "r0 fp32 anchor on 8,320 / 32,128 / 64,96 (merge-only)"}
+runs_on:
+  H200:
+    runs: false
+    representative: false
+    note: "tcgen05/TMEM paths are sm_100a-only"
+  A100:
+    runs: false
+    representative: false
+  L40S:
+    runs: false
+    representative: false
+risks:
+  - "The monotonic barrier keeps a process-lifetime 64-bit counter. It stays correct as long as every sc launch uses the full nsm grid and runs to completion; an aborted launch would desynchronise it. The operator should confirm that the no-reset form (which the E2 spec asks for) is acceptable under the self-reset counter rule"
+  - "S rows move about 1 us between portal submissions; the 7-14 % rented gains are above that, but 1,192's -1.3 us is close to the noise"
+  - "At 512 threads the GEMM2 ring has 5 stages instead of 6; measured faster on the rows that use it"
+measure_first:
+  - B200
+compliance:
+  single_stream: true
+  no_cross_call_state: true
+  fp32_math: true
+  no_threads_or_fork: true
+  no_precompiled_binaries: true
