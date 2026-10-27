@@ -824,7 +824,7 @@ def cmd_merge(a):
         (d / "candidates").mkdir(parents=True, exist_ok=True)
         path = d / "candidates" / f"{cid}.json"
         path.write_text(json.dumps(sol, indent=1))
-        res = b200_modal.handle.remote(dict(id=cid, kind="test", repeat=2, solution=sol,
+        res = b200_modal.call(dict(id=cid, kind="test", repeat=2, solution=sol,
                                             problem=b200_modal.problem_ref()))
     b200_modal.write_trace(d / "results" / "timing" / "B200r" / f"{cid}.jsonl", res)
     order_warning(cid, res)
@@ -901,17 +901,17 @@ def b200_test(round_id):
         with b200_modal.app.run():
             for sol_path, sol, m, need_test in ran:
                 if not need_test:                     # timing reused; only the compile statistics are missing
-                    comp = b200_modal.handle.remote(dict(id=f"{sol_path.stem}-c", kind="compile", solution=sol,
+                    comp = b200_modal.call(dict(id=f"{sol_path.stem}-c", kind="compile", solution=sol,
                                                                          problem=b200_modal.problem_ref()))
                     statics.append(dict(id=sol_path.stem, kernels=comp.get("kernels") or [],
                                         error=comp.get("error") or ""))
                     continue
-                res = b200_modal.handle.remote(dict(id=sol_path.stem, kind="test", solution=sol, repeat=2,
+                res = b200_modal.call(dict(id=sol_path.stem, kind="test", solution=sol, repeat=2,
                                                     problem=b200_modal.problem_ref()))
                 b200_modal.write_trace(out / f"{sol_path.stem}.jsonl", res)
                 order_warning(sol_path.stem, res)
                 wl = res.get("workloads") or []
-                comp = m.get("compile") or b200_modal.handle.remote(dict(id=f"{sol_path.stem}-c", kind="compile",
+                comp = m.get("compile") or b200_modal.call(dict(id=f"{sol_path.stem}-c", kind="compile",
                                                                          problem=b200_modal.problem_ref(),
                                                                          solution=sol))
                 statics.append(dict(id=sol_path.stem, kernels=comp.get("kernels") or [], error=comp.get("error") or ""))

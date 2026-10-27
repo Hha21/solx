@@ -220,13 +220,13 @@ class ModalB200:
         if kind == "probe" and self.workspace:
             req["workspace"] = self.workspace
         try:
-            res = self.fn.remote(req)
+            res = self._remote(req)
         except Exception as e:
             res = dict(id=rid, kind=kind, error=f"Modal call failed: {type(e).__name__}: {e}")
             # a network drop stops the ephemeral app ("function ... is stopped"); start a fresh one and retry once
             if any(m in str(e) for m in ("is stopped", "not running", "hydrated")) and self._restart():
                 try:
-                    res = self.fn.remote(req)
+                    res = self._remote(req)
                 except Exception as e2:
                     res = dict(id=rid, kind=kind, error=f"Modal call failed after restart: {type(e2).__name__}: {e2}")
         with self.lock:      # container time for this call (+5 s overhead); queueing behind other sessions is free
@@ -234,6 +234,18 @@ class ModalB200:
         if res.get("gpu") and "B200" not in res["gpu"]:
             res = dict(id=rid, kind=kind, error=f"wrong GPU {res['gpu']!r}; result discarded")
         return res
+
+    CALL_CAP_S = 900      # Modal can leave a B200 request unscheduled for hours (Starter-plan rationing, 2026-10-27)
+
+    def _remote(self, req):
+        """One request, cancelled if it has not returned within CALL_CAP_S, so a session never hangs on the queue."""
+        fc = self.fn.spawn(req)
+        try:
+            return fc.get(timeout=self.CALL_CAP_S)
+        except TimeoutError:
+            fc.cancel()
+            raise TimeoutError(f"no result in {self.CALL_CAP_S // 60} min: the B200 was probably not scheduled (Modal "
+                               "capacity); wait a few minutes, then retry")
 
     def _restart(self):
         import b200_modal

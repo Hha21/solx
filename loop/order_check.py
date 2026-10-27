@@ -30,7 +30,7 @@ def main():
     with b200_modal.app.run():
         for path in a.solutions:
             sol = json.loads(path.read_text())
-            res = b200_modal.handle.remote(dict(id=f"{path.stem}-order", kind="test", repeat=2, solution=sol,
+            res = b200_modal.call(dict(id=f"{path.stem}-order", kind="test", repeat=2, solution=sol,
                                                 problem=b200_modal.problem_ref()))
             first, later = res.get("workloads") or [], res.get("later_passes") or []
             # Modal's CUPTI timestamp skew (the normal test retries these): correctness had passed, so not a failure

@@ -37,7 +37,7 @@ def interleave(sols, reps, tag="ab"):
     samples, fails, names = {n: {} for n in sols}, [], list(sols)
     for rep in range(reps):
         for who in names if rep % 2 == 0 else names[::-1]:
-            res = b200_modal.handle.remote(dict(id=f"{tag}-{who}-{rep}", kind="test", repeat=2, solution=sols[who],
+            res = b200_modal.call(dict(id=f"{tag}-{who}-{rep}", kind="test", repeat=2, solution=sols[who],
                                                 problem=b200_modal.problem_ref()))
             if res.get("error"):
                 print(f"{who} rep {rep}: error {res['error'][-800:]}")

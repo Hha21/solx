@@ -67,7 +67,7 @@ def measure():
     p = problem.current()
     b200_modal.load_token()
     with b200_modal.app.run():
-        r = b200_modal.handle.remote(dict(id="research", kind="probe", timeout=600,
+        r = b200_modal.call(dict(id="research", kind="probe", timeout=600,
                                           script=PROBE.replace("PROBLEM", f"{p.level}/{p.name}")))
     line = next((l for l in (r.get("stdout") or "").splitlines() if l.startswith("RESULT ")), None)
     if not line:

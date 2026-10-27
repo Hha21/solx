@@ -36,7 +36,7 @@ def main():
         for cid in ids:
             sol = json.loads((archive.ROOT / arc[cid]["solution"]).read_text())
             t0 = time.time()
-            res = b200_modal.handle.remote(dict(id=cid, kind="test", solution=sol, problem=b200_modal.problem_ref()))
+            res = b200_modal.call(dict(id=cid, kind="test", solution=sol, problem=b200_modal.problem_ref()))
             wl = res.get("workloads") or []
             ok = wl and all(w["status"] == "PASSED" for w in wl)
             print(f"{cid}: {sum(w['status'] == 'PASSED' for w in wl)}/{len(wl)} passed in {time.time() - t0:.0f} s"

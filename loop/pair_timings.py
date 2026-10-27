@@ -35,13 +35,13 @@ def main():
         for cid in ids:
             sol = json.loads((archive.ROOT / arc[cid]["solution"]).read_text())
             for rep, gdir in ((1, "B200r"), (2, "B200r2")):
-                res = b200_modal.handle.remote(dict(id=f"{cid}-{rep}", kind="test", solution=sol, problem=b200_modal.problem_ref()))
+                res = b200_modal.call(dict(id=f"{cid}-{rep}", kind="test", solution=sol, problem=b200_modal.problem_ref()))
                 b200_modal.write_trace(D / "timing" / gdir / f"{cid}.jsonl", res)
                 wl = res.get("workloads") or []
                 print(f"{cid:28} rep {rep}: {sum(w['status'] == 'PASSED' for w in wl)}/{len(wl)} passed, "
                       f"{res.get('seconds')} s", flush=True)
             if cid not in statics:
-                comp = b200_modal.handle.remote(dict(id=f"{cid}-c", kind="compile", solution=sol, problem=b200_modal.problem_ref()))
+                comp = b200_modal.call(dict(id=f"{cid}-c", kind="compile", solution=sol, problem=b200_modal.problem_ref()))
                 statics[cid] = dict(id=cid, kernels=comp.get("kernels") or [], error=comp.get("error") or "")
                 sf.write_text("".join(json.dumps(x) + "\n" for x in statics.values()))
     print(f"{len(ids)} kernels in {(time.time() - t0) / 60:.1f} min")
