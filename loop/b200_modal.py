@@ -118,13 +118,19 @@ DEFAULT_PROBLEM = "L1/038_flux_multi_head_rmsnorm_qk"
 def call(req, cap_s=1800):
     """handle.remote with a cap: a request Modal has not answered within cap_s (a B200 it never scheduled: Starter-plan
     rationing, 2026-10-27) is cancelled and returned as an error, so a round never hangs overnight."""
-    fc = handle.spawn(req)
-    try:
-        return fc.get(timeout=cap_s)
-    except TimeoutError:
-        fc.cancel()
-        return dict(id=req.get("id"), kind=req.get("kind"),
-                    error=f"no result in {cap_s // 60} min: the B200 was probably not scheduled (Modal capacity)")
+    import time
+    fc, t0 = handle.spawn(req), time.time()
+    while True:
+        try:
+            return fc.get(timeout=max(1, cap_s - (time.time() - t0)))
+        except TimeoutError:
+            fc.cancel()
+            return dict(id=req.get("id"), kind=req.get("kind"),
+                        error=f"no result in {cap_s // 60} min: the B200 was probably not scheduled (Modal capacity)")
+        except (modal.exception.ServiceError, modal.exception.ConnectionError) as e:   # Modal API blips ("Deadline
+            if time.time() - t0 > cap_s:                                                 # exceeded"): keep polling
+                return dict(id=req.get("id"), kind=req.get("kind"), error=f"Modal service error: {e}")
+            time.sleep(15)
 
 
 def problem_ref():
