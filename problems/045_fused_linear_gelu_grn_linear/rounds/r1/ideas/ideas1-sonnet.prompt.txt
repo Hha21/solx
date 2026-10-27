@@ -1,0 +1,152 @@
+=== TASK ===
+Round r1: write 10 design ideas and 3 leader stories for this problem.
+
+=== PROBLEM ===
+L1/045_fused_linear_gelu_grn_linear: 14 workloads, variable axes ['batch_size', 'height', 'width']; bands by size: S <= 3.7 MB < M <= 13.4 MB < L
+           1,28,28       1.33 MB  band S
+           8,14,14       2.14 MB  band S
+           4,28,28       3.74 MB  band S
+          16,14,14       3.74 MB  band S
+           2,56,56       6.95 MB  band M
+          32,14,14       6.95 MB  band M
+          64,14,14      13.38 MB  band M
+           4,56,56      13.38 MB  band M
+          16,28,28      13.38 MB  band M
+          32,28,28      26.22 MB  band L
+          64,28,28      51.91 MB  band L
+          16,56,56      51.91 MB  band L
+          32,56,56     103.29 MB  band L
+          64,56,56     206.05 MB  band L
+
+=== HYPOTHESIS LEDGER (problems/045_fused_linear_gelu_grn_linear/ledger.yaml) ===
+constraints:
+- 'No deliberate delay before launch (CPU busy-wait, sleep, extra host work) and nothing else meant to change when our kernel reaches the GPU relative to the harness''s flush memset. It exploits the timing methodology, not kernel speed. Off-limits unless NVIDIA approves.'
+- 'No discard/invalidate of cache lines (discard.global.L2 etc.), even on our own inputs: it targets the harness''s measurement, not kernel speed. Off-limits unless NVIDIA approves.'
+- Never touch memory we do not own; no state carried between calls except a scratch counter that is correct for every call.
+- 'No overlap with the harness''s own kernels (no PDL against the flush memset, no other streams): it hides work from the timed window.'
+- 'Clusters only on small one-wave grids or where a GEMM tile needs them (2SM pairs).'
+- 'Eviction-priority operations only on the current call''s own input/output buffers, inside our kernel.'
+- 'No environment variables set from the solution (e.g. CUBLAS_EMULATE_SINGLE_PRECISION) without operator approval.'
+hypotheses:
+- id: H1
+  statement: Every size is compute-bound for any fp32-accurate engine; the GEMM engine (SIMT vs 3xTF32 vs FP16x3 tcgen05) decides the score more than any memory-side tuning.
+  status: open
+  evidence:
+  - 'arithmetic: 262 kFLOP/token vs 1 KB/token; SIMT 0.93 ms vs 36 us copy at 64,56,56'
+  - 'r0-simt-3k: 2191 us at 64,56,56 (61x copy)'
+- id: H2
+  statement: Split-precision tensor-core GEMMs (3xTF32 or FP16x3, fp32 accumulate) meet the tolerance with zero failing elements; any 1- or 2-term scheme and BF16x3 fail.
+  status: open
+  evidence:
+  - 'probe_b200 emulation: 3xTF32 and FP16x3 max err 1.8-2.3e-3, 0% fail; BF16x3 0.8-2.2% fail; TF32 96% fail; TF32 with W-only split 95%'
+  - 'margin is thin: the fp32 reference itself is 1.3-1.5e-3 from fp64'
+- id: H3
+  statement: FP16x3 on kind::f16 beats 3xTF32 on kind::tf32 by ~2x MMA rate, outweighing the in-kernel split/convert cost.
+  status: open
+  evidence:
+  - 'emulation shows identical error for both (probe_b200)'
+- id: H4
+  statement: For N <= ~18k tokens (all S and M) a single persistent kernel that keeps h on chip (TMEM+smem) across a grid barrier beats recompute and multi-launch designs.
+  status: open
+  evidence:
+  - 'arithmetic: 148 x (256 KB TMEM) ~ 37.9 MB vs h = N x 2 KB'
+- id: H5
+  statement: At L, recomputing GEMM1 (+50% FLOPs) beats storing h (+2 KB/token of traffic) once GEMMs run on tensor cores.
+  status: open
+  evidence:
+  - 'arithmetic at 64,56,56: recompute ~+44-88 us (FP16x3/3xTF32) vs store ~+100 us at 8 TB/s'
+- id: H6
+  statement: At S the first kernel is limited by too few CTAs (13-49) running long serial chunk loops; splitting work over hidden chunks or smaller token tiles to fill 148 SMs gives >5x at S.
+  status: open
+  evidence:
+  - 'r0-simt-3k: 137-143 us flat from 784 to 6272 tokens'
+- id: H7
+  statement: Folding s_b = 1 + gw*nf into a per-batch W2 (and gb into the bias) is within tolerance and removes the per-element affine from the hot loop.
+  status: open
+  evidence:
+  - 'algebra exact; rounding difference ~1 ulp of x2'
+
+
+=== LAB NOTEBOOK ===
+Findings recorded by design sessions, newest round first:
+Round r0:
+- [r0-simt-3k] run_tests: 14/14 pass; 137-143 us flat for 784-6272 tokens, 220 us at 12544, 2191 us at 200704 tokens (61x copy) [run_tests]
+- [r0-simt-3k] precision: TF32 fails 96% of elements, TF32 with only W split 95%, BF16x3 0.8-2.2% (fails), 3xTF32 and FP16x3 0% with max err 1.8-2.3e-3 vs atol ~3e-3 [probe_b200]
+- [r0-simt-3k] fp32 torch reference vs fp64: max err 1.3-1.5e-3, half the atol budget [probe_b200]
+- [r0-simt-3k] cuBLAS fp32 GEMM1 at M=200704: 592 us; GEMM2 500 us; TF32 GEMM1 85 us; cuBLAS BF16x9 emulation 289/390 us (more accurate than fp32) [probe_b200]
+- [r0-simt-3k] compile sm_100a: k_main 128 regs, k_stats 80 regs, k_grn 32 regs, 0 spills [compile_b200]
+
+=== PORTAL RESULTS (best first) ===
+- r0-simt-3k: portal 0.2442, S/M/L 176.5/237.6/1021.4 µs
+
+=== LEADER GAP (what the public top scores imply; poc/leader_gap.py) ===
+Leader gap for L1/045_fused_linear_gelu_grn_linear (public board live figures given): s1 0.8541; our best 0.2442 (#75960)
+Assumes the leader scores the same S on every workload. Ceilings at the portal lock: DRAM 7.05 TB/s read+write, 7.5 read-only, + 2.0 us; fp32 SIMT 0.06 PF/s, TF32 tensor 0.91 PF/s, FP16/BF16 tensor 1.82 PF/s, FP8 tensor 3.64 PF/s.
+| workload | MB | GFLOP | Tb us | Ts us | ours us (S) | leader us | leader TB/s | leader TF/s | needs |
+|---|---|---|---|---|---|---|---|---|---|
+| batch_size=1, height=28, width=28 | 1.3 | 0.0 | 57.6 | 0.8 | 178.3 (0.242) | 10.5 | 0.16 | 0 | DRAM ok |
+| batch_size=8, height=14, width=14 | 2.1 | 0.0 | 60.0 | 0.9 | 175.4 (0.253) | 11.0 | 0.24 | 0 | DRAM ok |
+| batch_size=4, height=28, width=28 | 3.7 | 0.0 | 64.6 | 1.4 | 176.1 (0.266) | 12.2 | 0.37 | 0 | DRAM ok |
+| batch_size=16, height=14, width=14 | 3.7 | 0.0 | 67.9 | 1.4 | 176.2 (0.276) | 12.7 | 0.35 | 0 | DRAM ok |
+| batch_size=2, height=56, width=56 | 7.0 | 0.0 | 104.2 | 2.6 | 183.2 (0.360) | 19.9 | 0.39 | 0 | DRAM ok |
+| batch_size=32, height=14, width=14 | 7.0 | 0.0 | 78.1 | 2.6 | 177.4 (0.302) | 15.5 | 0.52 | 0 | DRAM ok |
+| batch_size=64, height=14, width=14 | 13.4 | 0.0 | 104.2 | 4.6 | 284.9 (0.262) | 21.6 | 0.68 | 0 | DRAM ok |
+| batch_size=4, height=56, width=56 | 13.4 | 0.0 | 122.2 | 4.6 | 286.4 (0.294) | 24.7 | 0.59 | 0 | DRAM ok |
+| batch_size=16, height=28, width=28 | 13.4 | 0.0 | 101.5 | 4.6 | 285.4 (0.257) | 21.1 | 0.70 | 0 | DRAM ok |
+| batch_size=32, height=28, width=28 | 26.2 | 0.0 | 144.4 | 8.8 | 420.1 (0.248) | 31.9 | 0.88 | 0 | DRAM ok |
+| batch_size=64, height=28, width=28 | 51.9 | 0.0 | 176.4 | 17.3 | 799.0 (0.169) | 44.4 | 1.22 | 0 | DRAM ok |
+| batch_size=16, height=56, width=56 | 51.9 | 0.0 | 180.2 | 17.2 | 798.9 (0.173) | 45.1 | 1.21 | 0 | DRAM ok |
+| batch_size=32, height=56, width=56 | 103.3 | 0.0 | 311.8 | 33.9 | 1449.5 (0.164) | 81.4 | 1.30 | 0 | DRAM ok |
+| batch_size=64, height=56, width=56 | 206.1 | 0.0 | 573.5 | 67.5 | 2859.7 (0.153) | 153.9 | 1.36 | 0 | DRAM ok |
+Best mean score if every workload ran at the ceiling (optimistic; DRAM read ceiling, no harness flush penalty), by the precision the maths uses: fp32 SIMT 0.994, TF32 tensor 0.994, FP16/BF16 tensor 0.994, FP8 tensor 0.994. Memory-bound problem: precision does not matter.
+Every implied time fits under a ceiling listed in 'needs': the leader's score is reachable with that precision and bandwidth.
+
+=== SOL TARGETS (loop/sol_targets.py) ===
+SOL targets for L1/045_fused_linear_gelu_grn_linear: our best is #75960, mean 0.2442 by the recovered anchors (portal 0.2442); live #1 0.854141 (LIVE_FIRST), target mean 0.856141 (live + 0.002), a gain of +0.6119.
+T_SOL is recovered from the portal scores (planner.anchors(); it is what scores a kernel).
+(SOLAR rules are not encoded for this problem: GFLOP and MB are the compulsory I/O of the definition.)
+| workload (batch_size,height,width) | GFLOP | fused MB | AI | binds | T_SOL us | T_b us | ours us | S | T/T_SOL | dMean/dT x1e-4 per us |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1,28,28 | 0.00 | 1.3 | - | - | 0.77 | 57.6 | 178.3 | 0.242 | 231x | 0.74 |
+| 8,14,14 | 0.00 | 2.1 | - | - | 0.94 | 60.0 | 175.4 | 0.253 | 187x | 0.77 |
+| 4,28,28 | 0.00 | 3.7 | - | - | 1.40 | 64.6 | 176.1 | 0.266 | 125x | 0.80 |
+| 16,14,14 | 0.00 | 3.7 | - | - | 1.39 | 67.9 | 176.2 | 0.276 | 126x | 0.82 |
+| 2,56,56 | 0.00 | 7.0 | - | - | 2.56 | 104.2 | 183.2 | 0.360 | 72x | 0.91 |
+| 32,14,14 | 0.00 | 7.0 | - | - | 2.59 | 78.1 | 177.4 | 0.302 | 68x | 0.86 |
+| 64,14,14 | 0.00 | 13.4 | - | - | 4.58 | 104.2 | 284.9 | 0.262 | 62x | 0.49 |
+| 4,56,56 | 0.00 | 13.4 | - | - | 4.63 | 122.2 | 286.4 | 0.294 | 62x | 0.53 |
+| 16,28,28 | 0.00 | 13.4 | - | - | 4.56 | 101.5 | 285.4 | 0.257 | 63x | 0.49 |
+| 32,28,28 | 0.00 | 26.2 | - | - | 8.75 | 144.4 | 420.1 | 0.248 | 48x | 0.32 |
+| 64,28,28 | 0.00 | 51.9 | - | - | 17.26 | 176.4 | 799.0 | 0.169 | 46x | 0.13 |
+| 16,56,56 | 0.00 | 51.9 | - | - | 17.23 | 180.2 | 798.9 | 0.173 | 46x | 0.13 |
+| 32,56,56 | 0.00 | 103.3 | - | - | 33.91 | 311.8 | 1449.5 | 0.164 | 43x | 0.07 |
+| 64,56,56 | 0.00 | 206.1 | - | - | 67.45 | 573.5 | 2859.7 | 0.153 | 42x | 0.03 |
+
+Time each size needs for mean 0.8561: (a) every size at the same S = 0.8561; (b) cheapest allocation = greedy over 0.2% cuts of the size with the largest score gain until the mean reaches the target (minimises the sum of relative cuts). Cut is relative to our time; + means we are already faster than (a) needs.
+| workload | ours us | (a) equal-S us | (a) cut | (b) cheapest us | (b) cut | S now -> (b) |
+|---|---|---|---|---|---|---|
+| 1,28,28 | 178.3 | 10.3 | -94% | 10.3 | -94.2% | 0.242 -> 0.856 |
+| 8,14,14 | 175.4 | 10.9 | -94% | 10.7 | -93.9% | 0.253 -> 0.859 |
+| 4,28,28 | 176.1 | 12.0 | -93% | 11.2 | -93.6% | 0.266 -> 0.865 |
+| 16,14,14 | 176.2 | 12.6 | -93% | 11.9 | -93.3% | 0.276 -> 0.864 |
+| 2,56,56 | 183.2 | 19.6 | -89% | 17.9 | -90.2% | 0.360 -> 0.869 |
+| 32,14,14 | 177.4 | 15.3 | -91% | 13.0 | -92.7% | 0.302 -> 0.879 |
+| 64,14,14 | 284.9 | 21.3 | -93% | 16.7 | -94.2% | 0.262 -> 0.892 |
+| 4,56,56 | 286.4 | 24.4 | -91% | 20.0 | -93.0% | 0.294 -> 0.884 |
+| 16,28,28 | 285.4 | 20.8 | -93% | 16.2 | -94.3% | 0.257 -> 0.893 |
+| 32,28,28 | 420.1 | 31.5 | -92% | 21.7 | -94.8% | 0.248 -> 0.913 |
+| 64,28,28 | 799.0 | 44.0 | -94% | 22.6 | -97.2% | 0.169 -> 0.967 |
+| 16,56,56 | 798.9 | 44.6 | -94% | 23.4 | -97.1% | 0.173 -> 0.964 |
+| 32,56,56 | 1449.5 | 80.6 | -94% | 38.1 | -97.4% | 0.164 -> 0.985 |
+| 64,56,56 | 2859.7 | 152.5 | -95% | 1268.6 | -55.6% | 0.153 -> 0.296 |
+Sum of relative cuts: (a) 13.02 (cuts only), (b) 12.81; (b) reaches mean 0.8561, saves 6748 us in total. For scale, one uniform cut of 93.4% on all 14 sizes also reaches it (sum 13.07).
+
+Summary: our times are 42-231x T_SOL (geometric mean S 162x, M 65x, L 45x). a practical floor is the fairer yardstick (fp16 tensor MMA at 1.82 PF/s, fp32 tensors moved once at 7.5 TB/s, + 2 us); we are 60.6-97.0x above it at every size. In the S band T is 175-178 us against floors of 2-2 us, so latency, launch and synchronisation bind there, not the roofline. In the L band (the largest sizes by bytes) we are still 76.4-97.0x above the floor, so a throughput constraint binds there as well as fixed latency: traffic and CUDA-core work that the roofline omits, not T_SOL. A microsecond saved pays most at the small sizes (dMean/dT column), because T_b - T_SOL is small there.
+
+=== ARCHIVE ===
+| id | niche (mem/grid/spec) | lang | rented B200 S/M/L | H200 S/M/L | A100 S/M/L | L40S S/M/L | portal B200 S/M/L | B200 score | B200 regs/smem/fit | status |
+|---|---|---|---|---|---|---|---|---|---|---|
+| r0-simt-3k | ldg128/oneshot/all | cuda_cpp | 137.9/184.7/785.0 | -/-/- | -/-/- | -/-/- | 176.5/237.6/1021.4 | 0.244198 | 128/1024/None; 32/1088/None | passed |
+
+=== LINEAGES ===
+(no lineages yet: this is the first portfolio round; seed 2-3 from the ideas pool)

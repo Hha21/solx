@@ -1,0 +1,86 @@
+id: r1-b-e2-fanout-v3
+parents:
+  - r0-simt-3k
+operation: new_design
+language: cuda_cpp
+niche:
+  mem: ldg128
+  st: direct
+  grid: oneshot
+  launch: fused
+  tile: rows28
+  red: cta
+  cache: default
+  spec: dispatch:size
+hypothesis: >-
+  S rows are a chain of dependent latencies, not a FLOP problem. For N <= 3136 the kernel fans each token tile out over
+  4 hidden slices of 128, giving 112-128 CTAs in one cooperative wave with 128 KB of fp32 weight slices each. Each CTA
+  splits its slices hi/lo in shared memory and runs FP16x3 tcgen05 GEMM1 swap-AB, so each TMEM lane is a hidden channel
+  and the GRN sum of squares is a per-thread sum. One grid counter follows, then GEMM2 with a separate cross-term
+  accumulator, reduced with red.add into an output that the slice-0 CTA prefilled with b2.
+  Measured on the rented B200: 11.6 us at 1,28,28, 13.7 at 8,14,14 and 16.5-16.7 at the 3136-token rows, against
+  137-139 us for r0 (-88% to -92%). The 6272-token rows and above still run r0.
+expected_effect:
+  S:
+    pct: -89
+    confidence: high
+  M:
+    pct: 0
+    confidence: high
+  L:
+    pct: 0
+    confidence: high
+resources_sm100a:
+  regs_per_thread: 126
+  smem_per_cta_bytes: 202048
+  threads_per_cta: 512
+  ctas_per_sm: 1
+  bytes_in_flight_per_sm: 188416
+  launches_per_call: 1
+knobs:
+  slices: 4
+  slice_width: 128
+  TT_candidates: [28, 49, 98]
+  threads: 512
+  tmem_cols: 512
+dispatch:
+  - {max_tokens: 784, kernel: "e2_kernel<28>", meta: {grid: 112}}
+  - {max_tokens: 1568, kernel: "e2_kernel<49>", meta: {grid: 128, applies_when: "HW % 49 == 0"}}
+  - {max_tokens: 3136, kernel: "e2_kernel<98>", meta: {grid: 128, applies_when: "HW % 98 == 0"}}
+  - {max_tokens: null, kernel: "r0 k_stats/k_grn/k_main", meta: {launches: 3}}
+tests: [H11]
+findings:
+  - "run_tests (rented B200): 14/14 pass on the first build; E2 rows 1,28,28 11.6 us, 8,14,14 13.7, 4,28,28 16.5, 16,14,14 16.7, against 136.8-139.0 for r0 in the same container (-88% to -92%); r0-routed rows unchanged within 0.7%; emulator predicts portal 0.397 +- 0.007 vs 0.244 [run_tests]"
+  - "H11 verdict: partly supported. 1,28,28 at 11.6 us misses the <= 9 us success line but sits under the 12 us refutation line; the 3136-token rows at 16.5-16.7 us miss <= 11 us. The ~5 us gap between 28-token and 98-token tiles grows with TT (x ingest, GELU, x2 split with scalar 2-byte smem stores, 4x red.add volume), not with the fixed chain [run_tests; attribution INFERRED, stamps not run]"
+  - "compile sm_100a: e2_kernel<28/49/98> 120/126/125 regs at 512 threads, 0 spills; 202 KB dynamic smem forces 1 CTA/SM, so a 512-column TMEM allocation is safe [compile_b200]"
+  - "engine facts (first-try correct): K-major-A and K-major-B tcgen05 kind::f16 (idesc bit 16 = 0) with SW128 descriptors and +32 B K-steps; N = 32/64/112 with padded token rows; tcgen05.ld 32x32b.x4 chains made safe with an empty asm '+r' after wait::ld; flag-zeroed gsum plus a single arrival counter with departure reset, correct over all harness rounds [run_tests]"
+  - "design: gb folded into x2 before the hi/lo split, so no b2' = W2.gb is needed and the prefill stores only b2 [run_tests pass]"
+  - "dead end (arithmetic): 256-wide slices (brief's 6272 = 56 x 2) need 256-320 KB of smem and 588 TMEM columns; 6272 rows need GEMM2 in K halves or 2-CTA clusters to get onto this path [INFERRED]"
+  - "not done: 10-round fp64/err-tol precision log and globaltimer phase stamps; the instrumented build probe timed out twice (Modal could not schedule a B200 for 15 min), and earlier probe calls hung for 1800 s; the harness pass at atol ~3e-3 over 10 random rounds is the only precision evidence [probe_b200]"
+  - "next: stamp the phases; try 2-way slices with GEMM2 K-split for 6272; vectorise the x2 split (pack 2 tokens per 32-bit STS via a transposed TMEM read) and try 8 slices of 64 at 3136 to halve per-CTA GELU [INFERRED]"
+paths:
+  - {max_tokens: 3136, lang: cuda, width: 128, threads: 512, rows: 98, grid: oneshot, mem: ldg, launches: 1, x: none, w: nc, st: none}
+  - {max_tokens: null, lang: cuda, width: 128, threads: 256, rows: 64, grid: oneshot, mem: ldg, launches: 3, st: none}
+runs_on:
+  H200:
+    runs: false
+    representative: false
+    note: "tcgen05/TMEM are sm_100a only"
+  A100:
+    runs: false
+    representative: false
+  L40S:
+    runs: false
+    representative: false
+risks:
+  - "Precision err/tol per row not logged (gate <= 0.8 unverified); it passes the harness tolerance on 10 rounds x 4 E2 rows"
+  - "Grid barrier relies on cooperative co-residency at 1 CTA/SM; a kernel aborted mid-call would leave the counters dirty"
+  - "red.add of the 4 slice partials makes rounding order nondeterministic between calls (within tolerance)"
+  - "6272-token rows (2,56,56 and 32,14,14) and all M/L rows still on r0"
+measure_first: [B200]
+compliance:
+  single_stream: true
+  no_cross_call_state: true
+  fp32_math: true
+  no_threads_or_fork: true
+  no_precompiled_binaries: true

@@ -1,46 +1,113 @@
 constraints:
-- 'No deliberate delay before launch (CPU busy-wait, sleep, extra host work) and nothing else meant to change when our kernel reaches the GPU relative to the harness''s flush memset. It exploits the timing methodology, not kernel speed. Off-limits unless NVIDIA approves.'
-- 'No discard/invalidate of cache lines (discard.global.L2 etc.), even on our own inputs: it targets the harness''s measurement, not kernel speed. Off-limits unless NVIDIA approves.'
+- No deliberate delay before launch (CPU busy-wait, sleep, extra host work) and nothing else meant to change when our kernel
+  reaches the GPU relative to the harness's flush memset. It exploits the timing methodology, not kernel speed. Off-limits
+  unless NVIDIA approves.
+- 'No discard/invalidate of cache lines (discard.global.L2 etc.), even on our own inputs: it targets the harness''s measurement,
+  not kernel speed. Off-limits unless NVIDIA approves.'
 - Never touch memory we do not own; no state carried between calls except a scratch counter that is correct for every call.
-- 'No overlap with the harness''s own kernels (no PDL against the flush memset, no other streams): it hides work from the timed window.'
-- 'Clusters only on small one-wave grids or where a GEMM tile needs them (2SM pairs).'
-- 'Eviction-priority operations only on the current call''s own input/output buffers, inside our kernel.'
-- 'No environment variables set from the solution (e.g. CUBLAS_EMULATE_SINGLE_PRECISION) without operator approval.'
+- 'No overlap with the harness''s own kernels (no PDL against the flush memset, no other streams): it hides work from the
+  timed window.'
+- Clusters only on small one-wave grids or where a GEMM tile needs them (2SM pairs).
+- Eviction-priority operations only on the current call's own input/output buffers, inside our kernel.
+- No environment variables set from the solution (e.g. CUBLAS_EMULATE_SINGLE_PRECISION) without operator approval.
+notes:
+- Leader-gap per-workload times are the equal-S formula's output (t = Tsol + 0.171 (Tb - Tsol)); the HW=3136 "penalty" and
+  the 0.723 ns/token slope are artefacts and say nothing about the leader's design (critic r1 algebra).
+- 'leader_gap.py has GFLOP = 0 for #45, so its "memory-bound, precision does not matter, ceiling 0.994" output is wrong. Tsol
+  recovered from the portal anchors is 0.334 ns/token at L (67.45 us at 64,56,56).'
+- 'Precision ship gate: per row, max over 10 rounds of max |err| / (atol + rtol |ref|) <= 0.8 with the row''s own tolerance,
+  logged in findings; never rely on the 99% matched ratio. Prefer a separate cross-term accumulator on GEMM2.'
+- 'Engine template: #129 lineage-M kernel (read_example solx_129_token_stationary_tcgen05.cu) - SW128 descriptors, idesc kind::f16,
+  elect.sync issue, release/acquire counters with departure reset, packed A&S gelu2, cooperative launch.'
+- 'Portal noise: rows under ~40 us moved about +-1 us between identical submissions on #129. Merge thresholds: 3% projected
+  gain for a lineage with portal history, 10% for a new one.'
 hypotheses:
 - id: H1
-  statement: Every size is compute-bound for any fp32-accurate engine; the GEMM engine (SIMT vs 3xTF32 vs FP16x3 tcgen05) decides the score more than any memory-side tuning.
+  statement: Every size is compute-bound for any fp32-accurate engine; the GEMM engine (SIMT vs 3xTF32 vs FP16x3 tcgen05)
+    decides the score more than any memory-side tuning.
   status: open
   evidence:
   - 'arithmetic: 262 kFLOP/token vs 1 KB/token; SIMT 0.93 ms vs 36 us copy at 64,56,56'
   - 'r0-simt-3k: 2191 us at 64,56,56 (61x copy)'
 - id: H2
-  statement: Split-precision tensor-core GEMMs (3xTF32 or FP16x3, fp32 accumulate) meet the tolerance with zero failing elements; any 1- or 2-term scheme and BF16x3 fail.
-  status: open
+  statement: Split-precision tensor-core GEMMs (FP16x3 with fp32 accumulation) meet the tolerance with zero failing elements
+    on real tcgen05 hardware; any 1- or 2-term scheme and BF16x3 fail.
+  status: supported
   evidence:
-  - 'probe_b200 emulation: 3xTF32 and FP16x3 max err 1.8-2.3e-3, 0% fail; BF16x3 0.8-2.2% fail; TF32 96% fail; TF32 with W-only split 95%'
-  - 'margin is thin: the fp32 reference itself is 1.3-1.5e-3 from fp64'
+  - 'probe_b200 emulation: 3xTF32 and FP16x3 max err 1.8-2.3e-3, 0% fail; BF16x3 0.8-2.2% fail; TF32 96% fail'
+  - 'critic r1, hardware Triton tl.dot FP16x3 on both GEMMs, 7 shapes x 1-3 seeds: worst err/tol 0.78 single accumulator (cross-first
+    ordering the same), 0.44 with a separate GEMM2 cross-term accumulator, 0.29 with a per-k-block fp32 add; GEMM2 alone 0.70,
+    GEMM1 alone 0.25; 0 failing elements in 19 runs'
+  - raw max err 5.7e-3 is above atol but err/tol is what counts, because rtol*|ref| grows with |ref|
 - id: H3
-  statement: FP16x3 on kind::f16 beats 3xTF32 on kind::tf32 by ~2x MMA rate, outweighing the in-kernel split/convert cost.
-  status: open
+  statement: FP16x3 on kind::f16 beats 3xTF32 on kind::tf32; FP16x3 is the engine for every lineage.
+  status: supported
   evidence:
-  - 'emulation shows identical error for both (probe_b200)'
+  - 'critic r1 hardware probe: TF32x3 max err 9.2e-3 (rounded hi) and 1.1e-2 (raw hi), against 5.7e-3 for FP16x3, so TF32
+    is also worse for accuracy'
+  - rate (2x) not measured; it follows from the spec
 - id: H4
-  statement: For N <= ~18k tokens (all S and M) a single persistent kernel that keeps h on chip (TMEM+smem) across a grid barrier beats recompute and multi-launch designs.
+  statement: For N <= 18944 tokens (all S and M rows) one cooperative launch that keeps fp32 h in TMEM across per-batch counters
+    beats recompute and multi-launch designs; target 12544 tokens <= 21 us rented.
   status: open
   evidence:
   - 'arithmetic: 148 x (256 KB TMEM) ~ 37.9 MB vs h = N x 2 KB'
+  - r1 E1 tests it
 - id: H5
-  statement: At L, recomputing GEMM1 (+50% FLOPs) beats storing h (+2 KB/token of traffic) once GEMMs run on tensor cores.
-  status: open
+  statement: At L, recomputing GEMM1 beats storing h once GEMMs run on tensor cores.
+  status: parked
   evidence:
-  - 'arithmetic at 64,56,56: recompute ~+44-88 us (FP16x3/3xTF32) vs store ~+100 us at 8 TB/s'
+  - 'arithmetic at 64,56,56: recompute ~+44-88 us of MMA vs store ~+100 us at 8 TB/s'
+  - 'critic r1 SASS count: exact erff GELU is 1 MUFU + ~28 ALU per element, ~136 issue-clk/token with bias, sumsq and split,
+    above the 96-clk FP16x3 MMA; recompute repeats this GELU, so it pays ~136 clk/token more, not +50% of MMA'
 - id: H6
-  statement: At S the first kernel is limited by too few CTAs (13-49) running long serial chunk loops; splitting work over hidden chunks or smaller token tiles to fill 148 SMs gives >5x at S.
+  statement: At S the first kernel is limited by too few CTAs (13-49) running long serial chunk loops; splitting work over
+    hidden chunks or smaller token tiles to fill 148 SMs gives >5x at S.
   status: open
   evidence:
   - 'r0-simt-3k: 137-143 us flat from 784 to 6272 tokens'
 - id: H7
-  statement: Folding s_b = 1 + gw*nf into a per-batch W2 (and gb into the bias) is within tolerance and removes the per-element affine from the hot loop.
+  statement: Folding s_b = 1 + gw*nf into a per-batch W2 (and gb into the bias) is within tolerance and removes the per-element
+    affine from the hot loop.
   status: open
   evidence:
-  - 'algebra exact; rounding difference ~1 ulp of x2'
+  - algebra exact; rounding difference ~1 ulp of x2
+- id: H8
+  statement: In on-chip and stored-h designs the CUDA-core epilogue (bias, exact GELU, sumsq, hi/lo split, TMEM round trip)
+    binds at L rather than the MMA, unless it is cut to about 10 issue slots per element.
+  status: open
+  evidence:
+  - 'critic r1: erff 1 MUFU + ~28 ALU; normcdff 3 MUFU + ~60; erfcf 3 MUFU + ~45 (sm_100a SASS)'
+  - '#129 K: co-running epilogue and MMA warps keep 54-70% of their solo rates'
+  - r1 E3/E4 stamps (epilogue vs MMA per tile) test it
+- id: H10
+  statement: A per-CTA workspace ring of h (2 KB/token, at most 2 rounds, about 76 MB) written with evict_last and re-read
+    by the same CTA one round later stays in L2 under the harness's dirty-L2 flush, so read-back runs above 10 TB/s aggregate
+    and DRAM sees mostly x, out and the flush write-backs.
+  status: open
+  evidence:
+  - 'critic r1: probe not run (budget)'
+  - r1 E3 step 0 tests it
+- id: H11
+  statement: For N <= 6272, a hidden-slice fan-out (token tiles x hidden slices, at most 64 KB of weights per CTA, one grid
+    barrier, red.add split-K) reaches 1,28,28 in <= 9 us rented and 3136-token rows in <= 11 us.
+  status: open
+  evidence:
+  - 'critic r1 skeleton at 1,28,28, 128 CTAs, rented: empty 1.63 us, loads and stores 4.80, plus barrier 6.27, plus 16-way
+    red.add 6.82'
+  - r1 E2 tests it
+- id: H12
+  statement: For token-stationary designs at S, ingesting the 512 KB of hi/lo weight images per CTA (about 4 us at ~120 GB/s/SM)
+    is the largest term on the S critical path.
+  status: open
+  evidence:
+  - '#129 C: one-shot cp.async.bulk into smem after the flush runs at about 120 GB/s/SM'
+  - r1 E1 phase stamps at 1,28,28 test it
+- id: H13
+  statement: At L, persistent rounds aligned to whole batches, with fp32 h in TMEM and per-batch counters, run at <= 15 us
+    per 128-token round (about 165 us at 64,56,56) despite the full TMEM preventing overlap.
+  status: open
+  evidence:
+  - 'arithmetic: 6 passes x 128x512x128 MAC / 4096 MAC/clk = 12.3k clk = 8.2 us of MMA per round, plus epilogue, wait and
+    store'
+  - r1 E4 tests it

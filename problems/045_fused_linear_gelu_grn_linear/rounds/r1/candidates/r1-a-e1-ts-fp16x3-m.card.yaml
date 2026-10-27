@@ -1,0 +1,82 @@
+id: r1-a-e1-ts-fp16x3-m
+parents:
+  - r0-simt-3k
+operation: new_design
+language: cuda_cpp
+niche:
+  mem: bulk1d
+  st: direct
+  grid: persistent
+  launch: fused
+  tile: rows96
+  red: cta
+  cache: default
+  spec: dispatch:size
+hypothesis: >-
+  For N <= 14208 tokens (all S and M rows), one cooperative tcgen05 FP16x3 launch keeps fp32 h in TMEM across
+  per-batch GRN counters, and every SM ingests 512 KB of hi/lo weight images through a 3-stage 32 KB bulk ring.
+  Measured on the rented B200: 21.0-36.0 us at S/M against r0's 137-221 us (-80..-86%), with all 14 rows passing.
+  The design does not reach its targets (784 <= 13 us, 12544 <= 21 us). About 19 us of fixed chain cost at t=16
+  points to the serial weight ring plus the phase-0 grid wait; this is unconfirmed without stamps.
+expected_effect:
+  S:
+    pct: -84
+    confidence: high
+  M:
+    pct: -84
+    confidence: high
+  L:
+    pct: 0
+    confidence: high
+resources_sm100a:
+  regs_per_thread: 112
+  smem_per_cta_bytes: 210944
+  threads_per_cta: 544
+  ctas_per_sm: 1
+  bytes_in_flight_per_sm: 98304
+  launches_per_call: 1
+knobs:
+  TMAX: 96
+  HSW: 32
+  NST: 3
+  NTH: 544
+  lo_scale_gemm2: 2048
+dispatch:
+  - {max_tokens: 14208, kernel: f_kernel, meta: {t: "min(96, ceil16(N/148))", grid: "ceil(N/t)", cooperative: true, nst: 3}}
+  - {max_tokens: null, kernel: r0 k_stats+k_grn+k_main, meta: {TM: 64}}
+tests: [H4, H8, H12]
+findings:
+  - "run_tests (rented B200): 14/14 pass. Fused path us vs r0: 1,28,28 21.0 vs 139.5; 8,14,14 22.1 vs 137.6; 4,28,28 23.3 vs 137.6; 16,14,14 24.7 vs 137.4; 2,56,56 25.3 vs 144.0; 32,14,14 28.3 vs 139.1; 4,56,56 30.0 vs 220.6; 16,28,28 31.6 vs 219.6; 64,14,14 36.0 vs 219.5. L rows unchanged on the r0 path. Bands: S -83.5%, M -83.7%. Projected portal score 0.5325 +- 0.007 (r0: 0.244) [run_tests]"
+  - "H4 success line missed: 784 tokens 21.0 us (target 13), 12544 tokens 30.0-36.0 us (target 21), 6272 tokens 25.3-28.3 us (target 15). Refutation (>30 us at 12544 with weights plus batch wait >50%) could not be judged without phase stamps; 64,14,14 at 36.0 us is above 30 [run_tests]"
+  - "fixed cost dominates: 784 tokens (t=16, 49 CTAs, about 0.3 us of MMA) takes 21 us, and going from t=16 to t=96 adds only about 9-15 us. So about 19 us is chain latency that does not depend on work: the 16 serial 32 KB weight units through a 3-stage ring (each refill waits on the previous unit's MMA commit, then an L2 round trip), plus the phase-0 W conversion and grid counter. This supports H12 in spirit; the exact split is unmeasured [run_tests, INFERRED]"
+  - "hardware facts confirmed by the passing run: a SW32 MN-major UMMA B descriptor (layout code 6, LBO = 2048 between 16-token atoms, SBO = 256 between 8-row k groups, +512 B per K=16 step) is correct; tcgen05 32x32b.x8 ld/st round trips of fp32 h in TMEM work; at t=96, putting the GEMM2 cross accumulator in h block 0's freed columns works [run_tests]"
+  - "precision: all 10 rounds passed on every fused row with FP16x3 (GEMM1 single accumulator, GEMM2 hi*hi plus a separate 2^11-scaled cross accumulator). The per-row err/tol log was NOT collected: probe_b200 hung (1800 s, no response, twice) [run_tests, probe_b200]"
+  - "untested follow-up: ring depth computed from t (nst = (227 KB - 2*t*512 - 13 KB)/32 KB, i.e. 6 stages at t=16, 5 at t=32/48, 3 at t=96, with h' buffers sized t*512 B) written as r1-a-e1-ts-fp16x3-ring. Both run_tests calls timed out because Modal had no B200 capacity, so it is unmeasured. It is the next experiment; expect the S rows to move if the ring is the chain [run_tests timeout]"
+  - "tooling: probe_b200 timed out twice, and compile_b200 lost its connection twice; only run_tests worked, once. No SASS/register counts or STACK check were collected for the shipped build [probe_b200, compile_b200]"
+  - "phase stamps were not built because there was no working probe channel to read them; rerun with globaltimer stamps to split the 19 us fixed cost between phase 0, the grid wait, the ring and the batch wait [none]"
+paths:
+  - {max_tokens: 14208, lang: cuda, width: 128, threads: 544, rows: 96, grid: persistent, mem: tma, wstat: false, launches: 1, prefetch: true, x: none, w: none, st: none, cluster: 1}
+  - {max_tokens: null, lang: cuda, width: 128, threads: 256, rows: 64, grid: oneshot, mem: ldg, launches: 3, st: none}
+runs_on:
+  H200:
+    runs: false
+    representative: false
+    note: "tcgen05/TMEM are sm_100a only"
+  A100:
+    runs: false
+    representative: false
+  L40S:
+    runs: false
+    representative: false
+risks:
+  - "Cooperative launch with 210 KB smem at 1 CTA/SM; grid <= SM count is checked, occupancy is not queried"
+  - "The phase-0 weight counter and per-batch spins are grid barriers; launch skew is on the critical path at S"
+  - "Precision margin not logged (err/tol per row unknown); passes the 10-round harness check only"
+  - "Fixed ~19 us chain cost per call; the portal's 1.5 GHz clock may stretch the SM-side parts"
+measure_first: [B200]
+compliance:
+  single_stream: true
+  no_cross_call_state: true
+  fp32_math: true
+  no_threads_or_fork: true
+  no_precompiled_binaries: true

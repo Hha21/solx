@@ -1,0 +1,80 @@
+id: r1-a-e1-ts-fp16x3
+parents:
+  - r0-simt-3k
+operation: new_design
+language: cuda_cpp
+niche:
+  mem: bulk1d
+  st: direct
+  grid: persistent
+  launch: fused
+  tile: rows96
+  red: cta
+  cache: default
+  spec: dispatch:size
+hypothesis: >-
+  For N <= 14208 tokens (all S and M rows), one cooperative tcgen05 FP16x3 launch keeps fp32 h in TMEM across
+  per-batch GRN counters. Each CTA streams 512 KB of hi/lo weight images from L2 through a 3-stage 32 KB ring and runs
+  about 9.2k MMA clocks plus about 10k issue clocks of epilogue. That predicts about 12-15 us rented at 12544 tokens
+  and 6-9 us at 784 tokens, against r0's 137-221 us. UNMEASURED: the session ended before compile_b200 returned and
+  every probe timed out.
+expected_effect:
+  S:
+    pct: -93
+    confidence: low
+  M:
+    pct: -93
+    confidence: low
+  L:
+    pct: 0
+    confidence: high
+resources_sm100a:
+  regs_per_thread: 112
+  smem_per_cta_bytes: 210944
+  threads_per_cta: 544
+  ctas_per_sm: 1
+  bytes_in_flight_per_sm: 98304
+  launches_per_call: 1
+knobs:
+  TMAX: 96
+  HSW: 32
+  NST: 3
+  NTH: 544
+  lo_scale_gemm2: 2048
+dispatch:
+  - {max_tokens: 14208, kernel: f_kernel, meta: {t: "min(96, ceil16(N/148))", grid: "ceil(N/t)", cooperative: true}}
+  - {max_tokens: null, kernel: r0 k_stats+k_grn+k_main, meta: {TM: 64}}
+tests: [H4, H8, H12]
+findings:
+  - "tooling: probe_b200 timed out twice (1800 s, no response), even on a trivial inspect script; compile_b200 was cut off when the session ended. Nothing in this card is measured [probe_b200, compile_b200]"
+  - "design arithmetic: at t=96, TMEM holds h as 4x96 columns plus a 96-column GEMM2 main accumulator (480 of 512), so the cross-term accumulator must reuse h block 0's columns after block 0 is converted to h' [INFERRED]"
+  - "design arithmetic: an MN-major SW128 h' tile pads t=96 to 128 tokens (64 KB per hidden block), and two buffers do not fit next to a 3-stage ring; SW32 (16-token atoms) gives 48 KB per block, 211 KB smem in total [INFERRED]"
+  - "design arithmetic: per CTA at t=96, MMA is about 4.6k clk per GEMM, while the GELU+sumsq epilogue is about 2.4k issue clk per hidden block against 1.15k clk of MMA, so the epilogue binds GEMM1 (H8) [INFERRED]"
+  - "risk to check first: SW32 MN-major descriptor encoding (layout code 6, LBO = 2048 atom stride, SBO = 256) has never run; fallback is HSW=128 with NST=2 [INFERRED]"
+paths:
+  - {max_tokens: 14208, lang: cuda, width: 128, threads: 544, rows: 96, grid: persistent, mem: tma, wstat: false, launches: 1, prefetch: true, x: none, w: none, st: none, cluster: 1}
+  - {max_tokens: null, lang: cuda, width: 128, threads: 256, rows: 64, grid: oneshot, mem: ldg, launches: 3, st: none}
+runs_on:
+  H200:
+    runs: false
+    representative: false
+    note: "tcgen05/TMEM are sm_100a only"
+  A100:
+    runs: false
+    representative: false
+  L40S:
+    runs: false
+    representative: false
+risks:
+  - "Not compiled or tested: compile errors, a wrong SW32 MN-major descriptor, or wrong idesc bits would show up as failures or garbage at S/M"
+  - "Cooperative launch with 210 KB smem needs 1 CTA/SM and G <= 148; the plan checks G <= SM count but not occupancy"
+  - "Weight-counter wait plus per-batch spins are grid barriers; the launch skew of 131 CTAs is on the critical path at S"
+  - "GEMM1 single accumulator FP16x3 err/tol 0.25 (Triton emulation); real tcgen05 ordering unverified; GEMM2 uses a separate 2^11-scaled cross accumulator (0.44 expected)"
+  - "Phase stamps were planned but not implemented (no working probe channel)"
+measure_first: [B200]
+compliance:
+  single_stream: true
+  no_cross_call_state: true
+  fp32_math: true
+  no_threads_or_fork: true
+  no_precompiled_binaries: true

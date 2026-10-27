@@ -1,0 +1,106 @@
+id: r1-a-e4-rounds-tmem-v2
+parents: []
+operation: new_design
+language: cuda_cpp
+niche:
+  mem: bulk1d
+  st: direct
+  grid: persistent
+  launch: fused
+  tile: rows128
+  red: cta
+  cache: default
+  spec: all
+hypothesis: >-
+  At L, persistent rounds that hold whole batches only (18816 tokens = 147 tiles of 128 at every HW) keep fp32 h in
+  TMEM across per-batch GRN counters. FP16x3 tcgen05 swap-AB GEMMs need 8.2 us of MMA per round; with a
+  block-pipelined GELU epilogue a round should take <= 15 us, so 64,56,56 <= 170 us rented, without h leaving the SM.
+  UNMEASURED: the tool server never returned in either part of the session.
+expected_effect:
+  S:
+    pct: -85
+    confidence: low
+  M:
+    pct: -88
+    confidence: low
+  L:
+    pct: -85
+    confidence: low
+resources_sm100a:
+  regs_per_thread: 112
+  smem_per_cta_bytes: 230912
+  threads_per_cta: 576
+  ctas_per_sm: 1
+  bytes_in_flight_per_sm: 98304
+  launches_per_call: 1
+knobs:
+  TILE: 128
+  NSTAGE: 3
+  STAGE_BYTES: 32768
+  ROUND_TOKENS_MAX: 18944
+  epilogue_warps: 16
+tests:
+  - H13
+  - H4
+  - H8
+findings:
+  - "tooling: before the interruption, probe_b200 and get_kernel each went 1800 s without a response and the first compile_b200 was interrupted; after the resume, compile_b200 closed its connection once and then went 1800 s without a response. The kernel is NOT compiled, NOT correctness-tested and NOT timed [session log]"
+  - "arithmetic: 18816 = 96*196 = 24*784 = 6*3136 = 147*128, so full batch-aligned rounds have no partial tile at any workload HW, and a tile touches at most 2 batches (HW >= 196 > 128) [inferred]"
+  - "design: the GEMM1 epilogue is split by hidden block (warp group hb owns block hb, all 128 tokens), so each thread owns one hidden channel; sumsq needs no cross-thread reduction (1-2 red.add per thread per round), and block hb's GELU overlaps the MMAs of blocks hb+1.. [inferred]"
+  - "design: the TMEM budget is met by placing the GEMM2 main (cols 0-127) and cross (cols 128-255) accumulators over h blocks 0/1 once they are converted to smem hi/lo; blocks 2/3 reuse the two 64 KB h' buffers after commit-tracked pfree barriers [inferred]"
+  - "smem: X hi/lo 64 KB (reused as h' buffer 0) + h' buffer 1 64 KB + 3 x 32 KB weight ring = 224 KB; per round 16 bulk copies of 32 KB = 512 KB of L2 weight reads per CTA, about 3.7 us at ~140 GB/s/SM, which must hide under 8.2 us of MMA [inferred]"
+  - "risk to measure first: the GELU tail after the last GEMM1 block plus the grid-wide per-batch wait are serial each round (TMEM is full, so the next round's GEMM1 cannot overlap); refuted if a round takes > 22 us [inferred]"
+paths:
+  - max_tokens: 18944
+    lang: cuda
+    width: 128
+    threads: 576
+    rows: 128
+    grid: persistent
+    mem: tma
+    wstat: false
+    launches: 1
+    prefetch: true
+    x: none
+    w: none
+    st: none
+    cluster: 1
+  - max_tokens: null
+    lang: cuda
+    width: 128
+    threads: 576
+    rows: 128
+    grid: persistent
+    mem: tma
+    wstat: false
+    launches: 1
+    prefetch: true
+    x: none
+    w: none
+    st: none
+    cluster: 1
+runs_on:
+  H200:
+    runs: false
+    representative: false
+    note: "tcgen05/TMEM are sm_100a only"
+  A100:
+    runs: false
+    representative: false
+  L40S:
+    runs: false
+    representative: false
+risks:
+  - "Never compiled: syntax errors, the 112-register cap at 576 threads (xr[8] prefetch live across GEMM2) and spills are unknown"
+  - "K-major B descriptor for X (idesc bit16 = 0) is new relative to the #129 template and unverified on hardware; MN-major h' uses LBO = 16384"
+  - "Deadlock risk if any mbarrier parity or count is wrong (hready count 4, xready count 16); a hang would stall run_tests"
+  - "S rows use only 7-49 CTAs, each streaming 512 KB of weights per round; S is not this design's target"
+  - "Precision unverified with this accumulation order: GEMM1 single accumulator (0.25 err/tol emulated), GEMM2 separate cross accumulator (0.44)"
+measure_first:
+  - B200
+compliance:
+  single_stream: true
+  no_cross_call_state: true
+  fp32_math: true
+  no_threads_or_fork: true
+  no_precompiled_binaries: true

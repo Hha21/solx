@@ -1,0 +1,58 @@
+id: r1-c-e3-l2ring
+parents: []
+operation: new_design
+language: cuda_cpp
+niche:
+  mem: bulk1d
+  st: direct
+  grid: persistent
+  launch: fused
+  tile: rows128
+  red: cta
+  cache: default
+  spec: all
+hypothesis: >-
+  (H10) At L, fp32 h written to a per-CTA two-slot ring (2 x 148 x 256 KB = 76 MB) with st.global.L2::cache_hint
+  evict_last is reused from L2 one round later by the same CTA, so only the 512-float statistics cross CTAs and the
+  per-batch wait hides behind the next round's GEMM1. Estimated per 128-token round: GEMM1 epilogue about 10k clk,
+  MMA 6.1k clk under it, GEMM2 about 7k clk; roughly 14 us at 1.5 GHz, so about 150 us portal and 115 us rented at
+  64,56,56. UNVERIFIED: the B200 tools hung during this session, so nothing was compiled, run or probed.
+expected_effect:
+  S: {pct: -80, confidence: low}
+  M: {pct: -85, confidence: low}
+  L: {pct: -85, confidence: low}
+resources_sm100a:
+  regs_per_thread: 112
+  smem_per_cta_bytes: 206720
+  threads_per_cta: 576
+  ctas_per_sm: 1
+  bytes_in_flight_per_sm: 131072
+  launches_per_call: 1
+knobs: {TILE_TOKENS: 128, WORKER_WARPS: 16, RING_STAGES: 4, STAGE_BYTES: 32768, H_SLOTS: 2}
+tests: [H10, H8, H2]
+findings:
+  - "infrastructure: probe_b200 hung for 1800 s twice (the L2 residency probe and an API-introspection probe) and a trivial print probe was cut off at session end; no compile_b200 or run_tests ran, so this candidate is untested [probe_b200]"
+  - "H10 probe still to run: 148 CTAs x 1024 threads; write 38 / 76 MB with createpolicy evict_last vs evict_normal after a 2xL2 zero_; grid counter; re-read own bytes; time each phase with %globaltimer; control = read of an unwritten region (DRAM) [design only]"
+  - "design: hidden-by-token GEMM1 (W1 as the K-major A operand, x^T as the MN-major B operand) makes GRN sumsq a per-thread sum over TMEM columns; a 128-token tile spans at most 2 batches (HW >= 196), handled by one column split cb [design]"
+  - "design: the hi/lo weight images (512 KB) do not fit in smem next to the operand tiles, so they are re-streamed from L2 for every tile (4 KB/token of L2 reads, about 800 MB at 64,56,56); a cost of this lineage, unmeasured [design]"
+  - "design: no overlap of GEMM2 MMAs with the GEMM1 epilogue (x tile and h' buffers share 64 KB of smem); if stamps show MMA idle during the epilogue, the next variant should split the region or shrink the ring [design]"
+paths:
+  - {max_tokens: null, lang: cuda, width: 128, threads: 576, rows: 128, grid: persistent, mem: tma, wstat: false, launches: 1, prefetch: true, x: none, w: none, st: none, cluster: 1}
+runs_on:
+  H200: {runs: false, representative: false, note: "tcgen05/TMEM are sm_100a only"}
+  A100: {runs: false, representative: false}
+  L40S: {runs: false, representative: false}
+risks:
+  - "never compiled: syntax or ptxas errors are likely on the first build; descriptor LBO/SBO conventions are copied from the #129 lineage-M kernel (K-major A at +32 B per k16, MN-major B with LBO = token-chunk stride)"
+  - "deadlock risk if any mbarrier parity is off (ring, xfull/xfree, g1full/tfree, hfull/hfree, g2done/tfree2); each has the derivation in comments, none tested"
+  - "evict_last share of L2 may be capped in hardware (H10 untested); if h spills to DRAM the traffic is about 5 KB/token (~145 us floor at 64,56,56)"
+  - "L2 prefetch of the next hidden_states tile (prefetch.global.L2) may count as a hint on an input; drop it if the operator disagrees"
+  - "phase 0 at S rows runs on only 7-49 CTAs (32768 float4 to convert), several us on the S critical path"
+  - "precision gate (err/tol <= 0.8 per row over 10 rounds) not logged; the GEMM1 single accumulator and GEMM2 separate cross-term match the critic's 0.25 / 0.44 configurations"
+measure_first: [B200]
+compliance:
+  single_stream: true
+  no_cross_call_state: true
+  fp32_math: true
+  no_threads_or_fork: true
+  no_precompiled_binaries: true

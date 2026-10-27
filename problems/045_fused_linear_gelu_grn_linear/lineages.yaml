@@ -1,0 +1,36 @@
+lineages:
+- id: A
+  thesis: The hidden h never leaves the SM. One cooperative tcgen05 FP16x3 launch, token-stationary, keeps fp32 h in TMEM
+    across per-batch GRN counters; one round at S/M, rounds aligned to whole batches at L.
+  status: active
+  started: r1
+  best: null
+  conclusions:
+  - Seeded r1 from pool I1/I2/I5/I24; engine template is
+  - Precision (critic, hardware tl.dot) - single accumulator err/tol 0.78; a separate GEMM2 cross-term accumulator gives 0.44;
+    GEMM2 dominates.
+  - Known costs - 512 KB of hi/lo weights per CTA (about 4 us at 120 GB/s/SM bulk) hurts the S rows; TMEM is full at 128 tokens,
+    so GEMM2's accumulators must reuse freed h columns.
+- id: B
+  thesis: S rows are a latency chain, not a FLOP problem. Fan each token tile out over hidden slices so every SM ingests at
+    most 64 KB of weights, cross one grid barrier, and reduce the split-K GEMM2 with red.add into an output prefilled with
+    the bias.
+  status: active
+  started: r1
+  best: null
+  conclusions:
+  - Seeded r1 from pool I23/I29/I18.
+  - Critic skeleton at 1,28,28 (128 CTAs, rented) - empty 1.63 us, loads and stores 4.80, plus grid barrier 6.27, plus 16-way
+    red.add 6.82; projects about 8-9 us rented with MMAs against the leader's ~10.5.
+- id: C
+  thesis: At L the GRN dependency crosses through L2, not TMEM. A persistent single launch stores each CTA's h tile in a per-CTA
+    workspace ring with evict_last and re-reads it one round later; only the 512-float statistics cross CTAs, and the wait
+    hides behind the next round's GEMM1.
+  status: active
+  started: r1
+  best: null
+  conclusions:
+  - Seeded r1 from pool I26/I12/I3 (stored h with L2 reuse); recompute (I25/I30) parked because it doubles the GELU, which
+    already costs more issue than the MMA (H5, H8).
+  - Even with h fully in DRAM the traffic is about 5 KB/token, about 0.72 ns/token or 145 us at 64,56,56, which is a leader-class
+    floor.

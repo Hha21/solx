@@ -1,0 +1,95 @@
+id: r1-c-e3-l2ring-b
+parents: []
+operation: new_design
+language: cuda_cpp
+niche:
+  mem: bulk1d
+  st: direct
+  grid: persistent
+  launch: fused
+  tile: rows128
+  red: cta
+  cache: default
+  spec: all
+hypothesis: >-
+  (H10) At L, fp32 h written to a per-CTA two-slot ring (2 x 148 x 256 KB = 76 MB) with st.global.L2::cache_hint
+  evict_last is re-read from L2 one round later by the same CTA. Only the 512-float GRN statistics cross CTAs, and
+  the per-batch wait hides behind the next round's GEMM1. Estimate per 128-token round: GEMM1 epilogue about 10k clk
+  with 6.1k clk of MMA under it, GEMM2 about 7k clk; about 14 us at 1.5 GHz, so about 150 us portal and 115 us rented
+  at 64,56,56. UNVERIFIED: never compiled or run, because the B200 was unavailable in both parts of the session.
+expected_effect:
+  S:
+    pct: -80
+    confidence: low
+  M:
+    pct: -85
+    confidence: low
+  L:
+    pct: -85
+    confidence: low
+resources_sm100a:
+  regs_per_thread: 112
+  smem_per_cta_bytes: 206720
+  threads_per_cta: 576
+  ctas_per_sm: 1
+  bytes_in_flight_per_sm: 131072
+  launches_per_call: 1
+knobs:
+  TILE_TOKENS: 128
+  WORKER_WARPS: 16
+  RING_STAGES: 4
+  STAGE_BYTES: 32768
+  H_SLOTS: 2
+tests:
+  - H10
+  - H8
+  - H2
+findings:
+  - "infrastructure, part 1: probe_b200 hung to the 1800 s MCP timeout twice (the L2 residency probe and an API probe); a trivial print probe was cut off at session end [probe_b200]"
+  - "infrastructure, part 2: one probe printed 'alive'; then compile_b200 returned 'Connection closed', the H10 probe was interrupted, run_tests and a later probe timed out at 15 min (Modal did not schedule a B200), and the next probe reported the round's 20-min B200 budget used up [compile_b200, run_tests, probe_b200]"
+  - "result: this exact code was never compiled, run, timed or precision-logged; the first action for this lineage is run_tests of this build"
+  - "H10 probe written but never run: 148 CTAs x 1024 threads write 38 / 76 MB with createpolicy evict_last vs evict_normal after a 2xL2 zero_; grid counter; each CTA re-reads its own bytes with ld.global.cg; %globaltimer per phase; control re-reads an unwritten region (DRAM) [design only]"
+  - "design: hidden-by-token GEMM1 (W1 as the K-major A operand, x^T as the MN-major B operand) makes GRN sumsq a per-thread sum over TMEM columns; a 128-token tile spans at most 2 batches (HW >= 196), handled with one column split cb [design]"
+  - "design: the 512 KB of hi/lo weight images do not fit in smem next to the operand tiles, so they are re-streamed from L2 for every tile: 4 KB/token of L2 reads, about 800 MB at 64,56,56; unmeasured cost of this lineage [design]"
+  - "design: GEMM2 MMAs do not overlap the GEMM1 epilogue, because the x tile and the h' buffers share 64 KB of smem; if stamps show MMA idle during the epilogue, split that region or shrink the ring [design]"
+paths:
+  - max_tokens: null
+    lang: cuda
+    width: 128
+    threads: 576
+    rows: 128
+    grid: persistent
+    mem: tma
+    wstat: false
+    launches: 1
+    prefetch: true
+    x: none
+    w: none
+    st: none
+    cluster: 1
+runs_on:
+  H200:
+    runs: false
+    representative: false
+    note: "tcgen05/TMEM are sm_100a only"
+  A100:
+    runs: false
+    representative: false
+  L40S:
+    runs: false
+    representative: false
+risks:
+  - "never compiled: compile or ptxas errors are possible; the descriptor and idesc conventions are copied from the tested #129 lineage-M kernel (K-major A at +32 B per k16; MN-major B with LBO = token-chunk stride, SBO = 1024)"
+  - "deadlock risk if any mbarrier parity is wrong (ring, xfull/xfree, g1full/tfree, hfull/hfree, g2done/tfree2); each derivation is in the code comments, none tested"
+  - "the hardware may cap the L2 evict_last fraction (H10 untested); if h spills to DRAM, traffic is about 5 KB/token (~145 us floor at 64,56,56)"
+  - "prefetch.global.L2 of the next hidden_states tile may count as a hint on an input; drop it if the operator disagrees"
+  - "phase 0 runs on only 7-49 CTAs at the S rows (32768 float4 to convert), several us on the S critical path"
+  - "precision gate (err/tol <= 0.8 per row over 10 rounds) not logged; the accumulator layout matches the critic's measured configurations: single accumulator 0.25 on GEMM1, separate cross term 0.44 on GEMM2"
+measure_first:
+  - B200
+compliance:
+  single_stream: true
+  no_cross_call_state: true
+  fp32_math: true
+  no_threads_or_fork: true
+  no_precompiled_binaries: true

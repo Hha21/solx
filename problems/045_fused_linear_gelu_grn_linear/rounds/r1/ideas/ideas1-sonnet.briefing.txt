@@ -1,0 +1,1541 @@
+You are the kernel-design step of an automated optimisation loop for NVIDIA's SOL-ExecBench B200 leaderboard. The documents below are your briefing; follow the output contract exactly.
+
+=== core_brief.md ===
+# Core brief (include in every call)
+
+You write GPU kernels for NVIDIA's SOL-ExecBench leaderboard. They are scored on one **B200** (sm_100a) that we
+cannot run. We test on CSF3 (H200, A100, L40S) and compile for sm_100a without a GPU. Tags in brackets give each
+fact's source; the legend is at the end.
+
+## 1. Objective
+
+Maximise the **portal SOL score** for the problem, not the speed on any GPU we can run.
+
+- Score of one workload: `S = (Tb − Tsol) / ((t − Tsol) + (Tb − Tsol))`. Here t is your B200 time, Tb is a hidden
+  per-workload "scoring baseline" (S = 0.5), and Tsol is the SOLAR roofline time (S = 1). [PAPER]
+- The problem's score is the **arithmetic mean over its workloads** (16 for #38). Each workload counts equally, so the
+  12 MB inputs matter as much as the 800 MB ones. [PAPER: portal guide]
+- If any workload fails correctness or trips a reward-hack check, that workload scores 0. Submissions can also be
+  disqualified on review (the public API carries an `is_disqualified` flag). [PAPER]
+- Rule of thumb for #38: a 10% cut in any one workload's time adds about 0.002 to the score, and 10% on all of them adds
+  about 0.04. [INFERRED: model in the problem card]
+
+## 2. How you are timed (harness v1.1)
+
+- For each workload, `run()` is first checked for correctness: 10 rounds, each with fresh random inputs. It is then
+  timed: 10 warm-up calls and 50 timed calls (the portal says 3 trials of 50, mean of the trials). [PAPER: eval_driver.py, portal guide]
+- Before every timed call the harness clears the L2 by zero-filling a buffer twice the L2 size. It also copies the
+  inputs to a new address (shifted by a random 256 B–2 KB) and zero-fills the outputs. [PAPER: timing.py, io.py]
+- t is measured by CUPTI: **start of your first GPU activity to end of your last** (kernels, memcpys and memsets) in
+  that call. CPU time is not counted, but gaps between your kernels are. [PAPER: timing.py]
+- Clocks are locked: SM 1500 MHz, DRAM 3996 MHz. Our portal measurements: memory-bound workloads repeat within
+  ~0.3% (times are shown in 0.1 us steps); compute-bound workloads drift 2-3% between submissions; the scoring
+  baseline Tb is a stored constant, not re-measured. [MEASURED: our submissions; PAPER: device_config.py]
+- So: use **one kernel launch**, and launch nothing else from `run()` (no torch fills, copies or allocations that
+  launch kernels). The sequence of kernels must be identical on every call with the same shapes. [INFERRED: timing.py]
+
+## 3. Hard rules: forbidden behaviour and how it is caught
+
+Never do any of the following, even if it would pass the checks:
+
+| Forbidden | Detection |
+|---|---|
+| Work on another CUDA stream, `torch.jit.fork`, or CUDA-graph tricks that hide work | CUPTI timing window with synchronise; streams disallowed; LLM judge [PAPER] |
+| Python threads, or background work started during evaluation | `threading.active_count()` checked after round 0 and after timing [PAPER] |
+| Caching outputs or intermediates across calls, or any cache keyed on `data_ptr`, values or call count | inputs regenerated every round; pointers shifted every timed call; LLM judge [PAPER] |
+| Lazy or proxy outputs (tensor subclasses, FakeTensor) | `type(out) is torch.Tensor` [PAPER] |
+| Monkey-patching timing or harness functions (`Event.elapsed_time`, `time_runnable`, …) | `id()` snapshots before import, after round 0 and before timing [PAPER] |
+| Lower precision than the tolerance supports (for #38, anything below fp32: bf16/fp16/TF32, `round_f32_to_tf32=True`). Operator policy 2026-10-11: any precision that meets the tolerance with margin is fine; the formats checked for a problem are listed in its note and sol.yaml `precision:` (#35: TF32 and FP16) | tight tolerances (#38: atol = rtol = 1e-5) plus judge [PAPER] |
+| Embedded precompiled binaries (cubin/ELF blobs, `cuModuleLoadData` from strings) | judge and manual review [PAPER] |
+| `torch.utils.cpp_extension.load/load_inline` in Python solutions | blocked at runtime [PAPER: eval_driver.py] |
+| Computing only part of the output (exploiting the 99% matched-ratio rule), or skipping work after validation | 10 randomised rounds; reviewed as cheating [PAPER] |
+
+**Allowed:** choosing the launch configuration or kernel variant from **shapes and dtypes only** (per-size dispatch),
+caching compiled kernels at module level, and building TMA descriptors on the host for each call. [PAPER: docs;
+INFERRED]
+
+## 4. B200 facts that change designs
+
+| Fact | Value | Design consequence |
+|---|---|---|
+| SMs | 148 (2 dies × 74) [LITERATURE] | grid sizes and persistent-grid sizes are multiples of 148 |
+| HBM3e | 8 TB/s; about 8.18 TB/s at the locked 3996 MHz [SPEC; INFERRED] | about 36 B per SM per clock at 1.5 GHz, 2–3× H200/A100: spend few instructions per byte |
+| Bytes in flight to saturate | about 6.4 MB total, **about 43 KB per SM** (at 800 ns latency; 38–54 KB for 700–1000 ns) [INFERRED] | about 4× A100 and 1.8× H200 per SM: keep many loads or TMA stages outstanding |
+| Per SM | 2048 threads, 64 warps, 32 CTAs, 64K registers (≤32 regs/thread for full occupancy), 228 KB shared memory (227 KB per CTA, 1 KB reserved) [SPEC] | |
+| L2 | 126 MB in 2 partitions (one per die); about 21 TB/s local, 16.8 TB/s crossing dies [SPEC; LITERATURE] | L2 holds tiny weights; inputs always come cold from DRAM |
+| Async copy | TMA (`cp.async.bulk.tensor`), 1-D `cp.async.bulk` (no descriptor), mbarrier, clusters ≤8 (16 opt-in) [SPEC] | few instructions for many bytes; shared-memory rings set the bytes in flight |
+| 256-bit LDG/STG | sm_100 only (PTX 8.8); CUDA C++ emits `LDG.E.ENL2.256`, Triton 3.7 emits at most 128-bit [VERIFIED-CSF3] | wider plain loads are possible only from CUDA C++, CuTe or inline PTX |
+| Small inputs | the #38 floor is 1.57 µs for 12.6 MB; fixed costs (CTA dispatch, first DRAM latency, tail) are about 1–3 µs (unknown on B200) [INFERRED] | one launch, a single wave, issue all loads up front |
+
+## 5. Toolchain on the portal
+
+torch 2.9.0+cu130; fbtriton 3.7.1 (it reports `3.7.0+fb.beta`); CUDA 13.1.1 toolkit; CUTLASS 4.4.1 headers;
+nvidia-cutlass-dsl 4.4.2; cuda-tile 1.2.0; cudnn-frontend 1.18.0; Python 3.12. CUDA C++ is compiled with
+`-gencode arch=compute_100a,code=sm_100a`, and the default flags are `-O3 --use_fast_math`. [PAPER: pyproject.toml,
+Dockerfile, problem_packager.py; VERIFIED-CSF3 for our copy]
+
+## 6. Output contract (details in generation_protocol.md)
+
+Return exactly:
+
+1. The solution: a spec JSON (languages, entry point `kernel.py::run` or `*.cu`/`.cpp`, `destination_passing_style:
+   true`) and every source file as a fenced block. `run` takes the inputs in definition order, then the outputs, and
+   writes in place.
+2. A design card in YAML: parents, operation, niche tags, hypothesis, expected effect per size band, resource
+   estimates, which GPUs can run it, risks.
+
+Keep all maths in fp32 and launch on the current PyTorch stream. If an idea needs a forbidden behaviour, drop the idea.
+
+## Confidence labels
+
+| Label | Meaning |
+|---|---|
+| VERIFIED-CSF3 | we measured or compiled it on CSF3 |
+| SPEC | NVIDIA documentation or datasheet |
+| PAPER | the SOL-ExecBench paper, harness code or portal guide |
+| LITERATURE | third-party papers or benchmarks |
+| INFERRED | our reasoning; the doc says from what |
+
+
+=== tricks.md ===
+# Verified tricks and lessons (cross-problem)
+
+Distilled from the hypothesis ledgers of #38, #84, #85, #88 (memory-bound), #009/#218, #30 and #35 (GEMMs), up to
+2026-10-11. Each line was measured on the rented B200 and, where marked, on the portal. A lesson tagged with one problem
+may not transfer, so test it before relying on it. Problem-specific numbers live in each problem's ledger.
+
+## 1. Before tuning: is the gap tuning at all?
+
+- **Read the LEADER GAP section first** (`poc/leader_gap.py`). It backs out the per-workload times implied by the public
+  top scores and the best mean score reachable at the hardware ceilings for each precision. On #35, TF32 tops out at
+  about 0.70, while the leader scores 0.795 and FP16 can reach 0.84. Five rounds of TF32 tuning could never have
+  closed that gap; the first FP16 round gained +0.042 on the portal (0.626 to 0.668).
+- **Precision ladder** for fp32-in/fp32-out problems (operator policy 2026-10-11: any precision that meets the
+  tolerance is fine; check the arithmetic first):
+  - **TF32**: 10-bit mantissa. Use round-to-nearest (TMA tensor map `TFLOAT32`, or `cvt.rna.tf32.f32`). Truncation
+    (plain `FLOAT32` map fed to kind::tf32) gives about 2.5x the error.
+  - **FP16**: the same 10-bit mantissa as TF32, with 5 exponent bits (max 65504, normal down to 6.1e-5). When the
+    inputs sit in that range, FP16 operands round exactly like TF32 and run at **2x the TF32 tensor rate**.
+  - **BF16**: 7-bit mantissa, so about 8x TF32's error. It failed #35's atol 2e-3 on 39% of elements, against the
+    1% the portal allows.
+  - **Splits** (3xTF32, BF16x3/x9) are fp32-accurate but slower than plain TF32.
+  - **Check the arithmetic**: per-element error std ≈ u·sqrt(2/3)·||e||·||w||, where u = 2^-11 for TF32/FP16 and
+    2^-8 for BF16. Simulate in fp64 with numpy on the harness's input distribution, and count the elements outside
+    atol + rtol·|ref|.
+- **Tb** (hidden baseline) is a stored per-workload constant. Back it out from the portal page:
+  `Ts = (Tb - S·t - S·Tb)/(1 - 2S)`. This is ill-conditioned near S = 0.5.
+- **Tsol** for GEMMs uses about 1.8 PF/s, a 16-bit dense rate. A TF32 kernel cannot reach it.
+
+## 2. Portal vs rented B200
+
+- The portal runs the same Modal B200 with the SM clock locked (~1.45-1.5 GHz). The rented card boosts to 1.96 GHz,
+  and under sustained GEMM load it is **power-capped to 1.1-1.35 GHz**: its clock drifts between and within runs.
+  So rented differences of ~7% between sessions can be clock, not code (#35). Measure compute-bound kernels in **SM
+  cycles** (`clock64` with `%globaltimer`), report the clock, and interleave candidate and control in one container.
+- Typical portal/rented time ratios:
+  - DRAM-bound: 1.03-1.10.
+  - Clock-bound SIMT: about 1.2-1.3.
+  - tcgen05 kernels at the MMA ideal: 1.35 (#35 r5).
+  - tcgen05 kernels bound by load latency (FP16 with in-kernel conversion): 1.16-1.27 (#35 r6). Latency in ns
+    does not stretch with the clock, so a rented tie can be a portal win: #35 r6 373/384 were flat rented and
+    13% faster on the portal.
+  - cuBLAS at large M: 1.16-1.22.
+  - Rented gains on clock-bound code can grow (#35 r3: -7% rented became -18% portal) or shrink (#35 r5: -16% became
+    -6%) on the portal. Predict from cycles, not rented µs.
+- **Launch-gap and persistence savings shrink on the portal** (#35 r8). Fusing a pre-pass into the main kernel and making
+  a 2-wave kernel persistent gave -5..-7% rented under harness_time but only -1..-2% on the portal. In the same
+  rounds, gains in DRAM streaming rate carried over at 1.03-1.09 (r7). Prefer gains that move fewer bytes or use
+  the bandwidth better over gains that remove launch or synchronisation overhead.
+- The portal amplifies latency-tolerance gains: more resident warps lifted #88 by +16.7% portal against +6.7% bench.
+- Large **clustered** grids cost 2-5% on the portal and seem to slow later plain launches. Use clusters only where a
+  GEMM tile needs them (2SM pairs) or on small one-wave grids.
+- Portal noise: memory-bound sizes repeat to ~0.1 µs, while compute-bound sizes vary 2-3% between submissions of
+  the same code. Effects under ~1% are invisible.
+  - #35 r8 vs r9: byte-identical FP16 tensor-core code ran 4-7% apart (one submission to the next), costing ~0.01
+    of mean score. DRAM-bound sizes moved 1-2%.
+  - Across three submissions (r8-r10), the identical sizes ran at speed factors 0.965-1.045. The factor moves
+    every size together and hits tensor-heavy sizes hardest (6-9% spread) and DRAM-bound sizes least (1.5-2.5%).
+    Score noise per submission is about +-0.008.
+  - So one portal result cannot confirm a < 5% change on tensor-heavy sizes. Compare on the rented card in one
+    container. The board keeps each team's best score, so a real gain also gets more chances to show.
+
+## 3. Harness memory effects (every problem)
+
+- The harness zero-fills 2x L2 before each timed call, so **L2 is full of dirty lines** when our kernel starts. Every
+  line we allocate evicts one; its write-back lands inside our window and slows our reads:
+  - A read-only stream reaches ~5.3 TB/s, against 7.0 for read+write (#85).
+  - #38 lost ~0.5 µs at S and ~4 µs at M/L to it.
+- **Output stores with L2 evict_last** (`st.global.L2::cache_hint` + `createpolicy...evict_last`) keep our outputs
+  from displacing dirty lines inside the window. This is supported on #38, #84 (5-7% at L), #85 (6-13% at M/L) and #88.
+- **Input loads with L2 evict_first** make later allocations evict our own clean read lines instead of dirty flush
+  lines:
+  - Supported on #84 (+3-4% at L), #85 (lifts the 5.4 TB/s read cap) and #35 (W stream: 45.9 to 39.9 µs rented).
+  - Refuted on #38, where it hurt at some sizes.
+  - Test it per problem. Evict_first on stores and evict_last on read-once weights hurt (#38).
+- Floors: compulsory traffic ≈ reads + outputs, plus one dirty eviction per L2 set (~8 MB). Public read+write streams
+  reach 7.05-7.1 TB/s marginal, so no SM-side change lifts L past that (#38 H11, #88 H14).
+- Forbidden here, even though they work: discard/invalidate of lines we do not own, L2 persistence windows, any
+  deliberate launch delay, PDL or overlap with harness kernels (see core_brief).
+
+## 4. Memory-bound kernel design
+
+- One-shot grids of small CTAs with one 8-float (2x128-bit) chunk per thread beat persistent grids, work stealing,
+  TMA/bulk rings and fatter threads (#38, #85, #88). Persistent register-pipelined grids tied or lost (#88 H13).
+- 128-bit accesses are enough. 256-bit loads gave a little on #38 and nothing or worse elsewhere (#84: +0.8 µs at tiny
+  sizes).
+- **Resident warps per SM**, not bytes in flight, set latency tolerance. Keep registers ≤ 32-40 so 2x the threads fit.
+  The portal rewards this more than the bench (#88 H4).
+- Remove integer division from address maths: use a 2-D grid (#85: -2% at S) or a host-computed magic divisor (#88).
+- A cluster-of-2 launch on one-wave grids cuts ~0.1-0.2 µs of launch overhead at the smallest sizes (#38, #84).
+- Launch floor: a tiny streaming kernel costs ~2.2-3 µs on the portal. Below ~3 MB the gap to Tb is not a design lever.
+- Activation maths: `__expf` + `__fdividef` forms (e.g. GELU as a·b/(1+exp(-2u))) stay within 1e-5 and are faster
+  than `tanhf` (#85).
+
+## 5. GEMM / tensor cores (sm_100, tcgen05)
+
+- **Warp-uniform roles** (#35 r5; the biggest single lesson). Issuing `tcgen05.mma` from one lane inside a divergent
+  branch (`if (warp == 1 && lane == 0)`) makes nvcc wrap each UTCHMMA in an ELECT/BRA.U.ANY waterfall, costing
+  ~300-400 clk per pipeline stage. The fix:
+  - Get the role from a warp-uniform value (`__shfl_sync` of warp id).
+  - Run a whole-warp TMA producer and a whole-warp MMA warp that loops uniformly and wraps only the issue in
+    `elect.sync`.
+  - Commit to the empty barriers with the multicast form.
+  - With this, a 2SM ring ran at 770 clk per stage against a 768-clk MMA ideal (95-96% at B=373-919).
+  - CUTLASS's `PipelineTmaUmmaAsync` and `cute::elect_one_sync` do exactly this. Copy its structure.
+- **2SM pairs** (`cta_group::2`, cluster 2x1, M = 256 split 128 per SM) beat 1SM 128xN everywhere tested (#30 H4, #35):
+  - Each SM loads half the B operand, which halves per-SM operand ingest.
+  - Use two TMEM accumulators to cover N up to 512 in one pass.
+- **A release arrive waits for the thread's own loads** (#35 r6). `mbarrier.arrive.release` (cta or cluster scope)
+  from a thread that still has LDGs in flight (e.g. a register prefetch of the next k-block) stalls until those
+  loads land, so the prefetch hides nothing. Converter warps that LDG, convert and STS into a UMMA stage lost
+  13-27% per k-block to this. Hand off through a warp that has no loads in flight (a forwarder after a named
+  barrier recovered part of it), or keep global loads out of the arriving threads (TMA or cp.async staging,
+  or several warp groups taking k-blocks in turn with nothing prefetched at the arrive). A relaxed arrive is
+  fast but leaves the shared-memory writes unordered: do not ship it. The same wait hits global stores (#35 r11):
+  an epilogue warp's release arrive on the TMEM-free barrier waited ~1 us for its own output stores. That arrive
+  hands over only the end of TMEM reads, so tcgen05.wait::ld + tcgen05.fence::before_thread_sync + a relaxed arrive
+  is enough there.
+- **Overlap the accumulator drain with the next tile's MMA** (#35 r11): give the epilogue its own warps and finish
+  one accumulator early (its last k-blocks first), so it drains while the other accumulator completes. This cut an
+  8 us MMA idle to ~5 us. What is left is store-bound: when every CTA drains at the same moment, the output burst
+  runs at ~6 TB/s whatever the warp count. Stagger the CTAs' drains in time to hide more.
+- **Per-stage floor**: a rotating ring's stage costs max(MMA clk, ~565 clk fixed with uniform issue). Make stages carry
+  ≥ ~600 clk of MMA, e.g. 2 k-blocks per stage, or 48-k stages via a 32-k plus a 16-k TMA box.
+- **Wave and tile quantisation**: 320 pair tiles over 74 SM pairs = 4.32 waves cost ~13% at L on #30. Pick tile counts
+  that divide the SM pairs, or use stream-K. Batch-side padding (B=373 padded to 512) wastes MMA work, so choose N
+  tiles in multiples of 16 per size.
+- **Skinny GEMMs** (small batch × huge weight): the weight stream sets the time, so read it once with evict_first. With
+  one M tile covering every batch row, each W tile goes to exactly one CTA (#35: 144 CTAs × 128 rows).
+- **Fused epilogues**: fold the bias and any output split/scatter into the epilogue. #35's six-way split saved 5-22 µs.
+  A cuBLASLt epilogue with C != D can pick a slower kernel than plain matmul (#30 H10).
+- cuBLAS/cuBLASLt is the right anchor at S/M on fp16/bf16 GEMMs. Hand-written or CUTLASS 2SM kernels win where the
+  shape is unusual: skinny, fused epilogue, odd sizes. Triton `tl.dot` could not compete on B200 (#009 H5).
+- TMEM: allocate once per CTA, relinquish the permit, keep 1 CTA/SM when the allocation is large. A dynamically indexed
+  pointer array in params costs a few STL/LDL, which is fine.
+
+## 6. Working method
+
+- One experiment per hypothesis with a refutation criterion. Interleave the control in the same container, 3 rounds.
+  Report the clock for compute-bound work.
+- run_tests on all 16 workloads × 10 rounds before shipping. Record max |err| per size for any reduced-precision path.
+- When a rented gain disagrees with the portal, update the model (cycles vs µs, DRAM vs clock) before the next round.
+
+
+=== problem card: L1/045_fused_linear_gelu_grn_linear ===
+# Problem card: L1 #45 `045_fused_linear_gelu_grn_linear`
+
+## 1. Semantics
+Reference (ConvNeXtV2 MLP block, NHWC):
+- `h = gelu_erf(x W1^T + b1)`. x is [B,H,W,128], W1 is [512,128] and h is [B,H,W,512].
+- `G[b,c] = sqrt(sum_{hw} h²)`, `nf[b,c] = G / (mean_c G + eps)`, with eps = 1e-6.
+- `x2 = gw*(h*nf) + gb + h`. gw and gb are [1,1,1,512].
+- `out = x2 W2^T + b2`. W2 is [128,512] and out is [B,H,W,128].
+- DPS: `run(hidden_states, pwconv1_weight, pwconv1_bias, grn_weight, grn_bias, pwconv2_weight, pwconv2_bias, eps, output)`; eps is a Python float.
+- Write N = B·HW tokens. Per token: GEMM1 is 128→512 and GEMM2 is 512→128, so 2·2·128·512 = **262,144 FLOP**. Memory is 512 B in and 512 B out.
+- **GRN is a global reduction over HW per batch.** GEMM2 for any token depends on every token of its batch, so a design must do one of: recompute GEMM1, store h (4× the I/O bytes), or keep h on chip across a grid-wide barrier.
+- Algebra: `x2 = h ⊙ s_b + gb` with `s_b = 1 + gw·nf_b`. So out = h (W2 ⊙ s_b)^T + (W2 gb + b2), which means the per-batch scale can be folded into W2. The difference in numerics is about 1 ulp.
+- HW ∈ {196, 784, 3136}. None of these is a multiple of 64, so token tiles need masking or a tile that divides HW (49 and 28 divide all three).
+- All weights are randn: none of the names match the ones/zeros heuristics [harness io.py]. gw and gb are N(0,1), so s_b ranges roughly from -2 to 4.
+
+## 2. Numerics and tolerance
+- Tolerance per workload: atol 2.8e-3 to 3.4e-3 (three seen: 0.0029, 0.0028, 0.0034), rtol 1e-5, 99% matched. |out| has std ≈ 260 and max ≈ 1500, so the rtol term is ≤ 0.015 and atol dominates. The **relative budget is ≈ 1e-5 of the output std**: fp32 GEMM accuracy is required.
+- fp32 reference against fp64: max error is already 1.3–1.5e-3, half the budget [probe].
+- Emulated precision options on the harness distribution (fp32 accumulation) [probe_b200]:
+
+| Option | max err | fail % |
+|---|---|---|
+| fp32 (any order) | 1.3–1.5e-3 | 0 |
+| TF32 (1 pass) | 0.6–0.7 | 96% |
+| TF32 with only W split (2 pass) | 0.4–0.5 | 95% |
+| BF16x3 | 9.5e-3–1.1e-2 | 0.8–2.2% (fails) |
+| **3xTF32** (hi·hi + hi·lo + lo·hi) | 1.8–2.3e-3 | **0** |
+| **FP16x3** (same split, with or without 2^12 scaling of lo) | 1.8–2.3e-3 | **0** |
+| cuBLAS BF16x9 emulation (`CUBLAS_EMULATE_SINGLE_PRECISION`) | better than fp32 | 0 |
+
+- Both GEMMs need the split. TF32 error in GEMM1 alone (h error about 0.05) gives about 1 in out.
+- The GRN statistics need relative error ≲ 1e-5 (Δout ≈ 22·|gw·h·nf|·ε), so pass 1 cannot use 1-pass TF32 either.
+- GELU must use the erf form. `erff` with `--use_fast_math` passed. Keep `sqrt` and `/` in GRN exact (`__fsqrt_rn`, `__fdiv_rn`); they are cheap.
+
+## 3. Workloads
+Bytes = N·1024 + 0.53 MB weights. FLOP = N·262,144. The SIMT figure assumes the fp32 FMA peak of 56.8 TF/s at 1.5 GHz, without the recompute; 3xTF32 TC assumes 0.9 PF/s TF32 / 3; FP16x3 assumes 1.8 PF/s / 3. Floor and reference times are on the rented B200 (unlocked clocks).
+
+| B,H,W | N tok | MB | GFLOP | band | copy floor µs | torch ref µs | SIMT µs | 3xTF32 TC µs | FP16x3 TC µs |
+|---|---|---|---|---|---|---|---|---|---|
+| 1,28,28 | 784 | 1.33 | 0.21 | S | 2.53 | 106 | 3.6 | 0.7 | 0.3 |
+| 8,14,14 | 1568 | 2.14 | 0.41 | S | 2.69 | 108 | 7.2 | 1.4 | 0.7 |
+| 4,28,28 | 3136 | 3.74 | 0.82 | S | 3.07 | 116 | 14.5 | 2.7 | 1.4 |
+| 16,14,14 | 3136 | 3.74 | 0.82 | S | 3.04 | 113 | 14.5 | 2.7 | 1.4 |
+| 2,56,56 | 6272 | 6.95 | 1.64 | M | 3.65 | 137 | 29 | 5.5 | 2.7 |
+| 32,14,14 | 6272 | 6.95 | 1.64 | M | 3.78 | 128 | 29 | 5.5 | 2.7 |
+| 64,14,14 | 12544 | 13.4 | 3.29 | M | 4.83 | 202 | 58 | 11 | 5.5 |
+| 4,56,56 | 12544 | 13.4 | 3.29 | M | 4.82 | 211 | 58 | 11 | 5.5 |
+| 16,28,28 | 12544 | 13.4 | 3.29 | M | 4.74 | 214 | 58 | 11 | 5.5 |
+| 32,28,28 | 25088 | 26.2 | 6.58 | L | 6.91 | 404 | 116 | 22 | 11 |
+| 64,28,28 | 50176 | 51.9 | 13.2 | L | 11.1 | 822 | 232 | 44 | 22 |
+| 16,56,56 | 50176 | 51.9 | 13.2 | L | 11.0 | 816 | 232 | 44 | 22 |
+| 32,56,56 | 100352 | 103 | 26.3 | L | 19.6 | 1559 | 463 | 88 | 44 |
+| 64,56,56 | 200704 | 206 | 52.6 | L | 35.8 | 3028 | 926 | 175 | 88 |
+
+Latency depends only on (B, HW): there are 11 distinct sizes. The table's 3xTF32 and FP16x3 columns count 2 GEMMs; recomputing GEMM1 adds 50% to the GEMM time.
+
+## 4. Bounds per band
+- Arithmetic intensity is 256 FLOP/B, against a B200 balance of about 225 FLOP/B at 1.8 PF and 8 TB/s for 16-bit MMA. SOLAR probably takes Tsol = max(FLOP / ~1.8 PF, bytes / 8 TB/s) ≈ 29 µs at 64,56,56, roughly balanced. This is INFERRED; the first portal page gives Tsol per workload.
+- **Every fp32-accurate path is compute-bound at M and L**, even FP16x3 on tensor cores: 88 µs + recompute at 206 MB against a 36 µs copy. fp32 SIMT is 25–40× slower than the memory floor. At S, launch and latency plus the serial per-CTA work dominate: N/64 = 13–49 CTAs only.
+- Splits of the stored h: x2 is ≤ ~300, fine for FP16 range. lo parts of small values become subnormal in fp16, but the probe shows no harm.
+
+## 5. Where the reference loses (facts)
+- About 7+ launches: GEMM1 (cuBLAS fp32 SIMT, 592 µs alone at 64,56,56, rented), GELU, the norm reduction, the mean, the affine (several passes over the 411 MB h tensor), then GEMM2 (500 µs). h is materialised (N·2 KB) and re-read 3–4 times.
+- cuBLAS's BF16x9 emulation of fp32 is only about 2× faster on these skinny GEMMs (289 and 390 µs). K=128 and N=128 are too small to amortise the 9 products.
+
+## 6. Decisions any design must make (options and their arithmetic, not chosen)
+1. **GEMM precision engine.**
+   - fp32 SIMT: exact; about 57 TF/s, so about 0.93 ms plus recompute at L.
+   - 3xTF32 tcgen05 (kind::tf32): 3 MMAs per product; operand splits done in-kernel or by TMA plus conversion.
+   - FP16x3 tcgen05 (kind::f16): 2× the TF32 rate; the split costs cvt per element.
+   - BF16x9-style: too many products. Any 2-term split fails.
+   - Note: the hi·lo terms can share one MMA by concatening along K: [a_hi | a_lo] · [w_lo | w_hi]^T, with K=256.
+2. **How GRN's global dependency is crossed.**
+   - (a) Recompute GEMM1: 3 GEMM-equivalents in 2–3 launches.
+   - (b) Store h: +2 KB/token written and read, about +100 µs at L; it saves GEMM1 FLOPs.
+   - (c) One persistent cooperative kernel with a grid barrier: keep h (or x) on chip. TMEM plus smem is about 37 MB of h in fp32, enough for N ≤ ~18k (all S and M). It needs a self-resetting barrier counter and partials without a memset.
+   - (d) Store only x2's split operands in fp16 hi/lo (same bytes as fp32 h).
+3. **Launch structure.** Options are 3 kernels (stats, scalars, main), 2 kernels (merge the scalars into main's prologue: each CTA reduces tiles × 512 partials from L2), or 1 cooperative kernel. Each extra launch costs about 2–5 µs at S.
+4. **Folding.** s_b into W2 per batch (W2'_b = W2 ⊙ s_b, a per-batch weight, 256 KB × B) against applying it to h in registers. gb·W2 folded into the bias.
+5. **Tiling.** Token tile of 49 or 28 (divides HW) or masked 64/128. Hidden chunking of GEMM1 → GEMM2 (on-chip x2 chunk as GEMM2's A operand, as in the first kernel). At S, smaller tiles or a split-hidden to occupy 148 SMs (784 tokens = 6 tiles of 128!).
+6. **Weights.** W1 and W2 are 256 KB each in fp32, L2-resident. Per CTA they are streamed by chunks, or held in smem split-converted (hi and lo in fp16 = 256 KB per matrix: too big for one SM, so stream them).
+
+## 7. Results so far (rented B200, run_tests, unlocked clocks)
+`r0-simt-3k` (fp32 SIMT, 3 launches, TM=64, recompute) passes 14/14. Times in µs:
+
+| Workload | µs |
+|---|---|
+| 1,28,28 | 139 |
+| 8,14,14 | 137 |
+| 4,28,28 | 138 |
+| 16,14,14 | 137 |
+| 2,56,56 | 143 |
+| 32,14,14 | 138 |
+| 64,14,14 | 221 |
+| 4,56,56 | 221 |
+| 16,28,28 | 220 |
+| 32,28,28 | 325 |
+| 64,28,28 | 613 |
+| 16,56,56 | 613 |
+| 32,56,56 | 1113 |
+| 64,56,56 | 2191 |
+
+It is slower than the torch reference at S and M, because of the serial per-CTA path with only 13–98 CTAs. It is 1.4× faster than the reference at the largest size.
+
+## 8. Open questions
+- What Tb and Tsol are per workload. Is Tb a TF32-free PyTorch, i.e. ≈ cuBLAS fp32 plus fused elementwise ops, so about 1.2 ms at the largest size?
+- Real tcgen05 3xTF32 / FP16x3 error with the hardware's accumulation order (the emulation used fp32 GEMMs of split operands).
+- Whether a cooperative single kernel's grid barrier is acceptable to the judge (it should be: the work is not hidden).
+- The full list of per-workload atol values (only 3 seen).
+
+
+=== harness_scoring.md ===
+# Harness, timing and scoring (SOL-ExecBench v1.1)
+
+Source of truth: the harness clone at `/home/lain/execbench-test/SOL-ExecBench` (commit `a9fa080`, "Add v1.1 timing
+methodology"), the paper LaTeX, and the portal's public submission guide (read 2026-10-04). File paths below are relative
+to `SOL-ExecBench/src/sol_execbench/`. The portal may run a newer verifier than this clone; the v1.1 post says doubleAI
+reported 7 reward hacks that were then closed. Where the portal text and the code differ, both are given.
+
+## 1. Pinned evaluation environment
+
+| Component | Version | Evidence |
+|---|---|---|
+| Base image | `nvidia/cuda:13.1.1-cudnn-devel-ubuntu24.04` (nvcc 13.1) | docker/Dockerfile [PAPER] |
+| PyTorch | 2.9.0 from the cu130 index (`torch.version.cuda` = 13.0) | pyproject.toml; CSF3 venv [PAPER, VERIFIED-CSF3] |
+| Triton | `fbtriton==3.7.1` (replaces `triton`; `triton.__version__` = `3.7.0+fb.beta`) | Dockerfile; CSF3 [PAPER, VERIFIED-CSF3] |
+| ptxas used by Triton | `ptxas-blackwell` 13.1 for arch ≥ 100, `ptxas` 12.9 otherwise | `triton/backends/nvidia/compiler.py:get_ptxas` [VERIFIED-CSF3] |
+| CUTLASS (C++ headers) | v4.4.1 at `/usr/local/cutlass` (`CUTLASS_DIR`) | Dockerfile [PAPER] |
+| CuTe DSL | nvidia-cutlass-dsl 4.4.2 (+ libs-cu13 4.4.2) | pyproject, Dockerfile [PAPER] |
+| Others | cuda-python/bindings 13.1.1, cuda-tile 1.2.0, cupy-cuda13x 14.0.1, cudnn-frontend 1.18.0, cupti-python ≥13.0.1, Python 3.12 | pyproject.toml [PAPER] |
+
+Packaging gap: the fbtriton wheel ships `triton/runtime/launch.h`, but its NVIDIA driver looks in
+`triton/backends/nvidia/`. Every Triton launch on CSF3 failed until we added a symlink (PoC, CSF3) [VERIFIED-CSF3].
+Whether the portal image has the same gap is **unknown**; the first portal submission tests it. fbtriton also ships a
+ctypes launcher that needs no `launch.h` (`TRITON_USE_NO_COMPILE_LAUNCHER=1`, `backends/nvidia/no_compile_launcher.md`)
+[VERIFIED-CSF3]. Setting that variable from a solution changes the environment, so ask the user before relying on it.
+
+## 2. Calling convention and solution format
+
+- DPS (destination-passing style) is the default and what we use: `run(*inputs, *outputs)`, positional, inputs in
+  `definition.inputs` order, then outputs in `definition.outputs` order. Write the outputs in place and return nothing.
+  Scalars arrive as Python numbers. [PAPER: eval_driver.py `_call_and_collect_outputs`, docs/solution.md]
+- #38: `run(query, key, weight_q, weight_k, eps, query_norm, key_norm)`. Shapes are `[B,S,48,128]` fp32 (contiguous),
+  `[48,128]` fp32 for the weights, and `eps` is a Python float (1e-6).
+- Solution JSON. Required: `spec`, `sources`. The local schema also requires `name`, `definition` and `author`; the
+  portal fills these in. A working example is `poc/variants/v000.json`:
+
+```json
+{"name": "rmsnorm_qk_triton_v000", "definition": "flux_multi_head_rmsnorm_qk", "author": "solx-poc",
+ "description": "…",
+ "spec": {"languages": ["triton"], "target_hardware": ["B200", "LOCAL"], "entry_point": "kernel.py::run",
+          "dependencies": ["torch", "triton"], "destination_passing_style": true},
+ "sources": [{"path": "kernel.py", "content": "<full source>"}]}
+```
+
+- Languages: `pytorch`, `triton`, `cute_dsl`, `cutile`, `cudnn_frontend` (Python, `.py` entry), and `cuda_cpp`,
+  `cutlass`, `cudnn`, `cublas` (C++, entry `.cu`/`.cpp`). C++ and Python languages cannot be mixed in one solution.
+  [PAPER: core/data/solution.py]
+- C++ solutions are built by `torch.utils.cpp_extension.load(name="benchmark_kernel")`. Bind with
+  `PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)`; the portal guide writes `benchmark_kernel`, which is the same name.
+  `compile_options` defaults are `cuda_cflags=["-O3","--use_fast_math"]` and `ld_flags=["-lcuda"]`; the portal says
+  your flags are added to the defaults. If you set no `-arch`/`-gencode`, the packager adds
+  `-gencode=arch=compute_100a,code=sm_100a` for B200. Include paths are `$CUTLASS_DIR/include` and
+  `tools/util/include`. Launch on `at::cuda::getCurrentCUDAStream()`. [PAPER: driver/templates/build_ext.py,
+  driver/problem_packager.py, examples/cuda_cpp]
+- Static `__shared__` is limited to 48 KB per CTA. Above that, use dynamic shared memory with
+  `cudaFuncSetAttribute(..., cudaFuncAttributeMaxDynamicSharedMemorySize, ...)` (up to 227 KB). [SPEC: Blackwell
+  tuning guide]
+- CuTe DSL: compile once at module level (`cute.compile`) and use `mark_layout_dynamic()` so all workloads share one
+  compile. [PAPER: docs/solution.md]
+- Portal upload formats: `.py`, `.cpp`, archives (`.zip`/`.tar.gz`; the entry must be `submission.py`, or a `.cpp`
+  containing `PYBIND11_MODULE`), or `.json` (preferred, because it states the language and DPS explicitly). [PAPER: portal guide]
+
+## 3. Correctness checks (per workload)
+
+From `driver/templates/eval_driver.py` and `core/bench/correctness.py` [PAPER]:
+
+1. 10 rounds. Each round calls `gen_inputs` to draw fresh random inputs (the RNG is seeded once per process with
+   `seed=200`), runs the reference (return-value style), then runs your `run` with freshly zeroed outputs.
+2. Round 0 only: integrity check of the eval-driver functions; snapshot of the thread count; lazy-output check
+   (`type(t) is torch.Tensor`); exact output shape and dtype.
+3. Every round: any NaN/Inf in your output or the reference fails. An all-zero output where the reference is non-zero
+   fails. An element passes if `|out − ref| ≤ atol + rtol·|ref|`. The workload passes if at least
+   `required_matched_ratio` of elements pass (default 0.99) and, if set, `max_abs ≤ max_error_cap`.
+4. #38 tolerances: `max_atol = max_rtol = 1e-5`, other fields at their defaults.
+5. Input generators that matter for row-wise problems (`core/bench/io.py`): fp32 tensors are `torch.randn`. A name
+   equal to `weight`/`norm_weight`, or ending `_norm_weight`, gets ones; `cos`/`sin` names get values in range; and so
+   on. **#38's `weight_q`/`weight_k` match none of these patterns, so they are N(0,1)**, which includes negative and
+   near-zero weights.
+
+## 4. Timing (v1.1 code)
+
+`core/bench/timing.py::time_runnable(methodology="cupti")` [PAPER]:
+
+1. `ShiftingMemoryPoolAllocator(inputs, outputs, warmup+rep+1, seed)`. For each call it copies the inputs into a
+   pre-allocated pool at an offset that advances by a seeded random 256–2048 B (a multiple of 256), and it zero-fills
+   the outputs at the same offset. Every call therefore sees **new `data_ptr`s**. They stay 256-B aligned and
+   contiguous (strides are kept).
+2. Before each call: `cudaCtxResetPersistingL2Cache`, then `buffer.zero_()` over `2 × L2_cache_size` bytes, which is
+   about 252 MB on B200 (the paper says 256 MB).
+3. 10 warm-up calls with a synchronise after each. Then one **discovery** call under CUPTI that records the ordered
+   list of your GPU activities (kernel names, memcpys and memsets, with sizes).
+4. 50 timed calls (`iterations` = 50). The setup is queued **without** synchronising, then the CPU timestamp is taken,
+   then `run(...)`, then `torch.cuda.synchronize()`. In each call's CPU window the harness finds the discovered sequence
+   and records `max(end) − min(start)` over those activities.
+5. The local code returns the **median** of the 50. The portal guide says "3 trials, mean across trials" (the paper
+   says CUDA events, which is the v1.0 method). Assume the per-workload number is the mean over 3 trials of the median
+   of 50. That combination is INFERRED.
+6. Clock lock presets: B200 SM 1500 MHz and DRAM 3996 MHz (H100 1410/1593, A100 1065/1215). These are applied by the
+   container entrypoint. [PAPER: core/bench/config/device_config.py]
+
+Consequences [INFERRED from the code above]:
+
+- **CPU launch overhead is not timed** for a single kernel. Host-side work (tensor-map encoding, Python dispatch) is
+  free in score terms.
+- **Gaps between your kernels are timed.** The setup queued just before your call (input copies, output zero, the 252
+  MB zero-fill) gives the CPU tens of µs of head start, so back-to-back launches are usually queued before the first
+  kernel ends. Even so, each extra kernel adds at least the GPU's kernel-to-kernel gap plus a second ramp-up and tail.
+  PoC (CSF3), one matched pair only: two launches instead of one cost +19 µs on A100 and −1 µs on L40S at the smallest
+  sizes. The evidence is thin, but avoid splitting.
+- The kernel sequence must repeat exactly. Data- or call-count-dependent dispatch, or autotuning on a later call,
+  breaks the CUPTI matching (`assert kernel_activity_counts(...)`) and gives "Timing failed".
+- Don't launch torch kernels from `run()` (`fill_`, `zero_`, `copy_`, `contiguous()`, `empty_like().zero_()`). They
+  are timed, and their names can collide with the harness's own setup kernels in CUPTI matching.
+- **Cold L2:** inputs always come from DRAM. The flush is a write (`zero_`), so the L2 probably holds about 126 MB of
+  dirty lines when your kernel starts. Every line you allocate may then force a write-back, so assume the full
+  read+write DRAM traffic even for small workloads. Unknown; it can be tested on H200 by comparing a reads-only kernel
+  against reads+writes.
+- Outputs arrive zero-filled, but you must still write every element.
+- The first touch of the weights (24 KB per tensor) misses to DRAM; later CTAs hit in L2.
+
+## 5. Score and aggregate
+
+- Per workload: `S(t) = (Tb − Tsol)/((t − Tsol) + (Tb − Tsol))` (`sol_score.py`). Tb and Tsol come from precomputed
+  per-workload tables; the reference is not timed in your run. [PAPER: portal guide]
+- Problem score = arithmetic mean of the per-workload S; failed workloads count as 0. [PAPER: portal guide]
+- Leaderboard "latency" is the **geometric mean of the per-workload latencies**; "Avg Speedup" is the **geometric
+  mean of baseline/latency** per workload; "Fast₁" is the **number of workloads faster than the baseline**
+  [VERIFIED: our portal submission pages, 6 Oct 2026. #61441: geomean 28.564 µs vs 28.562 shown, mean of workload
+  scores 0.531119 = page score; #61435: geomean speedup 0.885 vs 0.89 shown, 5/16 faster]. So the score is averaged
+  per workload, not computed from the aggregate latency, and the two can rank entries differently.
+- Your own submission page shows, per workload: latency, the hidden **baseline latency Tb**, speedup and score.
+  Tsol per workload then follows from `Tsol = (Tb − S·t − S·Tb)/(1 − 2S)` (ill-conditioned when S ≈ 0.5).
+  `poc/ingest_portal.py` parses saved pages into `poc/results/b200_portal_workloads.csv`.
+- Tb is the "Scoring Baseline": the fastest PyTorch-only solution found by NVIDIA's agentic system, hidden and allowed
+  to change over time. The portal guide calls it "from a PyTorch reference implementation". [PAPER]
+- Tsol (SOLAR) is `max(FLOPs/peak, fused bytes/BW)` at 1.5 GHz. It can sit below what is physically reachable. For #38
+  it is below the read+write bandwidth floor (see the problem card) [INFERRED], and on other problems some entries beat
+  it (for example L1 `062_kv_cache_update_with_rope_backward`: the leader is at 0.0098 ms against SOL 0.0175 ms,
+  leaderboard 2026-10-03).
+- Scores are not comparable between evaluation stacks v1.0 and v1.1. [PAPER: portal post]
+
+## 6. Legitimate vs forbidden
+
+| Legitimate | Forbidden (and how it is caught) |
+|---|---|
+| One fused kernel per call; per-size dispatch by shape (`B·S` bands) to different configs or kernels | dispatch on data values, pointers or call count (caching; LLM judge) |
+| Module-level caches of compiled kernels or config tables keyed by shape/dtype | caches of outputs or intermediates; anything keyed on `data_ptr` (shifting allocator; 10 random rounds; judge) |
+| Host-side TMA descriptors built each call | reusing descriptors across calls (they point at the old addresses: wrong results) |
+| Cache-eviction hints, L2 prefetch hints inside your kernel | changing L2 persistence windows or device limits (environment manipulation; the harness resets persisting lines anyway) |
+| Programmatic dependent launch between **your** kernels on the current stream | other streams, events tricks, CUDA graphs that hide work (CUPTI window plus synchronise; streams disallowed) |
+| fp32 maths with any rounding order; approximate rsqrt (error ≤ 2^-22.9); reduced-precision compute (TF32, FP16, …) wherever its error meets the tolerance with margin: operator policy 2026-10-11, formats recorded per problem in the note (#35: TF32 and FP16, which round identically there; BF16 fails) | precision that fails the tolerance or passes only through the 99% matched ratio (tolerance; judge) |
+| Triton, Gluon/TLX (ship with fbtriton), CuTe DSL, CUDA C++ with inline PTX | embedded cubin/ELF, `cuModuleLoadData` from bytes, `cpp_extension.load_inline` at runtime (blocked; judge) |
+| `@triton.autotune` keyed on shapes (runs during round 0) | autotuning or recompiling during the timed loop; threads; `torch.jit.fork` |
+
+Note on autotune: it is allowed, but it adds compile and benchmark time inside the 300 s per-solution limit (paper)
+and it picks a config from noisy local timings. Prefer an explicit dispatch table.
+
+## 7. Portal operations
+
+- One kernel and one GPU type per submission, public or private. The first 5 submissions per UTC day return results
+  without delay. The 6th waits 10 min, the 7th 20 min, and so on (+10 min each, capped at 60). At most 5 in flight.
+  Immediate system failures are free. [PAPER: portal guide]
+- Collection submissions (`.py` only, per-kernel directories): 2 per day, 6 h delay.
+- Noise: about 5% between runs on the portal, up to 10% for many small kernels (README). So differences under 5%
+  between two single portal results are not significant. Repeat or pair submissions before concluding.
+- Local runs on CSF3: `sol-execbench <problem_dir> --solution sol.json` in `/scratch/t95317ha/solx` (env.sh). There
+  are no clock locks (no sudo), and other GPUs are used, so treat local timings only as relative signals.
+
+
+=== b200_arch.md ===
+# B200 (sm_100a) for kernel writers
+
+Facts that change design decisions, mainly for memory-bound kernels; §9 briefly covers compute-bound kernels. Source
+keys refer to `sources.md`. Labels: VERIFIED-CSF3, SPEC, PAPER, LITERATURE, INFERRED.
+
+## 1. The chip at a glance
+
+| Item | B200 value | Source |
+|---|---|---|
+| Compute capability, target | 10.0, compile `sm_100a` (`a` = arch-specific features: tcgen05, TMEM) | [SPEC: CUDA guide], [PAPER: problem_packager.py] |
+| SMs | 148 enabled (2 dies × 74; 80 per die physically), 8 GPCs | [LITERATURE: chipsandcheese-b200, arxiv-2512.02189] |
+| Harness clocks | SM locked at **1500 MHz**, DRAM at 3996 MHz | [PAPER: device_config.py] |
+| HBM3e | 8 stacks (4 per die), 8192-bit bus; 8 TB/s; 3996 MHz × 2 × 8192 bit ≈ **8.18 TB/s** peak at the locked clock | [SPEC: datasheet, blackwell-arch], [INFERRED from the clock preset] |
+| Capacity | 180 GB (tuning guide, HGX), 192 GB (product pages), 186 GB (one third-party page); irrelevant here | [SPEC] (sources disagree) |
+| L2 | **126 MB**, two partitions (one per die) | [SPEC: blackwell-tuning], [LITERATURE: chipsandcheese-b200] |
+| L1 + shared memory | 256 KB per SM unified; shared-memory carve-out 0/8/16/32/64/100/132/164/196/**228 KB**; 227 KB per CTA (1 KB reserved per CTA); static `__shared__` ≤ 48 KB | [SPEC: blackwell-tuning, cuda-guide-cc] |
+| Threads | 2048 per SM, 64 warps, **32 CTAs** per SM, 1024 per CTA | [SPEC] |
+| Registers | 64K 32-bit per SM, ≤ 255 per thread | [SPEC] |
+| TMEM | 256 KB per SM (128 lanes × 512 columns × 32 bit), tensor cores only | [SPEC: PTX ISA tcgen05], [LITERATURE] |
+| Die-to-die link | NV-HBI 10 TB/s | [SPEC: Blackwell architecture page] |
+| Clusters | portable ≤ 8 CTAs; B200 allows 16 with `cudaFuncAttributeNonPortableClusterSizeAllowed` | [SPEC: blackwell-tuning] |
+
+## 2. Memory hierarchy numbers
+
+| Level | Number | Source |
+|---|---|---|
+| L1D hit latency | 39 cycles (19.6 ns at about 2 GHz); at the 1.5 GHz lock, 39 cycles ≈ 26 ns | [LITERATURE: chipsandcheese-b200], [INFERRED] |
+| L2 latency, local partition | about 150 ns; "dramatically" higher when the data sits in the other die's partition | [LITERATURE: chipsandcheese-b200] |
+| L2 bandwidth | about 21 TB/s within a partition, 16.8 TB/s crossing partitions (Vulkan test) | [LITERATURE: chipsandcheese-b200] |
+| DRAM latency | **unknown**. Chips and Cheese finds it higher than H100/A100 (no number in text); arXiv 2512.02189 v1's "58% lower" claim is about TMEM vs Hopper global memory, not DRAM (`b200_sota.md` §5). Planning value: 800 ns loaded (range 700–1000 ns) | [LITERATURE], [INFERRED] |
+| Achieved HBM bandwidth | arXiv 2512.02189 **v1**: STREAM triad 7.48 TB/s (94%); **v3** of the same paper: 4.14 TB/s (51.8%). The versions disagree; v3 gives no thread/block configuration. Planning value: 85–92% of 8 TB/s for a well-fed streaming kernel. Best public B200 read+write streams fit 7.05–7.10 TB/s marginal (86–87%); see `b200_sota.md` §2 | [LITERATURE], [INFERRED] |
+| Global atomics | 90–100 ns between threads on the same partition, 190–220 ns across | [LITERATURE: chipsandcheese-b200] |
+
+Dual die: each die has 4 of the 8 HBM3e stacks attached, and the dies are joined by the 10 TB/s NV-HBI
+[SPEC: blackwell-arch]. [INFERRED:] CTAs are spread over both dies and physical addresses are interleaved across all 8
+stacks, so about half of every SM's traffic crosses NV-HBI. There is no user-level control. Expect a little more latency than a
+monolithic die, which means more bytes must be in flight.
+
+## 3. Little's law: bytes in flight
+
+Bytes in flight = bandwidth × latency. The DRAM rate a kernel sustains is capped at
+`(outstanding bytes per SM × SMs) / latency`.
+
+| GPU | BW (peak) | SMs | Latency assumed | In flight, whole GPU | **Per SM** | B/clk/SM at the clock used |
+|---|---|---|---|---|---|---|
+| B200 | 8.0 TB/s | 148 | 800 ns (700–1000) | 6.4 MB | **43 KB** (38–54) | 36 at 1.5 GHz (harness) |
+| H200 | 4.8 TB/s | 132 | 650 ns | 3.1 MB | 24 KB | 18 at about 1.98 GHz (CSF3, unlocked) |
+| A100 80GB | 2.04 TB/s | 108 | 600 ns | 1.2 MB | 11 KB | 13 at 1.41 GHz |
+| L40S | 0.86 TB/s | 142 | 600 ns | 0.5 MB | 3.7 KB | 2.4 at 2.52 GHz |
+
+Latencies are planning assumptions [INFERRED; the PoC analytic model used 600/600/650/700 ns]. Per SM, B200 needs
+**about 4× A100 and about 1.8× H200**. Latency rises under load, so aim for about 1.5× the table value.
+
+How designs supply it (sm_100a register and shared-memory counts are VERIFIED-CSF3 from `probes/`):
+
+| Design (from probes) | Resources per CTA | CTAs/SM | Outstanding input bytes per SM |
+|---|---|---|---|
+| Triton pointer tile, ROWS=8, 4 warps (2 × LDG.128 per thread) | 32 regs, 0 smem | 16 (thread limit) | 16 × 4 KB = **64 KB** |
+| Triton pointer tile, ROWS=16, 4 warps | 38 regs (40 after rounding) | 12 (register limit) | 12 × 8 KB = 96 KB |
+| Triton pointer tile, ROWS=32, 8 warps | 38 regs | 6 | 6 × 16 KB = 96 KB |
+| Gluon TMA ring, ROWS=16, 4 stages, weights in smem | 40 regs, 73.8 KB smem | 3 (smem limit) | 3 × 4 × 8 KB = 96 KB |
+| CUDA C++ 1-D bulk ring, ROWS=16, 4 stages | 25 regs, 50 KB smem | 4 | 4 × 32 KB = 128 KB |
+
+These pointer designs only reach their numbers if each thread issues all its loads before the first use (the
+reduction), and if many CTAs are resident at once. Register pressure above 32 per thread cuts occupancy; above 64 it
+halves it again.
+
+## 4. Occupancy rules for CC 10.0
+
+- Resident CTAs per SM = min(32, ⌊2048/threads⌋, ⌊65536/(regs_rounded × threads)⌋, ⌊228 KB/(smem + 1 KB)⌋).
+  Registers are allocated in 256-register chunks per warp (8 per thread) [SPEC: occupancy calculator convention;
+  INFERRED for sm_100]. `cudaOccupancyMaxActiveBlocksPerMultiprocessor` (CUDA) or Triton's `kernel.n_regs` and
+  `kernel.metadata.shared` give the inputs.
+- One wave = 148 × CTAs/SM. For the smallest #38 workload (12,288 rows of Q+K), ROWS=8 gives 1,536 CTAs. That is
+  10.4 per SM, one wave at 16 CTAs/SM. [INFERRED]
+- A Triton kernel whose shared memory exceeds about 113 KB per CTA allows only 1 CTA per SM; that is fine for a
+  persistent design, bad for one-shot.
+
+## 5. TMA, bulk copies and mbarrier pipelines
+
+Hardware mechanisms (Hopper and Blackwell) [SPEC: PTX ISA, CUDA guide §4.11–4.12]:
+
+- **Tensor TMA** (`cp.async.bulk.tensor.Nd.shared::cta.global.mbarrier::complete_tx::bytes`) uses a 128-B tensor map
+  (CUtensorMap). Rules: global address 16-B aligned; strides a multiple of 16 B; `boxDim[i] ≤ 256`; inner box bytes a
+  multiple of 16; the shared-memory destination 128-B aligned; with swizzle 32/64/128 B the inner box must be ≤ the
+  swizzle span. Out-of-bounds rows are zero-filled on load and clipped on store. Ranks 1–5 in the hardware;
+  **Triton's `make_tensor_descriptor` supports ranks 2–5 only**.
+- **1-D bulk copy** (`cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [dst],[src],size,[mbar]`) needs
+  no tensor map. Source and destination must be 16-B aligned and the size a multiple of 16. A `[ROWS,128]` fp32 tile
+  of a row-major tensor is one contiguous ROWS×512 B chunk, so this is the simplest TMA path for row-wise kernels.
+  SASS: `UBLKCP.S.G` (load) and `UBLKCP.G.S` (store) [VERIFIED-CSF3].
+- **mbarrier protocol**: `mbarrier.init(count)`; the producer calls `arrive.expect_tx(bytes)` and issues the copy; the
+  hardware decrements tx-count as bytes land; consumers spin on `try_wait.parity(phase)`. The phase flips each time the
+  stage is reused, so use `(i / STAGES) & 1`. Before refilling a stage, every consumer warp must be done reading it:
+  use a CTA barrier, or a second "empty" mbarrier per stage.
+- **Bulk store**: write registers to shared memory, `fence.proxy.async.shared::cta`, barrier, then one elected thread
+  issues `cp.async.bulk.global.shared::cta.bulk_group` (or `.tensor`) and `cp.async.bulk.commit_group`. Before reusing
+  that buffer, `cp.async.bulk.wait_group.read N`.
+- **Hints**: both bulk forms accept `.L2::cache_hint` with a `createpolicy` operand. `cp.async.bulk.prefetch.L2`
+  prefetches to L2 without using shared memory.
+- **Ampere-style `cp.async`** (LDGSTS, 4/8/16 B per thread) still exists. Triton uses it when a `tl.range(...,
+  num_stages>1)` loop pipelines pointer loads [VERIFIED-CSF3].
+- Bytes in flight per CTA = STAGES × tile bytes; shared memory is the budget (228 KB per SM). A TMA design gets its
+  in-flight bytes from **few instructions** (one per tile). At 36 B/clk/SM that matters more on B200 than on H200.
+  [INFERRED]
+
+## 6. Clusters and distributed shared memory
+
+- Up to 8 CTAs per cluster (16 opt-in on B200). The CTAs of a cluster are co-scheduled on one GPC and can read and
+  write each other's shared memory (DSMEM). TMA can multicast one global load to several CTAs' shared memory.
+  [SPEC: blackwell-tuning, CUDA guide]
+- For row-wise memory-bound kernels clusters help little. The only data reused across CTAs is small (the #38 weights,
+  24 KB per tensor, already L2-resident). One use: split a very long row across a cluster and reduce through DSMEM.
+  Size occupancy with `cudaOccupancyMaxActiveClusters`. [INFERRED]
+
+## 7. Cache-eviction hints
+
+- PTX: `ld/st.global.L1::{evict_first,evict_last,no_allocate}`, `.L2::{evict_first,evict_last}` (sm_100+ for the
+  `level2::eviction_priority` form), `.L2::cache_hint` with `createpolicy.fractional.L2::evict_*`, cache operators
+  `.cg/.cs/.lu`, and prefetch sizes `.L2::64B/128B/256B`. [SPEC: PTX ISA]
+- What Triton 3.7 emits on sm_100a [VERIFIED-CSF3, probes/probe1]:
+
+| Triton | PTX | SASS |
+|---|---|---|
+| `tl.load(..., eviction_policy="evict_first")` | `createpolicy … evict_first` + `ld.global.L2::cache_hint.v4` | `LDG.E.EF.128` |
+| `eviction_policy="evict_last"` | `… evict_last …` | `LDG.E.EL.128` |
+| `tl.store(..., eviction_policy="evict_first")` | `st.global.L2::cache_hint` | `STG.E.EF.128` |
+| `tl.load(..., cache_modifier=".cg")` | `ld.global.cg.v4` | `LDG.E.128.STRONG.GPU` (a coherent load: avoid for streaming) |
+| `tl.store(..., cache_modifier=".cs")` | `st.global.cs.v4` | `STG.E.EF.128` |
+| tensor-descriptor `.load/.store` | no hint parameter in Triton 3.7 (`load(offsets, latency=None)`) | `UTMALDG/UTMASTG` |
+
+- Expected effect for one-pass streams (each byte touched once) is small [INFERRED]. Mark the streamed inputs and
+  outputs `evict_first` and the reused weights `evict_last`. The PoC's EVICT knob was not decisive on A100/L40S. The
+  harness resets persisting-L2 state before each call, and changing access-policy windows counts as environment
+  manipulation; don't do it.
+
+## 8. Launch overhead and small-workload latency
+
+- CPU launch cost is **not timed** for a single kernel. Measured t ≈ CTA dispatch ramp + first DRAM round trip +
+  streaming time + tail (last stores drained, last CTA exits). [PAPER: timing.py; INFERRED]
+- Back-of-envelope for the smallest #38 workload (12.6 MB; 42.5 KB of reads per SM): about 0.3 µs ramp, plus about
+  0.8 µs latency, plus about 0.8 µs streaming at 54 GB/s per SM, plus about 0.5 µs tail ≈ **2.4 µs**, against the
+  1.57 µs bandwidth floor [INFERRED]. These overheads are about half the time on small workloads and about 2% on large
+  ones.
+- Tactics: one launch; a single wave sized to fill every SM evenly; issue all of a CTA's loads before any dependent
+  work; avoid long prologues (device-side tensor-map creation, mbarrier init chains, large shared-memory zeroing) in the
+  small-size path; avoid persistent loops whose per-iteration latency serialises a CTA's few tiles.
+- **Programmatic dependent launch** (PDL, CC ≥ 9.0) lets kernel 2 start its prologue while kernel 1 drains. Triton
+  3.7: `launch_pdl=True` launch option plus `gdc_wait()` / `gdc_launch_dependents()` from
+  `triton.language.extra.cuda` (import at module level, not inside `@triton.jit`) [VERIFIED-CSF3: PTX contains
+  `griddepcontrol.*`]. It is only relevant if a design needs two kernels.
+- **Unknown** for B200: the empty-kernel CUPTI span, the CTA launch rate, the kernel-to-kernel gap. How to find out:
+  measure them on H200 with the harness (an empty kernel, and a 2-launch variant of a good kernel). On B200, a pair of
+  portal submissions that differ only in one extra trivial launch (legitimate, correct, costs 2 slots).
+
+## 9. Compute-bound kernels, in brief (for later problems)
+
+- `wgmma` (sm_90a) **does not exist** on sm_100a. Blackwell tensor cores use `tcgen05.mma`: issued by a single
+  thread, asynchronous, A/B from shared memory (A may come from TMEM), accumulator in **TMEM** (256 KB per SM),
+  completion through `tcgen05.commit` → mbarrier, and `tcgen05.ld` to move TMEM → registers. `cta_group::2` lets a
+  CTA pair share one MMA (M=256). [SPEC: PTX ISA]
+- Types: FP64, TF32, BF16, FP16, FP8 (E4M3/E5M2), FP6, FP4, INT8; block-scaled MX formats and **NVFP4** (16-element
+  blocks, E4M3 scale) [SPEC: CUDA guide CC table; PAPER: Quant problems use NVFP4 16-element block scaling].
+- Rough dense peaks at the harness's 1.5 GHz [INFERRED from 1024 16-bit MAC/clk per SM sub-partition (chipsandcheese)
+  × 4 × 148 × 1.5 GHz]: BF16 ≈ 1.8 PFLOP/s, FP8 ≈ 3.6, FP4 ≈ 7.3. The datasheet's 2.25 PFLOP/s dense BF16 implies
+  about 1.85 GHz boost. FP32 SIMT: 128 lanes per SM ≈ 57 TFLOP/s at 1.5 GHz, and sm_100 adds packed `f32x2`
+  mul/add/fma (Gluon emitted `mul.f32x2` in our probes [VERIFIED-CSF3]). FP16 SIMT is no longer 2× FP32
+  [LITERATURE: chipsandcheese-b200].
+- Tooling: CUTLASS 4.4 C++ (sm100 collectives), CuTe DSL 4.4.2 (compiles for sm_100a on the CSF3 login node with
+  `CUTE_DSL_ARCH=sm_100a`, about 20 s for a trivial kernel [VERIFIED-CSF3]), Triton `tl.dot` lowers to tcgen05 on
+  sm_100.
+
+## 10. What each cheap GPU can tell us
+
+| | B200 (target) | H200 (CSF3) | A100 80GB (CSF3) | L40S (CSF3) |
+|---|---|---|---|---|
+| Arch | sm_100a | sm_90a | sm_80 | sm_89 |
+| SMs; threads/SM; CTAs/SM | 148; 2048; 32 | 132; 2048; 32 | 108; 2048; 32 | 142; 1536; 24 |
+| Shared memory per SM | 228 KB | 228 KB | 164 KB | 100 KB |
+| L2 | 126 MB (2 partitions) | 50 MB | 40 MB | 96 MB |
+| DRAM | HBM3e 8 TB/s | HBM3e 4.8 TB/s | HBM2e 2.04 TB/s | GDDR6 0.86 TB/s |
+| TMA / mbarrier / clusters | yes | yes | no (cp.async only) | no |
+| 256-bit LDG/STG | yes | no | no | no |
+| tcgen05 / TMEM | yes | no (wgmma) | no | no |
+| Clocks in our timing | SM 1500 MHz locked | default boost | default boost | default boost |
+
+Sources: B200 above; H200/A100/L40S from NVIDIA datasheets [SPEC] and the CUDA CC table. Check CSF3's exact
+H200/A100 SKUs with `nvidia-smi -q` in a job (unknown: SXM or NVL/PCIe).
+
+**What they can and cannot tell us** [INFERRED unless marked]:
+
+- **H200** is the best proxy. It runs every TMA/mbarrier/cluster design (Triton descriptor kernels compile to the same
+  UTMALDG/UTMASTG/SYNCS mix on sm_90a and sm_100a [VERIFIED-CSF3]), and it has HBM. It cannot show: 256-bit accesses,
+  the about 1.8× larger per-SM bytes-in-flight requirement (a design that saturates H200 can starve B200), dual-die L2 effects, or
+  SM-side costs at 1.5 GHz (H200 runs faster per SM relative to memory).
+- **A100** is a good ranking signal for plain-load designs on HBM. In the PoC the emulator found the best variant in
+  about 8 measurements, against about 20 for plain Bayesian optimisation (PoC, CSF3). It cannot run TMA designs: Triton
+  silently falls back on sm_80 to different code (4-byte LDGSTS, 72 regs for the host-descriptor kernel
+  [VERIFIED-CSF3]), so A100 timings of TMA niches are meaningless. Its bytes-in-flight need is 4× lower.
+- **L40S** is a weak predictor. It has GDDR6, 1536 threads per SM and 100 KB of shared memory; in the PoC it picked a
+  different winner and helped the emulator only early (PoC, CSF3). Use it as a correctness smoke test and to catch
+  gross regressions.
+- **Static sm_100a compile** (no GPU) gives the exact registers, shared memory, spills and instruction mix B200 will
+  run, for Triton, Gluon, CUDA C++ (nvcc 12.8 + `ptxas-blackwell` 13.1) and CuTe DSL [VERIFIED-CSF3]. It cannot give
+  timing.
+
+
+=== b200_sota.md ===
+# B200 memory-bound state of the art, and what it means for #38
+
+Public kernels and measurements relevant to row-wise, memory-bound fp32 kernels on B200 (sm_100a), as of
+2026-10-07. Source keys are in `sources.md`. Labels as in `core_brief.md`; `[portal]` = our own B200
+submissions (`poc/results/b200_portal_workloads.csv`). Excerpts with commentary are in `examples/`.
+
+## 1. What SOTA kernels do
+
+| Kernel (key) | Memory path | Bytes/thread, CTA, grid | Hints | Small sizes | B200 evidence |
+|---|---|---|---|---|---|
+| FlashInfer CuTe `qk_rmsnorm` [fi-qknorm] (`examples/flashinfer_qk_rmsnorm_sm100_excerpt.py`) | 128-bit `cp.async` → smem → regs; weights by a sync copy issued between commit and wait; plain 128-bit stores | On sm_100/103/107 only: **4 threads per row** for head_dim 128 (16 elsewhere), so 32 elements per thread; 128-thread CTA, 32 rows; one-shot grid | none; optional PDL | nothing special | PR #5305 (bf16, head_dim 128): **1.14× at M=8192, 1.20× at M=32768**, 0.98–1.00× at M ≤ 512; "adding threads per CTA instead was measured to be monotonically worse" [LITERATURE: fi-pr5305] |
+| quack RMSNorm fwd [quack] (`examples/quack_rmsnorm_fwd_excerpt.py`) | same cp.async → smem → regs pattern | N=128 fp32: 128 threads, 16 threads/row, 2×16 B per thread, 8 rows per CTA; one-shot | none | none; one config ladder for Hopper and Blackwell | none published; H100: about 3 TB/s (≈ 90%) for N ≥ 4 K. quack uses `torch.clone` (90.4% of H100 peak) as the empirical ceiling [LITERATURE: quack-blog, quack-notes] |
+| CAKE `cake_rmsnorm_train` fwd [cake-pr5741] (`examples/cake_rmsnorm_fwd_l2hint_excerpt.cu`) | direct 128-bit LDG into a register cache | per-size program table, chosen by paired CUPTI cold-L2 tests on B200: tiny T = one row per 64-thread CTA; mid T = persistent, software-pipelined, capped at 4–6 CTAs/SM; large T = one-shot (H=512: 2 rows per 64-thread CTA) | **x loads `L2::cache_hint` = EVICT_FIRST constant; weights `ld.global.nc`; stores plain** | separate programs below about 1024 rows | full table in §2. "256-bit single loads … not faster" (H=512, SM100a/103a); an evict-first looped variant "no gain" (GB300); pipelined persistent grids 0.96–1.00× at large sizes on SM100/103 |
+| FlashInfer CUDA `QKRMSNorm` [fi-norm-cuh] | 128-bit `vec_t`; x read twice (second read hits L1/L2) | a warp per (token, head), 4 warps per CTA, grid = min(occupancy × SMs, jobs/4), grid-stride | none; PDL `griddepcontrol` | – | – |
+| SGLang FLUX.2 QK-norm epilogue [sglang-flux2] (`examples/sglang_flux2_qknorm_excerpt.cuh`) | bf16 vector loads | a warp per (token, head), 8 B per lane, 256-thread CTAs, persistent at occupancy | none | – | – (written by a "Kernel Design Agent") |
+| TensorRT-LLM `fusedQKNormRope` [trtllm-qknorm] | bf16 packed vectors | a warp per (token, head) | none | – | – |
+| ThunderKittens [tk] | layernorm/rotary: 2 warps, per-warp double-buffered async loads | Hopper-era | – | – | no Blackwell memory-bound kernels (its Blackwell work is GEMM/attention) |
+| Cursor's public #38 [cursor-results] (no licence: read only, not excerpted) | float4 LDG | a warp per (token, head), 1024-thread CTAs | none | – | board score 0.551; v1.0-harness times 5.5 µs (12.6 MB) … 128.0 µs (805 MB, 6.29 TB/s) |
+
+Common to all of them: the row stays in registers, the reduction stays inside a warp (or within 4–16 lanes), there is one
+pass over DRAM, and **no one uses TMA for short rows**. Clusters/DSMEM appear only for rows ≥ 16–64 K elements
+[LITERATURE: quack, fi-pr2777]. The only B200-specific tuning found in public code is **more bytes per thread**
+(FlashInfer) and **per-size program tables plus evict_first on streamed loads only** (CAKE).
+
+## 2. Published B200 numbers (CUPTI or cold-L2 timing)
+
+CAKE RMSNorm forward, bf16, B200, CUPTI kernel time with cold L2 (rotating buffers), median of counterbalanced pairs
+[LITERATURE: cake-pr5741]. Bytes = read x + write y. Ours = r3 CuTe on the portal, same byte count for #38 [portal].
+
+| Bytes | CAKE shape | CAKE µs | CAKE TB/s | Ours (#38 size) | Ours µs | Ours TB/s |
+|---|---|---|---|---|---|---|
+| 2.1 MB | H2048 T256 | 2.53 | 0.83 | – | – | – |
+| 6.3 MB | H6144 T256 | 3.58 | 1.76 | – | – | – |
+| 8.4 MB | H2048 T1024 | 3.49 | 2.40 | 12.6 MB | 4.8 | 2.62 |
+| 25.2 MB | H6144 T1024 | **6.37** | 3.95 | 25.2 MB | **6.95** | 3.62 |
+| 33.6 MB | H2048 T4096 | 8.06 | 4.16 | 57.6 MB | 11.5 | 5.01 |
+| 100.7 MB | H6144 T4096 | 18.98 | 5.30 | 100.7 MB | **17.9** | 5.62 |
+| 134 MB | H512 T65536 (512-wide rows) | 23.36 | 5.75 | 201.3 MB | 32.3 | 6.23 |
+| 397 MB | H6144 T16172 | 61.70 | 6.44 | 402.7 MB | 61.0 | 6.60 |
+| 805 MB | H6144 T32768 | 119.2 | 6.76 | 805.3 MB | **117.8** | 6.84 |
+| 1611 MB | H6144 T65536 | 231.9 | 6.94 | – | – | – |
+
+Fits `t = fixed + bytes/BW` [INFERRED by least squares]: ours (≥ 25 MB) **3.5 µs + 7.03 TB/s**; CAKE H=6144
+**4.3–5.3 µs + 7.06–7.10 TB/s**. Conclusions:
+
+- **Marginal bandwidth ≈ 7.05–7.1 TB/s (86–87% of 8.18 TB/s) is the public ceiling for a 1:1 read+write stream** under
+  cold-L2 CUPTI timing. Our L band already sits there, and we beat CAKE at ≥ 100 MB. [INFERRED]
+- The **tiny-kernel floor on B200 is ≈ 2.2–2.5 µs** (2.1 MB in 2.53 µs). Our fixed cost of about 3.1–3.5 µs is about
+  1 µs above it. CAKE's mid-size persistent pipelined program beats us by 0.6 µs at 25 MB. [INFERRED]
+- Other figures: arXiv 2605.04178 says "sustained HBM is 6.8–7.1 TB/s vs. 8.0" (consistent, but the same paper lists 176
+  SMs and a 64 MB L2, so give it low weight). arXiv 2512.02189 v1: STREAM triad (2 reads : 1 write) 7.48 TB/s; v3:
+  4.14 TB/s at 4–16 GB, which it attributes to "larger arrays would be needed", an implausible explanation. Treat v3 as a methodology
+  artefact. [LITERATURE]
+- Noise: CAKE sees 5–9% launch-order dependence for kernels under about 10 µs (B200/GB300), even between bit-identical
+  builds. Treat S-band differences under 5% from one submission as noise. [LITERATURE: cake-pr5741]
+
+## 3. Cache hints on B200: evidence
+
+1. **Our own portal data** (µs; S = 12.6/25.2 MB, L = 805 MB) [portal]:
+
+   | Variant | Width | Hints | 12.6 MB | 25.2 MB | 100.7 MB | 402.7 MB | 805 MB |
+   |---|---|---|---|---|---|---|---|
+   | g2-os-r8w4 (Triton) | 128 | x EF, w EL, stores EF | 4.8 | 6.8 | 18.7 | 63.9 | 123.9 |
+   | r2-ldg256-os-r16 (CUDA) | 256 | x EF + L1::no_allocate, w EL, stores EF | 4.9 | 6.8–7.0 | 18.7 | 64.0 | 123.3 |
+   | r3-cute-ldg256-os-r16 | 256 | **none** | 4.8 | 6.9–7.0 | **17.9** | **61.0** | **117.8** |
+
+   At the same hints, 256-bit = 128-bit (r2 ≈ g2 within 0.5%). Without hints, M/L are 2–5% faster. S is identical
+   in all three. The most likely reading: **the hints, not the width, explain r3's gain** [INFERRED; the CuTe and CUDA
+   code generation differ in other small ways].
+2. quack (sm100 GEMM, July 2026): "we wired D stores as evict_first … and B loads as evict_last … and measured a net
+   REGRESSION (-0.9% plain / -3.5% AG)" [LITERATURE: quack].
+3. CAKE's paired B200 search kept evict_first **only on streamed loads**, with plain stores and `.nc` weights. A further evict-first
+   variant gained nothing on GB300 (32.29 vs 32.16 µs) [LITERATURE: cake-pr5741].
+4. evict_first helps when it protects **reused** data: FlashInfer FP8 MoE GEMM, a once-read weight stream marked
+   evict_first, 1.07–1.11× on B200, because activations are re-read 8 times [LITERATURE: fi-pr5692]. #38 reuses only
+   48 KB of weights, which stay in L2 anyway.
+5. PTX: ptxas ≥ 12.9 accepts `ld.global.nc.L2::evict_first` only on 256-bit accesses (`.v8.b32`/`.v4.b64`; 12.8 rejects it on `ld`). For any width,
+   `.L2::cache_hint` with a 64-bit policy works: `createpolicy`, or the CUTLASS constants EVICT_NORMAL
+   `0x1000000000000000`, EVICT_FIRST `0x12F0000000000000`, EVICT_LAST `0x14F0000000000000` [LITERATURE: te-3601;
+   SPEC: cutlass-cachehint].
+
+Probable mechanism [INFERRED]: `timing.py` zero-fills a 2×L2 buffer on the same stream immediately before every
+timed call [PAPER], so the L2 starts full of **dirty** lines. evict_first on stores makes our own dirty outputs the
+first victims, which adds DRAM writes (and read/write turnarounds) inside the timed window. The Ascend NPU benchmark
+documented the same effect: a zero-fill flush leaves dirty lines whose write-back "is included in the subsequent
+kernel" [LITERATURE: ascend-l2]. NVIDIA exposes no way to flush dirty L2 lines [LITERATURE: nv-forum-l2]. Because
+S-band times do not move with hints, the dirty L2 is not visibly on the critical path at ≤ 25 MB.
+
+**Update (portal, 7 October): `evict_last` on output stores scored 0.609 vs 0.588 without hints (the problem card (`problems/<name>/card.md`) §7); it supersedes the store rule below.** **Rule for #38: default policy on stores, no evict_last on weights. evict_first on x loads only is optional (CAKE's
+choice; expect ±1%).** Never touch memory we do not own (e.g. `discard.global.L2` on harness buffers): that is
+manipulating the environment.
+
+## 4. Small-input latency (the fixed cost)
+
+- Ours: one wave of 768 CTAs (5.2 per SM) at 12.6 MB takes 4.8 µs, about 3.0 µs above bytes/7.03 TB/s. The fixed cost of
+  about 3.5 µs is present at **every** size: it is 60% of the time at 12.6 MB and 3% at 805 MB. [portal; INFERRED]
+- Floor reference: about 2.2–2.5 µs for a tiny streaming kernel on B200 (CAKE), which covers launch, first CTA, one DRAM
+  round trip, stores and exit. CUPTI excludes CPU launch cost. The megakernel blog measured about 2.1 µs per launch with streams on
+  H100 (1.3 µs with graphs); that cost appears in our window only as gaps between kernels [LITERATURE: hazy-megakernel].
+- What SOTA does at small sizes: per-size dispatch to small 64–128-thread CTAs (CAKE) or a persistent pipelined
+  program capped at 4 CTAs/SM (CAKE, 25 MB: 6.37 µs vs our 6.95). FlashInfer's bytes-per-thread change is neutral
+  at small sizes. Nobody publishes a sub-2 µs B200 streaming kernel.
+- Chips and Cheese: "Perhaps Nvidia's scheduler tries to fill one partition's SMs before going to the other". A
+  small grid could then load one die more than the other. Unverified; keep S grids ≥ 2 × 148 CTAs. [LITERATURE:
+  chipsandcheese-b200]
+- PDL cannot help a single-kernel solution. Overlapping the harness's own memset would hide work, so it is forbidden.
+
+## 5. Corrections to our context docs
+
+- `b200_arch.md` §2 and `sources.md`: the arXiv 2512.02189 v1 "58% reduction in memory access latency in cache-misses" is
+  **TMEM at 420 cycles vs Hopper's 1000-cycle global memory**, not B200 DRAM latency. v3 drops the claim. It is not
+  evidence about DRAM latency.
+- arXiv 2507.10789 ("Dissecting the NVIDIA Blackwell Architecture") studies the **RTX 5080 (GB203)**, not B200.
+- the problem card (`problems/<name>/card.md`) §7 credits r3's M/L gain to 256-bit width, and `playbook_membound.md` §6 recommends `cache:stream`
+  (evict_first stores). On B200 the evidence in §3 points the other way: evict_first stores cost 2–5% at M/L, and width
+  alone gains about 0.
+- `b200_arch.md` §7: add the 256-bit-only rule for `.L2::evict_first` on loads (§3.5).
+- `b200_arch.md` §2 "85–92%" planning value: the measured marginal is 86–87% (7.05–7.1 TB/s). The size-averaged efficiency is
+  lower because of the 3–3.5 µs fixed cost.
+
+## 6. Applying this to #38
+
+**What r3 already does right:** one launch; one-shot grid; a half-warp per row, so each instruction covers one
+contiguous 512 B row, which is quack's fastest coalescing class (four separate 128 B pieces cost about 8% on H100 loads, and
+fragmented stores cost more) [LITERATURE: quack-notes]; x and w loads issued before first use; default cache policy; marginal
+bandwidth already at the public ceiling (7.03 vs 7.06–7.10 TB/s). **The remaining lever is mostly the fixed cost:**
+1 µs off at every size ≈ +0.02–0.03 in score (the problem card (`problems/<name>/card.md`) §6 sensitivities) [INFERRED].
+
+Ideas ranked by expected score gain:
+
+1. **Attack the ≈ 3.5 µs fixed cost** (+0.005 to +0.02; confidence low). First measure where it goes, on H200 with
+   the harness: the same grid with an empty body; reads only; zero-fill vs `sum()` flush; and nsys to confirm that `run()` issues
+   exactly one GPU activity (CuTe DSL launch, no extra memcpy). Then try a CAKE-like S/M specialist: a grid of 148 × 4 CTAs,
+   each thread holding 2–4 rows' 256-bit loads in flight, with the next row's loads issued before the current row's reduction. Compare
+   it with 64/128-thread one-shot CTAs. Evidence: CAKE beats us by 0.6 µs at 25 MB with a persistent, software-pipelined
+   program capped at 4 CTAs/SM (6144-wide rows, so not the same layout); the floor is ~1 µs below us. [LITERATURE; INFERRED]
+2. **More bytes in flight per thread at M/L** (+0.003 to +0.008; medium-low). Give each half-warp 2 rows, r and
+   r+48, which share one weight row and so need one weight load. Alternatively, use 128-thread CTAs with the same 16-row tile.
+   Issue every load first. FlashInfer measured +14–20% on B200 at ≥ 128 MB going from 16 to 64 B per thread. We are at 32 B and already at the
+   bandwidth ceiling, so expect M −2…−5% and L −0…−2%. Keep each instruction on one contiguous row: do **not** copy FlashInfer's 4-lanes-per-row
+   interleaving. [LITERATURE: fi-pr5305; INFERRED]
+3. **Cache policy discipline** (protects about 2–5% at M/L, ≈ +0.01, in every descendant; medium). No evict_first stores,
+   no evict_last weights. Optional single A/B: r3 plus EF on x loads only, via inline PTX with the policy constant
+   (`examples/quack_cutedsl_inline_ptx_excerpt.py`), expected ±1%. [portal; LITERATURE]
+4. **Diagnostic slot: g2-os-r8w4 (Triton, 128-bit) with all eviction hints removed.** The prediction is ≈ r3 (0.588). If it
+   holds, width does not matter, and Triton/Gluon designs (faster to iterate on) are back in play for #38. No score gain by itself, but it
+   decides where effort goes. [INFERRED]
+5. **Shorten the M-band tail** (+0.002 to +0.006; low). At 100–200 MB the fixed part is about 3.7 µs. Size one-shot grids as
+   whole multiples of 148 × resident CTAs, or use a balanced persistent split with in-register prefetch for M only. CAKE
+   found pipelined persistent grids no better than one-shot at large sizes, so do not apply it to L. [LITERATURE; INFERRED]
+
+**Not worth slots:** TMA/bulk rings (ours: +1–1.5 µs fixed), clusters/DSMEM (rows of 128), 256-bit width for its own
+sake, evict_last on weights, PDL, persistent loops without in-flight prefetch (v039, SGLang-style), and warp-per-row
+float4 (Cursor, 0.551).
+
+
+=== playbook_membound.md ===
+# Memory-bound kernel playbook (B200)
+
+For row-wise and elementwise kernels: norms, RoPE, softmax, activations. Examples use #38 (rows of 128 fp32, Q and K
+streams). Each design axis lists:
+
+- **when** it helps;
+- its **effect on S/M/L** size bands (S ≲ 64 MB, M 100–200 MB, L ≥ 400 MB moved);
+- a **Triton 3.7 recipe** (compile-verified for sm_100a unless marked; see `probes/RESULTS.md`);
+- CUDA C++ / CuTe DSL pointers;
+- its **niche tag(s)**, which the archive uses to keep one best kernel per niche.
+
+"Compile-verified" means it compiled for sm_100a/sm_90a on CSF3 and we inspected the SASS. It does **not** mean it ran.
+Every effect estimate here is INFERRED unless labelled.
+
+## 0. Niche tag vocabulary
+
+| Axis | Tags |
+|---|---|
+| language | `lang:triton`, `lang:gluon`, `lang:tlx`, `lang:cuda`, `lang:cutedsl` |
+| memory path | `mem:ldg128`, `mem:ldg256`, `mem:cpasync`, `mem:tma-tensor`, `mem:bulk1d` |
+| store path | `st:direct`, `st:bulk` |
+| grid | `grid:oneshot`, `grid:persistent`, `grid:persistent-wstat` |
+| launches | `launch:fused`, `launch:split`, `launch:pdl` |
+| tile | `tile:rows<N>` (N rows per program/CTA iteration), `tile:token` (all heads of one token) |
+| reduction | `red:warp`, `red:halfwarp`, `red:cta` |
+| cache | `cache:default`, `cache:stream` (inputs/outputs evict_first, reused data evict_last) |
+| specialisation | `spec:all`, `spec:S`, `spec:M`, `spec:L`, `dispatch:size` (a dispatcher over specialists) |
+
+The archive niche key is `(mem, grid, spec)`, with the other tags as descriptors (`niche_tags.yaml`). A design card must
+give exactly one tag per axis.
+
+## 1. Launch structure — `launch:fused` / `launch:split` / `launch:pdl`
+
+- **Fused** (one kernel covers both Q and K, or every stream of the problem) is the default. CUPTI times first-start to
+  last-end, so every extra kernel adds a ramp-up, a tail and a kernel-to-kernel gap. On S-band workloads that is a
+  large fraction of a 1.6–7 µs floor. On the L band the loss is under 1%.
+- Split only when the two parts need incompatible configurations, and then use PDL so kernel 2's prologue overlaps
+  kernel 1's tail:
+
+```python
+from triton.language.extra.cuda import gdc_wait, gdc_launch_dependents   # module level, NOT inside @triton.jit
+@triton.jit
+def k2(...):
+    gdc_wait()                 # wait for kernel 1's writes (only needed if k2 reads them)
+    ...
+    gdc_launch_dependents()    # hint: the next kernel may start
+k2[grid](..., launch_pdl=True)   # compile-verified: PTX has griddepcontrol.wait / launch_dependents
+```
+
+- CUDA C++: `cudaLaunchKernelEx` with `cudaLaunchAttributeProgrammaticStreamSerialization`, and
+  `cudaGridDependencySynchronize()` in the kernel. Only on the current stream.
+
+## 2. Tile shape and rows per program — `tile:rows<N>`, `tile:token`
+
+- Rows per program set the bytes each CTA moves per step, the register use, and the CTA count.
+  `tile bytes = ROWS × 512 B` for D=128 fp32.
+- For #38, keep ROWS a divisor of 48 (1, 2, 4, 8, 16), so that no masks are needed, each tile's heads form a
+  contiguous block, and `tile % (48/ROWS)` identifies the weight block. ROWS = 32 or 64 needs a row mask (the 1×131
+  workload).
+- S band: small tiles (4–8 rows) give enough CTAs to fill 148 SMs evenly. The smallest workload has 12,288 Q+K rows,
+  that is 1,536 CTAs at ROWS=8, about 10.4 per SM in one wave. L band: bigger tiles (16–32 rows) mean fewer CTAs and
+  less scheduling and prologue overhead per byte.
+- Verified register counts on sm_100a, 4 warps: ROWS=4 → 20 regs, 8 → 32, 16 → 38–40 (40 with cache hints). ROWS=32
+  with 8 warps → 38. One ROWS=16 source used 38 regs on sm_100a and 32 on sm_90a, so **always read registers from the
+  sm_100a compile**.
+- `tile:token` (48 rows = one token) gives a constant weight tile of 24 KB per stream, but 48 is not a power of 2,
+  which Triton blocks require. Use 3 × 16-row sub-tiles, or CUDA/Gluon.
+
+## 3. Memory path — `mem:*`
+
+### 3a. `mem:ldg128` — plain vector loads
+
+- **When:** the default, and it runs everywhere (useful for A100/L40S ranking signals). Needs high occupancy so that
+  enough loads are outstanding (`b200_arch.md` §3).
+- **S:** good (no prologue). **L:** typically about 80% of peak on A100 in the PoC; on B200 it relies on ≥ 48–64 KB per
+  SM outstanding.
+- **Triton recipe** (one-shot, fused, no masks). The exact kernel below is compile-verified as `playbook_3a_R{4,8,16}`
+  (probe7): 32/32/40 regs, no shared memory, `LDG.E.EF.128` / `LDG.E.EL.128` / `STG.E.EF.128`, no `div.full`:
+
+```python
+import torch, triton, triton.language as tl
+D, H = 128, 48
+
+@triton.jit
+def _qk_rms(q_ptr, k_ptr, wq_ptr, wk_ptr, qo_ptr, ko_ptr, n_rows, eps,
+            ROWS: tl.constexpr, D: tl.constexpr, H: tl.constexpr):
+    pid = tl.program_id(0)
+    n_tiles = n_rows // ROWS                 # ROWS divides 48 -> no tail
+    is_k = pid >= n_tiles
+    tile = tl.where(is_k, pid - n_tiles, pid)
+    x_ptr = tl.where(is_k, k_ptr, q_ptr)
+    w_ptr = tl.where(is_k, wk_ptr, wq_ptr)
+    y_ptr = tl.where(is_k, ko_ptr, qo_ptr)
+    rows = tile * ROWS + tl.arange(0, ROWS)
+    cols = tl.arange(0, D)
+    offs = rows[:, None] * D + cols[None, :]
+    x = tl.load(x_ptr + offs)                                       # LDG.E.128 (no hints on B200: see §6)
+    w = tl.load(w_ptr + (rows % H)[:, None] * D + cols[None, :])
+    inv = tl.math.rsqrt(tl.sum(x * x, axis=1) * (1.0 / D) + eps)    # * (1/D) is exact; "/" is div.full.f32
+    tl.store(y_ptr + offs, (x * inv[:, None]) * w)
+
+def run(query, key, weight_q, weight_k, eps, query_norm, key_norm):
+    n_rows = query.numel() // D
+    ROWS, WARPS = (8, 4)                     # replace by a size-band table (section 9)
+    _qk_rms[(2 * (n_rows // ROWS),)](query, key, weight_q, weight_k, query_norm, key_norm,
+                                     n_rows, float(eps), ROWS=ROWS, D=D, H=H, num_warps=WARPS)
+```
+
+- Triton picks the layout itself: on sm_100a every load and store above became `LDG/STG.E.128`, 2 per thread for ROWS=8
+  and 4 warps.
+
+### 3b. `mem:ldg256` — 256-bit loads/stores (CUDA C++ only)
+
+- **When:** B200-only. It halves the load/store instruction count per byte and doubles the bytes per outstanding
+  instruction. That matters more at 36 B/clk/SM (1.5 GHz lock). It cannot be tested on H200, A100 or L40S.
+- **Effect:** none expected on S; on L, plausibly a few %. Unmeasured.
+- **Triton 3.7 never emits it.** 1-D and 2-D kernels with 8+ contiguous floats per thread still produce `LDG.E.128`
+  [VERIFIED-CSF3, probe5].
+- **CUDA recipe** (compile-verified, `probes/bulk_probe.cu::k_ldg256` → SASS `LDG.E.NA.ENL2.256`, `STG.E.ENL2.256`;
+  needs PTX ISA 8.8, i.e. CUDA ≥ 12.9; the portal has 13.1). A half-warp (16 lanes × 8 floats) covers one 128-float
+  row, and the reduction uses `__shfl_xor_sync` with offsets 8, 4, 2, 1 (`red:halfwarp`):
+
+```cuda
+asm volatile("ld.global.L1::no_allocate.v8.f32 {%0,%1,%2,%3,%4,%5,%6,%7}, [%8];"
+             : "=f"(v[0]),"=f"(v[1]),"=f"(v[2]),"=f"(v[3]),"=f"(v[4]),"=f"(v[5]),"=f"(v[6]),"=f"(v[7]) : "l"(p));
+asm volatile("st.global.v8.f32 [%0], {%1,%2,%3,%4,%5,%6,%7,%8};" :: "l"(q), "f"(v[0]), ..., "f"(v[7]) : "memory");
+```
+
+  Addresses must be 32-B aligned. The harness's pointers are 256-B aligned and rows are 512 B, so this holds.
+
+### 3c. `mem:cpasync` — Ampere-style async copies (LDGSTS) through Triton's pipeliner
+
+- **When:** a persistent loop over many tiles per program, where prefetching the next tiles hides latency. It runs on
+  A100 too, so A100 gives a relevant signal.
+- **S:** neutral or worse (the prologue fills STAGES tiles of a program that has only 1–3 tiles). **L:** can raise
+  bytes in flight without high occupancy.
+- **Triton recipe** (compile-verified `ptr_persist_R8_S3`: 12 × `LDGSTS.E.BYPASS.128`, 16 KB shared, 32 regs). Use
+  `tl.range(..., num_stages=S)`. The kernel argument `num_stages` alone only pipelines loads that feed `tl.dot`:
+
+```python
+for t in tl.range(pid, total_tiles, n_prog, num_stages=3):   # n_prog = 148 * PROGS_PER_SM
+    ...same body as 3a...
+```
+
+### 3d. `mem:tma-tensor` — TMA through tensor descriptors
+
+- **When:** you want many bytes in flight per SM from few instructions; on the L band. Runs on H200 (sm_90a) and B200.
+  A100/L40S silently compile a different fallback (sm_80 host-descriptor kernel: 4-byte LDGSTS, 72 regs
+  [VERIFIED-CSF3]), so **never use A100/L40S timings for this niche**.
+- **S:** risky (descriptor setup and mbarrier prologue). **L:** the most promising Triton path.
+- **Host-side descriptors (preferred).** The exact kernel below is compile-verified (`playbook_3d_host`, probe7).
+  R8/S3: `UTMALDG.2D` × 6, `UTMASTG.2D` × 2, mbarrier `SYNCS.*`, 36.9 KB shared, 32 regs, no global scratch.
+  R16/S4: 46 regs, 106.5 KB shared, so 2 CTAs/SM. The descriptor is encoded on the host for each launch, which is not
+  timed. The `run()` host code has not been run:
+
+```python
+from triton.tools.tensor_descriptor import TensorDescriptor
+
+@triton.jit
+def _qk_rms_tma(qd, kd, qod, kod, wq_ptr, wk_ptr, n_rows, eps, n_prog,
+                ROWS: tl.constexpr, D: tl.constexpr, H: tl.constexpr, STAGES: tl.constexpr):
+    pid = tl.program_id(0)
+    cols = tl.arange(0, D)
+    for t in tl.range(pid, n_rows // ROWS, n_prog, num_stages=STAGES):
+        r0 = t * ROWS
+        hq = ((r0 + tl.arange(0, ROWS)) % H)[:, None] * D + cols[None, :]
+        x = qd.load([r0, 0])
+        inv = tl.math.rsqrt(tl.sum(x * x, axis=1) * (1.0 / D) + eps)
+        qod.store([r0, 0], (x * inv[:, None]) * tl.load(wq_ptr + hq))
+        x = kd.load([r0, 0])
+        inv = tl.math.rsqrt(tl.sum(x * x, axis=1) * (1.0 / D) + eps)
+        kod.store([r0, 0], (x * inv[:, None]) * tl.load(wk_ptr + hq))
+
+def run(query, key, weight_q, weight_k, eps, query_norm, key_norm):
+    ROWS, STAGES, PROGS_PER_SM = 8, 3, 4
+    q2, k2, qo2, ko2 = (t.view(-1, D) for t in (query, key, query_norm, key_norm))
+    d = [TensorDescriptor.from_tensor(t, [ROWS, D]) for t in (q2, k2, qo2, ko2)]   # never round_f32_to_tf32
+    n_rows = q2.shape[0]
+    n_prog = min(n_rows // ROWS, _NUM_SMS * PROGS_PER_SM)   # _NUM_SMS cached at module level
+    _qk_rms_tma[(n_prog,)](*d, weight_q, weight_k, n_rows, float(eps), n_prog,
+                           ROWS=ROWS, D=D, H=H, STAGES=STAGES, num_warps=4)
+```
+
+- **Device-side descriptors** (`tl.make_tensor_descriptor(ptr, shape, strides, block_shape)`) also compile
+  (`tma_dev_*`). They need `triton.set_allocator(lambda size, align, stream: torch.empty(size, dtype=torch.int8,
+  device="cuda"))` at import, 128 B of global scratch per descriptor per program, and a per-program prologue of
+  `tensormap.replace.*`, fences and `CCTL`. Prefer host-side. Triton descriptors support ranks 2–5; a 1-D tensor
+  needs a `[n/C, C]` view.
+- Triton's pipeliner also pushed the weight `tl.load` through cp.async (12 LDGSTS at R8/S3) and grew shared memory:
+  37 KB at R8/S3 and 107 KB at R16/S4, for both host and device variants. 107 KB caps the kernel at 2 CTAs/SM. Check
+  `metadata.shared`. Weight-stationary (§4) or Gluon (weights in shared memory once) avoids this.
+- Descriptor `.load/.store` take **no cache hints** in Triton 3.7.
+- **Gluon** (`triton.experimental.gluon`, ships with fbtriton) gives explicit control of the ring: STAGES, mbarrier
+  phases, double-buffered TMA stores, weights loaded once into shared memory. Compile-verified for R8/R16 × S4/S8
+  (`probes/probe4.py`; `UTMALDG.2D`, `UTMASTG.2D`, no LDG/STG; 28–40 regs; shared 49 KB (R8,S4), 74 KB (R16,S4),
+  107 KB (R16,S8)). Core loop:
+
+```python
+for i in range(my_n):                       # tiles of this persistent CTA
+    st = i % STAGES
+    mbarrier.wait(bars.index(st), (i // STAGES) & 1)
+    x = xs.index(st).load(layout)           # smem -> registers (BlockedLayout [1,4],[1,32],[NW,1],[1,0])
+    gl.barrier()                            # all warps done with stage st
+    ok = i + STAGES < my_n
+    mbarrier.expect(bars.index(st), x_desc.block_type.nbytes, pred=ok)
+    tma.async_copy_global_to_shared(x_desc, [(pid + (i + STAGES) * n_prog) * ROWS, 0], bars.index(st), xs.index(st), pred=ok)
+    w = ws.index((pid + i * n_prog) % G).load(layout)        # weights resident in smem, G = 48 // ROWS
+    y = (x * gl.expand_dims(gl.rsqrt(gl.sum(x * x, axis=1) / D + eps), 1)) * w   # verified with "/ D"; prefer * (1.0 / D)
+    b = i % 2
+    tma.store_wait(1); ys.index(b).store(y); fence_async_shared(); gl.barrier()
+    tma.async_copy_shared_to_global(y_desc, [(pid + i * n_prog) * ROWS, 0], ys.index(b))
+```
+
+  Gluon pitfall seen on CSF3: `gl.load(ptr_tensor)` returned a tensor without a layout, and the next arithmetic
+  failed, so load through TMA/shared memory as above. This may be our misuse. Gluon's host-side
+  `TensorDescriptor.from_tensor(t, block, NVMMASharedLayout(swizzle_byte_width=0, element_bitwidth=32, rank=2))` is
+  not run-tested.
+- CuTe DSL: TMA through `cute.nvgpu.cpasync` bulk-tensor copy atoms. Compiling for sm_100a without a GPU works
+  (`CUTE_DSL_ARCH=sm_100a` [VERIFIED-CSF3, trivial kernel]); the TMA path itself is not yet verified.
+
+### 3e. `mem:bulk1d` — 1-D bulk copies, no tensor map (CUDA C++)
+
+- **When:** contiguous tiles (a ROWS×128 fp32 tile is one contiguous chunk). It is the simplest TMA-engine path, with
+  no descriptor encoding and an L2 cache hint on the copy. Runs on H200 and B200.
+- **Recipe** (compile-verified `probes/bulk_probe.cu::k_bulk<ROWS,STAGES>`: `UBLKCP.S.G` loads, `UBLKCP.G.S`
+  stores, 25 regs, 25.6 KB (R8,S4) / 50 KB (R16,S4) shared). Producer thread 0:
+  `mbarrier.arrive.expect_tx` + `cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint`.
+  Consumers: `mbarrier.try_wait.parity` loop. One warp per row: a float4 per lane from shared memory, then
+  `__shfl_xor_sync` for the sum. Output staged in a double-buffered shared tile, then `fence.proxy.async.shared::cta`
+  → `__syncthreads` → `cp.async.bulk.global.shared::cta.bulk_group` + `commit_group`; before reusing a buffer,
+  `cp.async.bulk.wait_group.read 1`.
+- Above 48 KB use dynamic shared memory: the probe's static 50 KB compiled, but would need the dynamic opt-in to
+  launch.
+- CuTe DSL equivalent: `cpasync.CopyBulkG2SOp`-style atoms (unverified).
+
+## 4. Grid shape — `grid:oneshot` / `grid:persistent` / `grid:persistent-wstat`
+
+- **One-shot** (one program per tile) has no loop overhead or prologue amortisation issues, and lets the hardware
+  scheduler balance. Best for S; fine for M/L with small tiles if occupancy is high. Tail effect: the last partial wave
+  is idle bandwidth; it is small when there are many waves.
+- **Persistent** (grid = 148 × k, loop over tiles with stride = grid): it amortises prologues (descriptor, barrier
+  init, weight load) and enables software pipelining (3c/3d). On S it is risky, because each program has only 1–3
+  tiles, so its latency chain is serial. Choose k so that CTAs/SM × k fits occupancy (k = resident CTAs per SM).
+- **Weight-stationary persistent** (`grid:persistent-wstat`): program p always handles the same (stream, head group),
+  so its weight tile is loaded once, before the loop. Compile-verified `wstat_HB16` (48 regs; 4 weight
+  `LDG.E.128` outside the loop, 4 `LDG.E.EF.128` + 4 `STG.E.EF.128` inside):
+
+```python
+G2 = 2 * (H // HB)                       # (Q,K) x head groups; n_prog must be a multiple of G2
+grp = pid % G2; is_k = grp >= G2 // 2; hg = tl.where(is_k, grp - G2 // 2, grp)
+heads = hg * HB + tl.arange(0, HB)
+w = tl.load(w_ptr + heads[:, None] * D + cols[None, :])          # once
+for tok in range(pid // G2, n_tok, n_prog // G2):
+    offs = (tok * H + heads)[:, None] * D + cols[None, :]
+    ...
+```
+
+  Effect: removes the L1/L2 weight traffic (equal to the input bytes in the naive kernel) and the weight address
+  maths. Expected gain is small to moderate on L and unknown on B200.
+
+## 5. Store path — `st:direct` / `st:bulk`
+
+- `st:direct`: `STG.128` (or `.256`) from registers, default cache policy (§6). Simplest. Stores are fire-and-forget, but
+  they occupy memory-system queues.
+- `st:bulk`: stage in shared memory and issue a TMA/bulk store. Fewer instructions, and it frees registers early.
+  Needs `fence.proxy.async` plus a barrier, and costs a shared buffer (double-buffer it).
+- For S, direct stores avoid the shared-memory round trip; for L, bulk stores pair naturally with `mem:tma-*`.
+
+## 6. Cache hints — `cache:stream` / `cache:default`
+
+- **On B200: default policy on loads, `evict_last` on output stores** (`cache:stl2`). [portal, 7 October]
+  `r5-ldg256-os-r16-stel` (stores `st.global.L2::cache_hint` + `createpolicy.fractional.L2::evict_last`) scored 0.609
+  against 0.588 for the same structure with no hints: outputs left in L2 at kernel end are written back after the
+  timed window, so M sizes gain 7–9%. `evict_first` on stores costs 0–3% (r2, g2 vs d1). Weights need no hint.
+- `evict_first` on the streamed x loads: hurt L by 4% on A100 when combined with evict_last stores (r5 session);
+  untested on B200. The Triton mapping of hints is in `b200_arch.md` §7 (`tl.store(..., eviction_policy="evict_last")`
+  should give `STG.E.EL`; check with compile_b200). **Do not** use `cache_modifier=".cg"` for loads: it becomes `LDG.E.128.STRONG.GPU`.
+  The PoC's EVICT knob was not decisive (A100/L40S). FlashGPU-Sim ignores these hints.
+
+## 7. Reductions — `red:warp` / `red:halfwarp` / `red:cta`
+
+- D=128 fp32 = 512 B = one warp × float4 (`red:warp`: 5 butterfly shuffles), or a half-warp × 8 floats
+  (`red:halfwarp`, pairs with 256-bit). Triton lays out a `[ROWS,128]` tile so the row sum is in-warp (10
+  `SHFL.BFLY` for 2 rows per warp at ROWS=8, 4 warps). Keep it that way.
+- `red:cta` (a row split across warps through shared memory) only pays for long rows (D ≥ 2048). For D=128 it adds
+  barriers and is an anti-pattern.
+- For long-row problems (for example RMSNorm with hidden size 4096–7168): one CTA (or cluster) per row, a two-level
+  reduction (warp shuffle, then shared memory), and the row held in registers between the reduction and the scaling,
+  so it is read from DRAM once.
+
+## 8. Small-input tactics — `spec:S`
+
+- **When:** the S band, where t is about 1.5–3× the floor and fixed costs dominate.
+- Use one wave: CTAs ≤ 148 × resident CTAs/SM, and spread evenly. Better 1,536 small CTAs than 148 large ones,
+  unless each CTA issues all its loads at once.
+- Each thread issues all its loads, then reduces, then stores. No loop-carried dependence and no prologue (no device
+  descriptors, no shared-memory rings).
+- Small CTAs (2–4 warps) with 2–4 rows each launch faster and balance better.
+- Effects to measure, not assume: the B200 CTA launch rate and empty-kernel span are unknown (`b200_arch.md` §8).
+- Measure S-band candidates on H200 first (closest latency structure), then confirm on B200.
+
+## 9. Per-size dispatch — `dispatch:size`
+
+- Legitimate (choose the config or kernel from shapes only). Pattern:
+
+```python
+_BANDS = [  # (max tokens B*S, kernel, meta) -- illustrative; fill from measurements
+    (600,   _qk_rms,     dict(ROWS=4,  num_warps=2)),   # S band: <= 2*293 tokens
+    (2048,  _qk_rms,     dict(ROWS=8,  num_warps=4)),   # M band
+    (1<<62, _qk_rms_tma, dict(ROWS=16, STAGES=4)),      # L band
+]
+def run(query, key, weight_q, weight_k, eps, query_norm, key_norm):
+    tokens = query.shape[0] * query.shape[1]
+    kern, meta = next((k, m) for lim, k, m in _BANDS if tokens <= lim)
+    ...launch exactly one kernel...
+```
+
+- Every specialist gets compiled during correctness round 0 of the first workload that uses it, inside the 300 s limit.
+  Triton compiles take about 1–3 s each, CuTe DSL about 20 s [VERIFIED-CSF3 for a trivial kernel]. Keep it to ≤ 4–5
+  specialists.
+- In the PoC, picking the best of 72 knob variants per size gained only 1.4–2.3%. Dispatch pays off only between
+  **structurally different** specialists (for example `spec:S` pointer one-shot against `spec:L` TMA persistent).
+
+## 10. Register pressure and occupancy (all designs)
+
+- Read regs and shared memory from the **sm_100a** compile (`kernel.n_regs`, `metadata.shared`, or `cuobjdump
+  -res-usage`). ≤ 32 regs keeps 2048 threads per SM. Spills (`LOCAL > 0`) are a red flag for streaming kernels.
+- Triton `num_warps` 1–8. Fewer warps per CTA means more CTAs per SM, which helps S (the PoC's best L40S variant used
+  1 warp; on A100, 2 warps with ROWS=32 persistent).
+- Bytes in flight per SM = resident CTAs × outstanding bytes per CTA. Target ≥ 48–64 KB on B200, and write the
+  estimate in the design card.
+
+## 11. Anti-patterns
+
+VERIFIED-CSF3 where marked; the rest are INFERRED from the harness code or the B200 numbers.
+
+| Anti-pattern | Why |
+|---|---|
+| Two launches (Q then K), or any torch op in `run()` | timed gaps and extra ramp-ups; torch fill/copy kernels can be confused with harness setup in CUPTI matching |
+| `tl.range(..., warp_specialize=True)` on non-matmul loops | sm_100a compile **crashes** (`TritonGPULoadMMASpecialization`); sm_90a ignores it [VERIFIED-CSF3] |
+| Expecting Triton to emit 256-bit LDG | it does not [VERIFIED-CSF3]; use CUDA C++ |
+| `cache_modifier=".cg"` on streaming loads | becomes `LDG...STRONG.GPU` [VERIFIED-CSF3] |
+| Device-side descriptors in the S path | per-program tensormap build, fences and global scratch |
+| Shared-memory rings so large that only 1 CTA fits per SM, in a one-shot grid | kills occupancy and in-flight bytes |
+| Persistent grid on S-band workloads | 1–3 tiles per program, so serial latency |
+| Persistent grid sized from another chip's occupancy | the extra programs wait for whole programs to finish, then run a full share: a second wave, up to about 1.5× slower. PoC v028 (ROWS=32, 2 warps, 8 programs per SM) uses 128 registers on sm_90a (8 fit) but **149 on sm_100a (6 fit)**. It ran 36.4 µs on H200 and **35.9 µs on B200** (score 0.451), so it gained nothing from 1.7× more bandwidth. Size `k` from the **sm_100a** register and shared-memory counts, or read `n_regs` from the compiled kernel at runtime [VERIFIED-CSF3; portal result 6 Oct, cause INFERRED] |
+| Fp32 `/` for constant divisors | Triton emits `div.full.f32` (approximate, ≤ 2 ulp; Gluon showed an extra `MUFU.RCP`) [VERIFIED-CSF3]; multiply by the reciprocal |
+| Masks on every element when ROWS ∤ 48 | extra predicates; choose ROWS dividing the row multiple |
+| `@triton.autotune` with large config lists | compile/benchmark time inside the 300 s limit, noisy choice; use a band table |
+| int32 offsets on tensors ≥ 2^31 elements (other problems) | overflow; cast row index to int64 |
+| Any cache keyed on `data_ptr`, data values or call count | forbidden (reward hack) |
+| Reusing a TMA descriptor across calls | pointers move every call: wrong results |
+
+## 12. Porting notes
+
+- **Triton → CUDA C++**: the binding is in `harness_scoring.md` §2. The kernel is the same algorithm. Gains available
+  only in CUDA: 256-bit accesses, the 1-D bulk path, explicit `createpolicy` on bulk copies, exact control of the
+  prologue. Use `__launch_bounds__(threads, minBlocks)` to pin registers. Launch on
+  `at::cuda::getCurrentCUDAStream()`; check the `is_contiguous()` and alignment assumptions on the host.
+- **Triton → Gluon**: the same Python harness interface. You control layouts, rings and barriers. Start from
+  `probes/probe4.py`.
+- **Any → CuTe DSL**: compile once (`cute.compile` at first call), `mark_layout_dynamic()` so all sizes share one
+  binary, and `from_dlpack` for the inputs each call. Allow about 20 s compile time per kernel.
+
+## 13. Other memory-bound row-wise problems
+
+The same axes apply. Recompute: bytes per workload (inputs read once plus outputs written once; count broadcast
+operands once), the floor per workload at 8 TB/s, the S/M/L bands, the row length (D) for the reduction pattern, and
+which tensors are reused (weights, cos/sin tables → `evict_last`, or stationary). Then copy the structure of
+the problem card (`problems/<name>/card.md`) into a new problem card.
+
+
+=== generation_protocol.md ===
+# Generation protocol for the inner LLM
+
+The inner LLM is the loop's **mutation operator**. Each call proposes a small number of kernels (default 1, at most 3).
+Each one comes with a design card stating what it changes and what it should do on B200. The loop compiles, checks,
+measures and archives them. This document fixes what the LLM receives, what it may do, and the exact output format.
+
+## 1. Inputs per call
+
+The loop assembles the prompt in this order (template in §6):
+
+| Block | Content | Always? |
+|---|---|---|
+| `core_brief.md` | objective, timing, rules, B200 facts, contract | yes |
+| task header | call type, operation, target niche and size band, number of candidates, round id | yes |
+| problem card | the problem card (`problems/<name>/card.md`), or its §1–3 + §6 only for knob mutations | yes |
+| reference docs | chosen per call type (README table): `playbook_membound.md`, `b200_arch.md`, `harness_scoring.md` | per call type |
+| archive summary | one row per niche: best kernel, measured and predicted results with uncertainty (format §4) | yes |
+| parents | 1–2 kernels: full source, design card, per-band measurements, sm_100a static features | for mutation, crossover, port, repair |
+| feedback | compiler output, correctness errors, or lint hits from the previous attempt | for repair |
+
+## 2. Allowed operations
+
+| Operation | What may change | Constraints |
+|---|---|---|
+| `knob_mutation` | only constexprs and launch parameters (ROWS, num_warps, STAGES, PROGS_PER_SM, band thresholds, hints) | niche tags unchanged; state the expected direction per band |
+| `structural_mutation` | one design axis (memory path, grid, store path, reduction, tile scheme, launch structure) | changes 1–2 niche tags; one hypothesis |
+| `crossover` | combine the axes of two parents (for example A's TMA ring and B's S-band dispatcher) | list which axis came from which parent |
+| `specialisation` | a kernel tuned for one size band, plus or including a `dispatch:size` wrapper | `spec:` tag set; correct for **all** shapes (the dispatcher may route other bands elsewhere) |
+| `port` | the same algorithm in another language (Triton → CUDA C++, Gluon, CuTe DSL) | niche tags unchanged except `lang:`; say what the port enables (for example `mem:ldg256`) |
+| `repair` | fix compile, correctness or lint failures | minimal diff; no performance changes unless required |
+| `new_design` | a fresh design for a niche not yet in the archive | must name the empty niche it fills |
+
+Every candidate must:
+
+- be correct for every workload shape;
+- launch exactly one kernel per call, unless the card argues for `launch:split` + PDL;
+- keep fp32 maths;
+- launch on the current stream;
+- hold no state between calls except compiled kernels and shape-keyed config tables;
+- contain nothing on the forbidden list (`core_brief.md` §3).
+
+If a requested operation can only be done by breaking a rule, return no candidate and say why in the rationale.
+
+## 3. Output format (exact)
+
+The response contains, in this order:
+
+1. Optionally, a `### Rationale` heading with ≤ 150 words.
+2. For each candidate, three kinds of fenced block, in this order:
+   - one ```` ```json solution-spec ```` block: the solution JSON **without** `sources`;
+   - one block per source file, with the info string `<lang> file=<relative path>` (for example
+     ```` ```python file=kernel.py ````, ```` ```cuda file=kernel.cu ````, ```` ```cpp file=binding.cpp ````). The
+     content is the complete file;
+   - one ```` ```yaml design-card ```` block.
+
+The loop builds the solution JSON from these, in the format of `poc/variants/v000.json`, which the harness and portal
+accept:
+
+```json
+{"name": "<card.id>", "definition": "038_flux_multi_head_rmsnorm_qk", "author": "solx-loop", "description": "<card.hypothesis>",
+ "spec": {"languages": ["triton"], "target_hardware": ["B200", "LOCAL"], "entry_point": "kernel.py::run",
+          "dependencies": ["torch", "triton"], "destination_passing_style": true},
+ "sources": [{"path": "kernel.py", "content": "<file block>"}]}
+```
+
+(`definition` should match `definition.json`'s name, `038_flux_multi_head_rmsnorm_qk`. The PoC used
+`flux_multi_head_rmsnorm_qk`, and the local CLI accepted it; the portal overwrites `name`, `definition`, `author` and
+`target_hardware` anyway.)
+
+Spec rules: `languages` is one of the harness names; Python and C++ languages cannot be mixed. `entry_point` is
+`file::function`. `destination_passing_style: true`. For CUDA C++ add
+`"compile_options": {"cuda_cflags": ["-O3", "--use_fast_math", "-std=c++17"]}`. Do not set `-arch`/`-gencode`; the
+packager injects sm_100a, plus the local arch when `LOCAL` is in `target_hardware`.
+
+**CUDA C++ layout: two files.** Put the device code and a small `extern "C"` launcher in `kernel.cu` **with no
+PyTorch headers** (`#include <cuda_runtime.h>` only), and the PyTorch glue (`torch/extension.h`, argument checks,
+`CUDAGuard`, the current stream, `PYBIND11_MODULE`) in `binding.cpp`, which declares and calls the launcher; the entry
+point is `binding.cpp::run`. The harness compiles and links every `.cu`/`.cpp` file, on the portal as on our B200.
+Measured on the B200 test bench: a one-file build (nvcc parsing the PyTorch headers) takes 54–67 s; the two-file
+build takes 18 s, and 9 s when `binding.cpp` is unchanged (it is cached). Same kernel, same timings.
+
+### Design card schema (YAML)
+
+```yaml
+id: g2-tma-host-r16s4            # unique; lowercase, digits, dashes
+parents: [v028]                  # ids from the archive; [] for new_design
+operation: structural_mutation   # §2 names
+language: triton                 # triton | gluon | tlx | cuda_cpp | cute_dsl
+niche:                           # exactly one tag per axis (playbook §0)
+  mem: tma-tensor                # ldg128 | ldg256 | cpasync | tma-tensor | bulk1d
+  st: bulk                       # direct | bulk
+  grid: persistent               # oneshot | persistent | persistent-wstat
+  launch: fused                  # fused | split | pdl
+  tile: rows16                   # rows<N> | token
+  red: warp                      # warp | halfwarp | cta
+  cache: default                 # default | stream
+  spec: L                        # all | S | M | L | dispatch:size
+hypothesis: >-
+  One or two sentences: the mechanism and why B200 differs from where we can measure.
+expected_effect:                 # predicted change in B200 time vs the first parent, per size band
+  S: {pct: +5, confidence: low}  # pct > 0 means slower
+  M: {pct: -2, confidence: low}
+  L: {pct: -8, confidence: medium}
+resources_sm100a:                # estimates; the loop overwrites them with the compiled values
+  regs_per_thread: 46
+  smem_per_cta_bytes: 106552
+  threads_per_cta: 128
+  ctas_per_sm: 2
+  bytes_in_flight_per_sm: 131072
+  launches_per_call: 1
+knobs: {ROWS: 16, STAGES: 4, PROGS_PER_SM: 2, num_warps: 4}
+dispatch:                        # only for dispatch:size designs
+  - {max_tokens: 600, kernel: _qk_rms, meta: {ROWS: 4, num_warps: 2}}
+tests: [H8]                      # hypothesis ids from the ledger this candidate tests ([] if none)
+findings:                        # REQUIRED in design sessions: what you measured or learned, one line each, with the
+  - "probe: one wave of 1184 fat CTAs copies 805 MB in 117 us vs 120 us for 49k small CTAs [probe_b200]"
+  - "dead end: prefetching the next tile into L2 evicts evict_last outputs at M sizes (+3%) [run_tests]"
+                                 # source in brackets. Negative results count. They go into the lab notebook.
+paths:                           # REQUIRED. What each code path does, for the emulator (portal = rented x correction)
+  - {max_tokens: 600, lang: cuda, width: 256, threads: 256, rows: 16, grid: oneshot, x: ef, w: nc, st: el}
+  - {max_tokens: null, lang: cuda, width: 256, threads: 256, rows: 16, grid: oneshot, st: el}
+  # one entry per size range, smallest first; max_tokens is the largest B*S it serves (null = all above).
+  # lang triton|cuda|cute; width 128|256; threads per CTA; rows per CTA; grid oneshot|persistent;
+  # mem ldg|tma|cpasync; wstat true|false; launches 1|2; prefetch true|false;
+  # x none|ef (Q/K loads); w none|el|nc (weight loads); st none|ef|el (output stores);
+  # cluster 1|2|4 (thread-block cluster size at launch). Omitted = default. Every launch attribute you set
+  # must appear here: the emulator cannot predict what it is not told.
+runs_on:                         # can this exact code run, and is the timing representative of B200 behaviour?
+  H200: {runs: true, representative: true}
+  A100: {runs: true, representative: false, note: "Triton compiles a non-TMA fallback on sm_80 (runtime untested); correctness check only"}
+  L40S: {runs: true, representative: false}
+risks:
+  - "106 KB smem limits to 2 CTAs/SM; in-flight bytes rely on STAGES"
+measure_first: [H200]            # which cheap source is most informative for this candidate
+compliance:                      # all must be true
+  single_stream: true
+  no_cross_call_state: true
+  fp32_math: true
+  no_threads_or_fork: true
+  no_precompiled_binaries: true
+```
+
+## 4. Archive summary format (what the LLM sees)
+
+One row per niche, showing the best kernel in it, sorted by predicted B200 score. Times are geometric means per size
+band in µs. Predicted values are the emulator's posterior mean ± 1 sd. `B200 meas` is filled in once the kernel has
+been submitted.
+
+| id | niche (mem/grid/spec) | lang | H200 S/M/L | A100 S/M/L | L40S S/M/L | pred B200 S/M/L ± sd | pred score ± sd | B200 meas (score) | status |
+|---|---|---|---|---|---|---|---|---|---|
+| v028 | ldg128/persistent/all | triton | pending | 16.5/81.0/322.1 | 37.2/223.0/860.3 | {{emulator}} | {{emulator}} | pending | queued for portal |
+
+(The v028 A100/L40S numbers are real PoC band geomeans, CSF3; the other cells are placeholders.)
+
+Below the table, the loop appends: the 3 most recent B200 results with the emulator's prior prediction (calibration
+error), the niches that are empty, and any rule the last round broke.
+
+## 5. Gates applied to every candidate (self-check before answering)
+
+1. Parse: fences are present, the spec is valid JSON, the card validates (tags from `niche_tags.yaml`).
+2. Lint (flags go to human review): `torch.cuda.Stream`, `torch.cuda.graph`/`CUDAGraph`, `threading`,
+   `multiprocessing`, `concurrent.futures`, `torch.jit.fork`, `os.environ[...] =`, `load_inline`, `cuModuleLoadData`,
+   `base64`, `ctypes` loads, `.half()`/`.bfloat16()`/`float16`/`bfloat16`/`allow_tf32`/`round_f32_to_tf32=True` (formats listed in the problem's sol.yaml `precision:` are not flagged, e.g. TF32 and FP16 on #35), module
+   globals holding tensors, `lru_cache`/dicts keyed on tensors or `data_ptr()`, torch ops inside `run()`
+   (`torch.empty` is allowed; fills, copies and compute are not).
+3. Compile for **sm_100a** without a GPU: Triton via `ASTSource` + `GPUTarget("cuda",100,32)` (see
+   `probes/probe1.py`); CUDA via nvcc → PTX → `ptxas-blackwell`; CuTe DSL via `CUTE_DSL_ARCH=sm_100a`. Records regs,
+   shared memory, spills and the SASS mix.
+4. Correctness: the harness's `sol-execbench` CLI on an available GPU (H200 for TMA designs, any GPU otherwise), all 16
+   workloads, 10 rounds each.
+5. Timing: H200, plus A100/L40S where `runs_on` says representative. The emulator then predicts B200 per band, with an
+   uncertainty.
+
+A candidate that fails 1–4 is returned for `repair` with the log.
+
+## 6. Prompt template
+
+Fill the `{{…}}` slots; keep the section markers so the LLM can find things.
+
+````text
+=== CORE BRIEF ===
+{{core_brief.md}}
+
+=== TASK ===
+Round: {{round_id}}   Call type: {{call_type}}   Operation: {{operation}}
+Problem: {{problem_id}}   Target niche: {{target_niche or "any empty niche"}}   Target band: {{band or "all"}}
+Return {{n_candidates}} candidate(s). Each must follow OUTPUT CONTRACT exactly.
+{{extra_instructions, e.g. "Port parent g2-tma-host-r16s4 to CUDA C++ using a 1-D bulk ring (mem:bulk1d)."}}
+
+=== PROBLEM CARD ===
+{{the problem card or its sections 1-3,6}}
+
+=== REFERENCE ===
+{{selected docs per README table}}
+
+=== ARCHIVE (best per niche) ===
+{{archive table, section 4 format}}
+Recent B200 results vs prior predictions: {{calibration lines}}
+Empty niches: {{list}}
+
+=== PARENTS ===
+--- parent {{id}} ---
+design card:
+{{yaml}}
+measurements (geomean µs per band; per-workload table optional): {{table}}
+sm_100a static features: regs={{r}} smem={{s}} local={{l}} sass={{LDG/STG/UTMA counts}}
+source:
+{{full source}}
+{{repeat for second parent}}
+
+=== FEEDBACK FROM LAST ATTEMPT ===
+{{compiler/correctness/lint output or "none"}}
+
+=== OUTPUT CONTRACT ===
+Optional "### Rationale" (<=150 words). Then, per candidate:
+1) ```json solution-spec``` (solution JSON without "sources")
+2) one ```<lang> file=<path>``` block per source file (complete files)
+3) ```yaml design-card``` following the schema in the generation protocol.
+No other code blocks. Do not use any forbidden behaviour; if the task needs one, return no candidate and explain.
+````
+
+### Call-type presets (which docs go into REFERENCE)
+
+| Call type | REFERENCE contents | Parents |
+|---|---|---|
+| `new_design` (#38) | playbook (all), b200_arch §1–8 + §10 | 0–1 (best overall) |
+| `knob_mutation` | playbook §0 + the axis being tuned | 1 |
+| `structural_mutation` | playbook (all), b200_arch §3, §5, §8 | 1 |
+| `crossover` | playbook §0, §9 | 2 |
+| `specialisation` (S band) | playbook §2, §8, §9; b200_arch §8 | 1–2 |
+| `port` to CUDA C++ / Gluon / CuTe DSL | harness_scoring §2; playbook §3b/3d/3e and §12; b200_arch §5 | 1 |
+| `repair` | harness_scoring §2–4 | 1 (the failing one) |
+| new memory-bound problem | harness_scoring (all), playbook (all), b200_arch §1–8, plus a new problem card | 0 |
+
+
+=== OUTPUT CONTRACT ===
+Optional "### Rationale" (<=150 words). Then, per candidate:
+1) ```json solution-spec``` (the solution JSON without "sources")
+2) one ```<lang> file=<path>``` block per source file (complete files)
+3) ```yaml design-card``` following the schema in the generation protocol (block style, one key per line).
+No other fenced code blocks. Never use a forbidden behaviour; if the task needs one, return no candidate and explain.
+
+=== IDEAS PROTOCOL ===
+You are one of several independent idea generators for this problem. This session writes no kernel and has no GPU.
+Your output is a list of design ideas in plain language. The research lead deduplicates the ideas of all generators,
+weighs them and starts the best, most different ones as parallel lineages (independent lines of development, each
+built and measured by its own design session on a rented B200).
+1. Read the problem, the bounds and the evidence below (ledger, notebook, portal results, leader gap, lineages).
+   You may read kernels (get_kernel), public SOTA excerpts (read_example) and value a speed-up per size band
+   (predict_score).
+2. Write 10 ideas. Each is a whole-kernel design or a decisive change to one, specific enough to start building: what
+   is computed where, what moves through DRAM / L2 / shared memory / TMEM / registers, how many launches, which
+   precision per stage, and why that is fast on B200 for these shapes. Work out the numbers (bytes, FLOPs, launches)
+   per size band. Aim at least half of the ideas at the measured terms in the newest design cards' findings (stamps,
+   per-phase times, what each card says binds) and at the SOL TARGETS cheapest allocation: name the term an idea removes
+   and by how many microseconds. The rest may be whole-kernel long shots. Skip ideas the ledger already records as built
+   or refuted unless you say what is different.
+3. Spread them out. At most 3 ideas may share a family. At least 3 must be long shots: ideas a strong B200 kernel
+   engineer would propose with probability below 0.2, that could still win. Rewriting the maths (reordering, folding
+   or fusing operations), another decomposition of the work, a different precision per stage, unusual use of the
+   memory hierarchy, and fewer or more launches are all fair game within the rules.
+4. For each idea: p_expert (probability, 0-1, that a strong engineer proposes it unprompted), the expected effect per
+   band with the arithmetic behind it, the main risk (what would kill it), and the cheapest test (one probe of about
+   10 minutes that would most change our belief in it).
+5. Leader stories: assume the public leader's implied per-workload times (LEADER GAP) are real. Give 3 different
+   explanations of how they reach them that fit our measurements, each with a test.
+Rules: never propose a forbidden behaviour (core brief, ledger constraints). Any precision is allowed as long as every
+workload meets its tolerance; say how you would check that.
+This session returns ideas, not a kernel: ignore the OUTPUT CONTRACT and answer in this format:
+### Notes
+(at most 150 words)
+```json ideas
+[{"title": "...", "family": "two or three words", "design": "...", "p_expert": 0.3, "effect": "...",
+  "risk": "...", "test": "..."}]
+```
+```json leader-stories
+[{"story": "...", "consistent_with": "...", "test": "..."}]
+```

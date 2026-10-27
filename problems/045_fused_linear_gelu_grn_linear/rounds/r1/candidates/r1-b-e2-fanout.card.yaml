@@ -1,0 +1,82 @@
+id: r1-b-e2-fanout
+parents:
+  - r0-simt-3k
+operation: new_design
+language: cuda_cpp
+niche:
+  mem: ldg128
+  st: direct
+  grid: oneshot
+  launch: fused
+  tile: rows28
+  red: cta
+  cache: default
+  spec: dispatch:size
+hypothesis: >-
+  S rows are a chain of dependent latencies, not a FLOP problem. Each of 112-128 CTAs (token tiles x 4 hidden slices of 128)
+  takes in 128 KB of fp32 weight slices plus its x tile, splits them hi/lo in shared memory, and runs FP16x3 tcgen05
+  GEMM1 swap-AB, so each TMEM lane is a hidden channel and the GRN sum of squares is a per-thread sum. It then crosses
+  one grid counter and reduces split-K GEMM2 with red.add into an output prefilled with b2. The prediction is 8-11 us
+  rented, against 137-143 us for r0, at 784-3136 tokens. UNTESTED: no compile or run result was obtained in this session.
+expected_effect:
+  S:
+    pct: -93
+    confidence: low
+  M:
+    pct: -90
+    confidence: low
+  L:
+    pct: 0
+    confidence: medium
+resources_sm100a:
+  regs_per_thread: 128
+  smem_per_cta_bytes: 202048
+  threads_per_cta: 512
+  ctas_per_sm: 1
+  bytes_in_flight_per_sm: 188416
+  launches_per_call: 1
+knobs:
+  slices: 4
+  slice_width: 128
+  TT_candidates: [28, 49, 98]
+  threads: 512
+  tmem_cols: 512
+dispatch:
+  - {max_tokens: 784, kernel: e2_kernel<28>, meta: {grid: 112, HW_divisor: 28}}
+  - {max_tokens: 1568, kernel: e2_kernel<49>, meta: {grid: 128, applies_when: "HW % 49 == 0"}}
+  - {max_tokens: 3136, kernel: e2_kernel<98>, meta: {grid: 112-128, applies_when: "HW % 98 == 0"}}
+  - {max_tokens: null, kernel: r0 k_stats/k_grn/k_main, meta: {launches: 3}}
+tests: [H11]
+findings:
+  - "tooling: both probe_b200 calls (an API inspection of b200probe) gave no response for 1800 s and were aborted; the session ended before compile_b200 returned, so this kernel has NOT been compiled, run or timed [probe_b200, compile_b200]"
+  - "design arithmetic: S=256 slices (the brief's 6272 = 56 x 2 of 256) do not fit: hi/lo W1 + x + W2 + x2 images need 256-320 KB of smem against 227 KB, and the D1 + 2 x D2 TMEM need is 588 columns at 196 tokens. So a 6272-token row needs either 256 CTAs (two waves, which breaks the grid barrier) or GEMM2 done in K halves; 6272 stays on r0 for now [INFERRED]"
+  - "design arithmetic: with S=128 swap-AB, per-CTA weight ingest is a fixed 128 KB (W1 + W2 slices, fp32) plus TT x 512 B of x; the hi/lo conversion costs about 3.5 issue slots per float, so about 1.4 us of issue at 512 threads; S=64 would halve both, but swap-AB with M=128 leaves half the TMEM lanes idle [INFERRED]"
+  - "design choice: gb folded into x2 before the hi/lo split, so b2' = W2.gb is never needed and the slice-0 prefill stores only b2; the hi/lo split keeps gb to about 2^-22 relative, unlike #129's failed fold of gb into a single fp16 hidden [INFERRED]"
+  - "untested: phase stamps, err/tol precision log and STACK check were not run; the first test must run run_tests on all 14 workloads and log max err/tol per E2 row (gate <= 0.8)"
+paths:
+  - {max_tokens: 3136, lang: cuda, width: 128, threads: 512, rows: 28, grid: oneshot, mem: ldg, launches: 1, x: none, w: nc, st: none}
+  - {max_tokens: null, lang: cuda, width: 128, threads: 256, rows: 64, grid: oneshot, mem: ldg, launches: 3, st: none}
+runs_on:
+  H200:
+    runs: false
+    representative: false
+    note: "tcgen05/TMEM are sm_100a only"
+  A100:
+    runs: false
+    representative: false
+  L40S:
+    runs: false
+    representative: false
+risks:
+  - "Never compiled: descriptor/idesc bit layouts (K-major B, bit 16 = 0), tmem_ld ordering trick, and register pressure (24 float4 loads per thread under a 128-reg cap) may fail or spill"
+  - "Grid barrier relies on cooperative-launch co-residency with 1 CTA/SM (202 KB smem); if any call aborts mid-kernel, the counters stay dirty and later calls deadlock"
+  - "A&S GELU and FP16x3 precision are unverified on this exact accumulation order; GEMM2 uses a separate cross-term accumulator (critic: 0.44 err/tol)"
+  - "red.add of 4 slice partials into out makes the rounding order nondeterministic; this is a tolerance risk only near the atol edge"
+  - "6272-token rows (2,56,56 and 32,14,14) still on r0 (about 180 us portal)"
+measure_first: [B200]
+compliance:
+  single_stream: true
+  no_cross_call_state: true
+  fp32_math: true
+  no_threads_or_fork: true
+  no_precompiled_binaries: true
