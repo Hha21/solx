@@ -65,3 +65,4 @@ r11-merge-b,0.058091,0.740376,16,2.759,73053,035_convnextv2_block_with_grn,B200,
 r12-merge,0.057510,0.742523,16,2.787,75393,035_convnextv2_block_with_grn,B200,v1.1,Private,AC,portal_html/75393_r12-merge.html
 r13-merge,0.053653,0.755533,16,2.987,75810,035_convnextv2_block_with_grn,B200,v1.1,Private,AC,portal_html/75810_r13-merge.html
 r0-simt-3k,0.367396,0.244198,0,0.327,75960,045_fused_linear_gelu_grn_linear,B200,v1.1,Private,AC,portal_html/75960_r0-simt-3k.txt
+r1-merge,0.048699,0.721632,14,2.467,76512,045_fused_linear_gelu_grn_linear,B200,v1.1,Private,AC,portal_html/76512_r1-merge.html
