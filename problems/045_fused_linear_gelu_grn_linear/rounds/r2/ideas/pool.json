@@ -1,0 +1,508 @@
+{
+ "ideas": [
+  {
+   "id": "I1",
+   "title": "Bulk reduce-add (cp.reduce.async.bulk .add.f32) for split-K partials instead of scalar red.add",
+   "family": "fan-out",
+   "design": "In the fan-out kernels (S now, M with TT=196, L cluster variant if DSMEM is slow) each CTA writes its GEMM2 partial tile (TT x 128 fp32, 14-100 KB) to smem and one thread issues cp.reduce.async.bulk.global.shared::cta.bulk_group.add.f32 over the contiguous output rows, then wait_group before exit. The TMA unit performs the L2 atomics in full 128 B lines with no SM issue, replacing 24-50 red.add per thread plus the b2 prefill (the slice-0 CTA adds b2 into its partial in registers instead).",
+   "p_expert": 0.15,
+   "effect": "S: the 4-way red.add at 3136 tokens is 6.4 MB plus a 1.6 MB prefill at 4.1-4.4 TB/s = ~2 us; if bulk reduce runs near L2 write bandwidth it drops below 0.5 us: -8..-10% on 4,28,28 and 16,14,14 (the rows the cheapest allocation wants at -22..-25%). L: makes a cluster-free split-K at 2 KB/token (400 MB at 64,56,56) cost ~40 us overlapped instead of ~95, enabling the fan-out at L without DSMEM.",
+   "risk": "The L2 atomic unit, not the issuing side, may be the 4.3 TB/s limit, in which case bulk reduce saves only the SM issue and the prefill; the reduce proxy needs fence.proxy.async before issue and ordering with the final store.",
+   "test": "Probe: 128 CTAs each reduce-adding a 64 KB tile into a shared 1.6-6.4 MB output, bulk vs scalar red.add v1/v4, after a 2xL2 zero_; report TB/s. Decisive at 10 minutes."
+  },
+  {
+   "id": "I2",
+   "title": "Batch-local GRN inside clusters for HW=196/784: no grid barrier, no counters, no red.add",
+   "family": "hidden-sliced clusters",
+   "design": "For the 9 rows with HW in {196, 784}, one cluster holds whole batches: 4 hidden slices x g token groups. HW=196 uses g=2: cluster of 8, 98 tokens per CTA, N=112. HW=784 uses g=4: non-portable cluster of 16, 196 tokens, N=208. The cluster runs persistently over batches. Each CTA runs hidden-major GEMM1 on its slice and group, then GELU and per-channel sumsq. The sumsq is all-reduced over the g groups, and the 512-float G vector is all-gathered over the 4 slices, both through DSMEM with one barrier.cluster; that gives s. Then x2 split, the split-K GEMM2 partial, and a DSMEM reduce-scatter with b2 and a single store. All GRN traffic stays inside the GPC. TMEM at HW=196: h 112 + main 112 + cross 112 = 336 columns. At HW=784, use a single accumulator per K=128 partial, or recycle h columns after the x2 split. The 4-way fp32 split-K sum behaves like the per-k-block add (err/tol 0.29), but check it.",
+   "p_expert": 0.25,
+   "effect": "HW=196 per batch per CTA: MMA 11M MAC = 2.7k clk (1.8 us) plus GELU about 1.1k clk, so about 2.5-3 us per batch round. 16,14,14 (16 clusters): ~7 us rented vs 16.7. 8,14,14 ~6-7 vs 13.7. 32,14,14 (2 rounds) ~10 vs 28.3. 64,14,14 (4 rounds) ~15 vs 36. HW=784 (at most 8 clusters of 16): 1,28,28 and 4,28,28 ~8-9 vs 11.6/16.5; 16,28,28 ~13 vs 31; 64,28,28 ~35-40 vs ~80. The two worst-scoring M rows (0.69, 0.70) move most: about +0.02-0.03 mean from this band alone.",
+   "risk": "16-CTA clusters may fit only 6-8 at once (GPC sizes), which leaves 20+ SMs idle at HW=784. The TMEM/smem budget at N=208 is tight. The 1-wave rule for clusters holds only while the grid stays persistent.",
+   "test": "Probe MaxActiveClusters for sizes 8 and 16 with 180 KB smem and the NonPortableClusterSizeAllowed attribute. Time barrier.cluster plus a 2 KB DSMEM all-gather (expect < 1 us). If cluster-16 gives fewer than 7, keep HW=784 on idea 2."
+  },
+  {
+   "id": "I3",
+   "title": "Hidden-sliced, weight-stationary cluster-of-4 pipeline with lagged TMEM h buffers (one launch, all rows)",
+   "family": "hidden-sliced clusters",
+   "design": "Persistent one-wave grid of 37 clusters x 4 CTAs. CTA q owns hidden channels [128q, 128q+128). W1_q and the W2[:, q] slice are converted to fp16 hi/lo once and stay resident in smem (64 + 64 KB), so weights are never streamed. Per 64-token tile, TMA multicasts the 32 KB fp32 x tile to the 4 CTAs, and each CTA splits it in place. GEMM1 runs hidden-major: D1 = W1_q (M=128, K-major) x x^T (N=64), 3 FP16 passes, into one of 4 TMEM h buffers of 64 columns. GELU (idea 1) and per-thread sumsq go to global [B x 512] partials (column range split at batch boundaries) with a per-batch arrival counter. Because h is held for up to 3 tiles, the grid-level batch wait overlaps the next GEMM1s. When the batch completes, each CTA reads the 512 G values (2 KB) and forms s for its own 128 channels. x2 = h*s + gb is split into an MN-major smem B operand of 32 KB. GEMM2 computes the partial out^T = W2 slice (M=128 out, K=128) x x2^T (N=64) with separate main and cross accumulators (2 x 64 columns). A DSMEM reduce-scatter gives each CTA 16 tokens; it adds b2 and does one plain store. No red.add and no prefill. TMEM: 256 + 128 = 384 of 512 columns. smem about 216 KB.",
+   "p_expert": 0.2,
+   "effect": "Per 64-token cluster tile: MMA 6.3M MAC/4096 = 1.54k clk (1.0 us); CUDA core with idea 1 about 1.4k clk; so about 1.1-1.3 us per tile. 64,56,56: 3136 tiles / 37 = 85 per cluster, about 95-110 us (vs 326 portal); 32,56,56 ~55 (184); 16,56,56 and 64,28,28 ~30 (97/104); 4,56,56 ~10-12 (38); 2,56,56 ~8 (33). L and M -60..-70%. predict_score at -25/-60/-60: 0.868.",
+   "risk": "cudaOccupancyMaxActiveClusters may give fewer than 37 clusters of 4 when each CTA uses 216 KB of smem. The DSMEM reduce volume equals the h volume. A tile-order mistake could deadlock the lagged wait (tiles must be dealt batch-major round-robin so that the lag is <= 2 tiles). The smem budget is tight at 64-token tiles.",
+   "test": "B200 probe, 10 min: launch an empty persistent kernel with clusterDim 4, 216 KB dynamic smem and a 512-column TMEM alloc, then read MaxActiveClusters. In the same probe, time a 4-CTA DSMEM reduce-scatter of 24 KB per CTA, repeated 100 times, with globaltimer."
+  },
+  {
+   "id": "I4",
+   "title": "Kill lineage A's ~19 us fixed chain: convert-on-ingest weights and an L2 prefetch at entry",
+   "family": "weight path",
+   "design": "Lineage A takes 21 us at t=16 with 0.3 us of MMA. Its chain is a phase-0 cooperative W to hi/lo conversion, a grid counter, then 16 serial 32 KB weight units through a 3-stage ring, each refill waiting on the previous unit's commit. Replace it as follows. At kernel entry every CTA issues cp.async.bulk.prefetch.L2 for its share of W1/W2 (512 KB total, cold from DRAM), so the DRAM latency is paid once and in parallel. Drop phase 0 and the grid counter: a converter warp group TMA-loads fp32 weight chunks into smem and converts them to SW128 hi/lo in place of the image while the MMA consumes the previous stage. The ring depth follows from t (6 stages at t=16). Converter warps hand stages over through a warp with no loads in flight (#35 release-arrive lesson).",
+   "p_expert": 0.45,
+   "effect": "Removes the phase-0 barrier (about 1.5-2.5 us) and most of the ring latency chain: an estimated 4-8 us off every A-routed row. 32,14,14 36.7 -> ~30, 64,14,14 46.8 -> ~40, 2,56,56 32.7 -> ~27 portal. M -10..-15% if ideas 2/3 do not take these rows.",
+   "risk": "Conversion in the CTA costs 128K floats x 4 ops per CTA (about 2.7 us of issue) per round, so it is only good for single-round rows. Release-arrive stalls behind the converter's own loads.",
+   "test": "Add globaltimer phase stamps to r1-a-e1-ts-fp16x3-m at 1,28,28: kernel entry, end of phase 0, end of the grid counter, each weight unit, and the batch wait. A 10-min run says which of these terms are the 19 us."
+  },
+  {
+   "id": "I5",
+   "title": "B-lineage trim for 3136-token rows",
+   "family": "fan-out trim",
+   "design": "Lineage B measured 1,28,28 at 11.6 us but 3136-token rows at 16.5-16.7, a gap of about 5 \u00b5s that grows with the token tile TT (x ingest, GELU, x2 split with scalar 2-byte smem stores, 4x red.add volume). Changes: (1) 8 slices of 64 hidden (M=64 swap-AB lanes; MMA is not binding at S) with TT=98, so per-CTA GELU halves (98x64 vs 98x128 elements) and the weight ingest drops to 64 KB; 392 CTAs do not fit one wave, so use 2 token tiles x 4 slices... or alternatively 4 slices of 128 with TT=49 and 64 token tiles = 256 CTAs resident at 1 CTA/SM only if smem <= 113 KB, hence the 64-slice choice with 2 CTAs/SM. (2) Vectorise the x2 split: read the TMEM accumulator transposed (tcgen05.ld 16x64b/32x32b) so each thread owns 2 consecutive tokens and writes one 32-bit pair, replacing 2-byte STS. (3) Replace the grid barrier with cluster-8 DSMEM exchange of the 8 per-slice partials when the batch fits a cluster (4,28,28: 784 tokens/batch, not for 16,14,14 with 16 batches of 196 which fits as cluster of 4 per batch). (4) Cut red.add by writing the 8-way partial into bulk reduce-add (as idea 3).",
+   "p_expert": 0.3,
+   "effect": "4,28,28 and 16,14,14: 16.5 -> about 12.5 rented (-24%); 8,14,14 13.7 -> about 11.5. Worth +0.005..+0.008.",
+   "risk": "M=64 lanes leave half the TMEM lanes idle; 2 CTAs/SM halves available smem; the grid barrier with 2 CTAs/SM co-residency must be guaranteed (cooperative launch occupancy check).",
+   "test": "Stamp B at 4,28,28 with globaltimer (x loaded, GELU done, barrier released, GEMM2 done, red.add done). Pass if GELU+split > 3 \u00b5s, which says slices/vectorisation are worth building."
+  },
+  {
+   "id": "I6",
+   "title": "Two-kernel recompute at L, now that GELU is cheap: no waits, no TMEM capacity limit",
+   "family": "recompute",
+   "design": "This revisits parked H5: it was parked because GELU dominated, and idea 1 removes that. K1 runs GEMM1 FP16x3, GELU and sumsq, and does a per-batch red.add of the sumsq; it stores nothing. K2 recomputes GEMM1 and GELU, applies s, splits, runs GEMM2, and stores. K2 waits on K1 through PDL griddepcontrol, our own kernels only. Both kernels are warp-specialised, with 2 TMEM accumulators double-buffered across 128-token tiles, so the epilogue fully overlaps the MMA. 2SM pairs (cta_group::2) halve the per-SM weight ingest to 2 KB/token.",
+   "p_expert": 0.3,
+   "effect": "MMA is 9 passes instead of 6: 131 us at 64,56,56 at 100%. At about 85% utilisation plus 2 ramps, about 160 us vs 326 (-50%). 32,56,56 ~85 vs 184. A robust fallback that needs no grid-wide synchronisation and no workspace; worse than idea 2 when that works.",
+   "risk": "The MMA floor alone is 131 us, so it cannot beat about 0.85 per row at L. A second launch costs about 2-4 us, which rules it out below L.",
+   "test": "Instrument e4 to time GEMM1 plus GELU (idea 1) for one tile with the next tile's MMA overlapped. If the overlapped GEMM1 tile is <= 1.1x its MMA time, the 160 us projection holds."
+  },
+  {
+   "id": "I7",
+   "title": "Tokens-as-lanes GEMM1 with h' packed into TMEM as GEMM2's A operand and the GRN scale folded into a per-batch W2'",
+   "family": "operand path",
+   "design": "Non-swapped GEMM1 (A = x tile K-major from smem, B = W1 from the ring, D1[token][hidden]); sumsq per channel by 5-step warp shuffles (0.3 instr per element). After GELU the unscaled h is packed hi/lo fp16 into TMEM (256 columns per 512 hidden) by tcgen05.st, so no smem h' buffers exist and the weight ring gets 160+ KB (5-7 x 32 KB). GEMM2 uses the A-from-TMEM form (tensor-bound 64 clk at N=128, B = W2' 4 KB per k-step) against a per-batch W2'_b = W2 (1 + gw nf_b) hi/lo image that the batch's CTAs build cooperatively after the per-batch counter (64K elements per batch, ~0.1 us per CTA) behind a second per-batch counter; gb W2 folds into the bias. Tiles that straddle a batch run GEMM2 twice with N split at the boundary padded to a 16-token atom.",
+   "p_expert": 0.05,
+   "effect": "Per 128-token tile: GEMM1 port-bound 4.2 us, GEMM2 tensor-bound 4.1 us, no 2.3 us h' split, no 1.2 us exposed split before GEMM2, ring deep enough to hide the weight stream; TMEM 512 D1 + 256 h' = 768 does not fit, so GEMM1 runs in two hidden halves (256 + 128 + 128 + reuse): the h' pack of half a overlaps GEMM1 of half b. Target ~13-15 us per round at L (-40%) if the second counter costs < 2 us.",
+   "risk": "Two per-batch counters and a W2' image per batch (256 KB x B, 16 MB at B=64, built after the wait) put an L2 round trip and a sync inside every round; batch-straddling tiles need N splits at non-multiple-of-8 boundaries (196 = 4 x 49), so a padded relayout is required; the A-from-TMEM layout is unverified.",
+   "test": "Measure the added chain first: in e4, after the per-batch wait, have the batch's CTAs write a 256 KB dummy W2' image, bump a counter, wait, and bulk-copy one unit; stamp it. If > 2 us per round, drop the fold and keep only the TMEM-packed h' with the scale applied in the pack (which forces the pack after the wait and loses the overlap)."
+  },
+  {
+   "id": "I8",
+   "title": "B fan-out: replace the red.add split-K and bias prefill with a 4-CTA DSMEM reduce-scatter",
+   "family": "hidden-sliced clusters",
+   "design": "In lineage B (the 4 smallest rows), group the 4 hidden-slice CTAs of a token tile into a cluster of 4. This is a one-wave grid of at most 128 CTAs, so clusters are allowed. After GEMM2, each CTA keeps its partial out in TMEM, pushes 3/4 of it to its peers with st.async / cp.async.bulk shared::cluster, adds b2, and stores its quarter with plain coalesced 512 B rows. This removes the bias prefill, its ordering against the red.adds (part of the grid barrier), and the 16-way L2 atomic traffic (0.55 us in the critic skeleton). The cluster launch itself saves the 0.1-0.2 us launch trick.",
+   "p_expert": 0.4,
+   "effect": "Critic skeleton terms: red.add 0.55 us plus the prefill ordering. Expect -0.6..-1.0 us on 1,28,28 / 8,14,14 / 4,28,28 / 16,14,14 (-4..-7% of 14.7-21.4 portal), about +0.002-0.003 mean.",
+   "risk": "The DSMEM exchange plus barrier.cluster may cost as much as the red.add. If the cluster attribute changes CTA placement, the slices of one tile can land unevenly on GPCs.",
+   "test": "Extend the critic's 1,28,28 skeleton (empty 1.63 / loads 4.80 / barrier 6.27 / red.add 6.82 us) with a cluster-4 DSMEM reduce in place of red.add; one 10-min run."
+  },
+  {
+   "id": "I9",
+   "title": "Cut the S-band launch floor: find what the 1.63 us empty-kernel span is made of",
+   "family": "launch overhead",
+   "design": "Every S row carries a fixed cost of about 1.6 us rented and about 2-3 us on the portal before any byte moves, which is 15-20% of 14.7 us. Candidate contributors in our kernels: cooperative-launch attribute, 200+ KB dynamic smem (an L1/smem carve-out switch after the harness's zero-fill kernel ran with carve-out 0), a 512-column TMEM alloc/relinquish, mbarrier init chains, and 512-thread CTAs. Build the empty-body variants of the shipped B kernel with each removed in turn and keep the cheapest legal combination for S. For example: a smem carve-out of 0 for the first phase is impossible, but a smaller dynamic smem with a 1-SM-per-CTA occupancy forced by TMEM, a non-cooperative launch with our own counter, and 256 TMEM columns where enough.",
+   "p_expert": 0.3,
+   "effect": "If the carve-out switch or the cooperative attribute costs >= 0.5 us, about -0.5..-1 us on all 4 S rows and on 1-round M rows; about +0.003-0.006 mean. Pure measurement, no maths risk.",
+   "risk": "The floor may be the harness's CUPTI span itself (about 2.2 us floor per CAKE), so nothing can be removed.",
+   "test": "One 10-min B200 probe: 6 empty kernels (baseline, +200 KB dyn smem, +cooperative, +TMEM alloc 512, +clusterDim 4, all of these) timed under the harness's cupti methodology after a 2xL2 zero_ flush."
+  },
+  {
+   "id": "I10",
+   "title": "Hidden-split CTA pair with two tiles in flight (L)",
+   "family": "L overlap",
+   "design": "At L (HW 784/3136), replace the one-tile-per-SM round (fp32 h fills all 512 TMEM columns, so GEMM1, GELU, batch wait, pass 2 and GEMM2 run serially) with a 2-CTA cluster that splits the 512 hidden channels 256/256. Each SM holds one 128-token tile as 2 swap-AB blocks (hidden on lanes, 128 token columns) = 256 TMEM columns, so TWO tiles of fp32 h are resident. GEMM1 of tile i+1 and its GELU/sumsq run while tile i waits for the batch counter and does pass 2 and GEMM2. GEMM2 accumulators (main + cross, 256 columns) reuse tile i's freed h columns, as e4 does. GEMM1 uses cta_group::2 (M=256 hidden across the pair, N=128 tokens), so each SM reads only half of X from smem. This cuts smem-read pressure from about 128 B/clk (N=128 1SM, the likely cause of the 54-70% co-run retention) to about 96 B/clk, and frees 32 KB of smem. GEMM2 stays 1SM. Each SM produces a partial out over its 256 hidden channels. Partials are summed through DSMEM (32 KB per tile) or a bulk reduce-add. Per SM-tile: MMA 6.1k clk, epilogue about 5-6k clk (256 channels x 128 tokens x about 2 MUFU / 16 = 4.1k MUFU clk plus split), overlapped. Weights per tile per SM drop from 512 KB to 256 KB, with the W1 half pinned in smem. 64,56,56: 1568 tiles x 2 halves / 148 SMs = 21.2 tile-halves per SM x about 6.1k clk = 130k clk = 86 \u00b5s, plus prologue and tail, so about 100-110 \u00b5s rented against about 250 now.",
+   "p_expert": 0.15,
+   "effect": "L: -50..-60% (64,56,56 326 -> about 150 portal; 64,28,28 104 -> about 55). Score about +0.05..+0.06. M rows with at least 98 tiles: -10..-20%.",
+   "risk": "TMEM budget (two tiles x 256 columns leaves no spare for GEMM2 accumulators, which must reuse freed columns), cta_group::2 descriptor/commit multicast complexity, deadlock in cluster barriers. The batch counter waits of tile i may still be exposed if the batch spans more tiles than the grid.",
+   "test": "Probe about 10 min: a kernel that only does GEMM1 (cta_group::2, N=128) on 2 resident tiles plus a fake GELU spin of 4k clk per tile. Time it against 1SM N=128 and against serial. Check MMA/epilogue overlap efficiency and smem-bound behaviour. Also stamp e4 with globaltimer per phase at 64,56,56 to confirm how much of a round is serial."
+  },
+  {
+   "id": "I11",
+   "title": "Weight slices as the A operand from TMEM at small N (S fan-out rows)",
+   "family": "operand path",
+   "design": "At 784 and 1568 tokens the MMAs are N=32/64 and the smem operand port (A 4 KB + B 1-2 KB per k-step = 41-49 clk) binds them, 2.5-3x above the tensor ideal of 16-32 clk. tcgen05.st the hi/lo W1 slice (128 lanes x 64+64 columns) and W2 slice (128 columns) into TMEM straight from the LDG registers (skipping the SW128 STS), use the tcgen05.mma A-from-TMEM form (CUTLASS SM100_MMA_F16BF16_TS), leaving D1 and D2 main/cross in the remaining 256 columns. Only B (x, x2 hi/lo) goes through smem.",
+   "p_expert": 0.1,
+   "effect": "GEMM1+GEMM2 at 784 tokens: 48 MMAs x 41 clk = 1.3 us -> 48 x 16 = 0.5 us (-0.8 us, -7% at 1,28,28); at 1568: -0.5 us (-4%). Also saves the W STS and its fence. No effect at N >= 112 where the port limit equals the tensor limit.",
+   "risk": "The TMEM A layout for kind::f16 (packed pairs along K per 32-bit column) is unverified by us; the fixed chain (ingest, barrier, red.add) is 85% of the S time, so the ceiling is small and the cheapest allocation prices 1,28,28 at -0.8%.",
+   "test": "Single-CTA probe: 24 MMAs A-from-TMEM vs A-from-smem at N=32 and N=64, clock64 around issue+commit; correctness against the smem version."
+  },
+  {
+   "id": "I12",
+   "title": "GEMM2 split into P0 + m*Q so only a scalar crosses the global barrier (S fan-out)",
+   "family": "maths rewrite",
+   "design": "x2 = h(1 + gw nf) + gb with nf = G m, m = 1/(mean G + eps). So out = GEMM2(h) + m * GEMM2(h gw G) + (W2 gb + b2). In the fan-out, P0 = GEMM2(h) runs on each slice CTA right after GELU, before any sync; G for the CTA's own 128 channels needs only the sumsq of the same-slice CTAs of its batch (28-32 CTAs, a slice-level counter), after which Q = GEMM2(h gw G) runs; the 512-channel mean (global) is read last and applied as out = P0 + m Q + bias in the red.add epilogue. The grid-wide dependency shrinks to one scalar read at the very end, when the global counter is almost surely already complete.",
+   "p_expert": 0.05,
+   "effect": "Removes most of the barrier skew (critic skeleton: +1.5 us for the barrier at 128 CTAs) and the post-barrier split latency from the chain, at the cost of a second GEMM2 (3 more passes, 0.65 us at N=32-112): net -0.5..-1 us on S rows (-4..-8%). Precision: h gw G <= ~700 in fp16 range; P0 and Q need separate main/cross accumulators: 4 x 112 = 448 TMEM cols at TT=98 after D1 is freed, fits.",
+   "risk": "The gain is only the skew between slice-level and grid-level arrival; if the barrier cost is the atomics' round trip rather than skew, nothing is saved and the extra GEMM2 costs 0.65 us.",
+   "test": "Stamp e2: time from a CTA's own arrival to barrier release, split into (last same-slice arrival) and (last global arrival). If the slice-level release is >= 0.8 us earlier on average, build it."
+  },
+  {
+   "id": "I13",
+   "title": "Cluster-of-4 hidden-slice fan-out at L and M with DSMEM split-K reduction",
+   "family": "fan-out",
+   "design": "Persistent clusters of 4 CTAs (37 clusters, 148 SMs); CTA s owns hidden slice s (W1 slice hi/lo 64 KB resident in smem). Per 128-token tile: x tile multicast to the 4 CTAs (64 KB hi/lo, one L2/DRAM read per cluster), GEMM1 slice swap-AB (24 MMAs, h slice = 128 TMEM cols, lanes = channels so sumsq is per-thread), red.add of 128 sumsq per batch, per-batch counter wait hidden under the next tile's GEMM1 (TMEM: 2 h slices 256 + D2 main/cross 256 = 512), h' slice into the dead x buffer, W2 slice [128 out][128 K] streamed per tile (64 KB), GEMM2 partial over K=128 (24 MMAs), then each CTA pushes 3 x 16 KB partial quarters to its partners with st.async + mbarrier and sums its own 32 output channels, storing 128 B per token. No weight re-stream (0.5 KB/token of W2 only), no red.add on the output, no grid barrier.",
+   "p_expert": 0.25,
+   "effect": "MMA per tile per SM 48 x 66 clk = 2.1 us, 42 tiles per cluster at 64,56,56 -> 89 us of MMA, weight ingest 2.7 MB per SM total (trivial). DSMEM 48 KB in per tile at 12-25 B/clk = 1.3-2.7 us; if async-overlapped, round ~2.5 us -> ~110 us rented (-55% at L); if serial, ~4.5 us -> ~190 us (-25%). At 6272/12544 tokens the same kernel in one-shot form replaces e1 (see next idea).",
+   "risk": "DSMEM measured at only ~12 B/clk per SM in #129 H13 (16-CTA clusters); at that rate the reduction equals the MMA time and must fully overlap. Cluster launch penalty on the portal. Smem traffic per SM is higher than token-stationary (each SM touches x and h' for 4x the tokens).",
+   "test": "Cluster-4 probe at 148 CTAs: each CTA st.async's 3 x 16 KB to partners and waits on an mbarrier, repeated 40 times; report clk per 48 KB. Go if < 2k clk."
+  },
+  {
+   "id": "I14",
+   "title": "One-pass stats prepass + streaming recompute (HW=3136 rows)",
+   "family": "stats prepass",
+   "design": "Long shot. Split the work as a stats pass with a SINGLE FP16 hi-only MMA pass of GEMM1 (K=128; a 1-pass error of about 3e-3 absolute on a, which is random across tokens), approximate GELU + sumsq in the epilogue, then a barrier, then a fully streaming main pass: GEMM1 (3 passes) -> exact GELU -> fold s_b in registers (s = 1+gw nf) -> hi/lo -> GEMM2 (3 passes), chunked by 128 hidden channels so TMEM = 2x128 (acc1 double buffer) + 256 (GEMM2 main + cross) = 512, with no TMEM-full stall and no batch wait in the main loop. For HW=3136 (rows 16,56,56 / 32,56,56 / 64,56,56 and 2,56,56 / 4,56,56) my estimate of the G relative error is 2 x 3e-3 / (sqrt(3136) x 8) = about 7e-6, which gives 22 x 8 x 7e-6 = about 1.2e-3 on out, a 0.4 err/tol contribution. MMA total 7 passes = 112 clk/token (+17%), epilogue GELU twice but the first only with a cheap form. Fully pipelined: about 150-170 clk/token = 100-110 \u00b5s at 64,56,56 against about 250 rented now.",
+   "p_expert": 0.08,
+   "effect": "L HW=3136 rows: -45..-55% if precision holds (about +0.02 on those three rows); no effect where it fails the gate (HW<=784).",
+   "risk": "Precision: at 784 tokens the estimate is 1.3e-5 on G, which fails the 0.8 gate; the extra MMA pass; two phases means two barriers (prepass to main).",
+   "test": "Numpy/torch emulation (fp16-rounded x and W, fp32 accumulate) of G error and final out err/tol at HW=196, 784, 3136, 10 seeds. Ship only if the worst err/tol <= 0.5 at 3136."
+  },
+  {
+   "id": "I15",
+   "title": "Exact-accumulate INT8 slices (Ozaki) for the cross terms",
+   "family": "precision engine",
+   "design": "Long shot. Quantise x and W per row to 3 int8 slices (21 bits aligned to the row max; absolute error about 1.7e-6 x |x|max, below the 5e-6 relative budget), compute the 6 slice products with i+j <= 2 on tcgen05 kind::i8 at 2x the FP16 rate (3 FP16-equivalent passes, the same as FP16x3), with exact int32 accumulation. The point is not fewer MMA passes (equal) but the accuracy: int32 accumulation removes the fp32 accumulation rounding that currently dominates err/tol (0.44-0.78). That frees budget to drop terms. With exact accumulation the two cross slices need only about 2% accuracy, so GEMM2 could use 2 slices of h (14 bits, with per-row scale) x 3 slices of W2 (4 products = 2 FP16-equivalent passes instead of 3). Saves about 1 of 6 passes (16 clk/token).",
+   "p_expert": 0.05,
+   "effect": "MMA -10..-16% at L; only matters once epilogue is hidden. +0.005 at best.",
+   "risk": "Per-row max alignment loses small elements; the h range (a std 11, h up to 40) needs per-token or per-block exponent; slice extraction costs CUDA-core slots comparable to the fp16 split; may be net zero.",
+   "test": "fp64 emulation in numpy on the harness distribution: err/tol per row for (a) 3x3 slices with i+j<=2, (b) the 2x3 variant for GEMM2. Proceed only if worst err/tol <= 0.5."
+  },
+  {
+   "id": "I16",
+   "title": "Producer/consumer SM roles linked by an L2-resident h queue, with per-batch folded W2",
+   "family": "SM role split",
+   "design": "One persistent launch with two warp-uniform CTA roles. Producers (~74 SMs) run GEMM1 FP16x3, GELU (idea 1), sumsq and the hi/lo split of h. They write fp16 hi/lo h (2 KB per token) into a ring workspace of about 2 batches (12.8 MB at HW=3136) with st evict_last, reusing the same addresses so the lines stay dirty in L2 and are never written back mid-run. Fold s_b into W2: out = h (W2 o s_b)^T + (W2 gb + b2). The last producer to arrive for batch b builds the W2'_b hi/lo image (256 KB) into an L2 workspace. Consumers (~74 SMs) are then pure TMA to MMA: A = h hi/lo straight from the queue, B = W2'_b, with no CUDA-core work except the out drain. TMEM no longer has to hold h across the stats wait: the queue absorbs it, and both roles keep their MMA busy.",
+   "p_expert": 0.12,
+   "effect": "At 64,56,56 the MMA is 87 us total, split across the roles. Producer CUDA core with idea 1 is about 2x the per-SM GELU density, about 75 us on 74 SMs, so it is balanced near ~100-115 us. L2 traffic is 822 MB of h write plus read at about 20 TB/s, about 41 us, overlapped. DRAM sees only x, out and the one-time flush write-backs. L -55..-65%; M rows with HW=3136 about -50%. No gain at S (keep B or idea 3).",
+   "risk": "H10 (L2 residency under the dirty flush) is unproven. Cross-die L2 runs at 16.8 TB/s. The producer/consumer balance is fixed at compile time, while the GELU/MMA ratio differs per row. Consumers stall if the last-arriver W2' build (64K elements times about 4 ops, about 0.2 us on 512 threads) sits on the critical path.",
+   "test": "Run the r1-c H10 probe that was written but never run: 148 CTAs write 13 / 26 / 76 MB with evict_last after a 2xL2 zero_, then re-read with globaltimer stamps. If 13 MB re-reads at > 10 TB/s aggregate, the queue is viable."
+  },
+  {
+   "id": "I17",
+   "title": "Weight-image kernel + PDL main kernel",
+   "family": "launch split",
+   "design": "Split the phase-0 work (fp32 -> hi/lo weight images, b2' = W2.gb + b2, gsum zero) into a 148-CTA kernel of about 1 \u00b5s, then launch the main kernel on the same stream with programmatic dependent launch. The main kernel's prologue (barrier init, TMEM alloc, x tile load/convert) overlaps kernel 0's tail, and griddepcontrol.wait replaces the in-kernel grid counter spin (g_ctr[0]). This removes the phase-0 counter chain and the cooperative-launch cap from the first half of the kernel. PDL between our own kernels on the current stream is allowed. The cost is a second launch (+1-2 \u00b5s gap risk).",
+   "p_expert": 0.3,
+   "effect": "S/M A-path rows: -0..-3 \u00b5s (21-36 rented -> 19-33); L: none. +0.002..+0.006. Risk that the portal erases launch savings, as seen in #35 r8.",
+   "risk": "Gap plus second launch; cooperative launch is incompatible with PDL attributes in one call; two kernels in the CUPTI window.",
+   "test": "On the rented B200, time the A path at 1,28,28 and 64,14,14 with phase 0 in-kernel vs split, interleaved in one container, 20 runs each. Needs a win > 1 \u00b5s rented."
+  },
+  {
+   "id": "I18",
+   "title": "Die-aware work assignment",
+   "family": "die placement",
+   "design": "Long shot. Each CTA reads %smid and %nsmid at start. Batches are assigned to a die (SM ids 0-73 / 74-147 if the mapping is that, which a probe would confirm), and CTAs claim tiles of their die's batches. Per-batch gsum and counters then stay in one L2 partition, so atomics cost about 90-100 ns instead of 190-220, and the spin waits (the per-round serial term) shorten. Weight images and x are read from the local partition more often. For the A/e4 path this cuts the per-round counter chain; for idea 2 clusters are already die-local.",
+   "p_expert": 0.05,
+   "effect": "L: -3..-6% (counter chain about 3 \u00b5s of 25 per round, halved); S/M: -0..-1 \u00b5s. +0.003..+0.006.",
+   "risk": "The SM id to die mapping is not documented; dynamic claim counters add an atomic; the dies' tile counts must balance (74 + 74 SMs, 18816-token rounds).",
+   "test": "10-min probe: pairs of SMs ping-pong an atomic counter; print latency by (smid_a, smid_b). A bimodal map shows the die boundary."
+  },
+  {
+   "id": "I19",
+   "title": "Batch-resident cluster, DSMEM stats, no global sync (S/M)",
+   "family": "cluster GRN",
+   "design": "Make one cluster = one batch, so the GRN dependency never leaves the cluster. HW=196: tile = whole batch, N=196 token columns (swap-AB), cluster of 4 CTAs, each owning 128 hidden channels. Each CTA holds h for the whole batch in 196 TMEM columns, so its per-channel sumsq is complete inside the CTA. The per-batch mean of G is a 4-way DSMEM exchange plus cluster barrier (hardware, about 0.3-0.5 \u00b5s). The GEMM2 partial (196x128 fp32) is reduced across the 4 CTAs through DSMEM into the batch's output. HW=784: cluster of 8 splits tokens (98 per CTA, N=112 padded, all 512 hidden) with a 512-float DSMEM sumsq reduce. Weight images are made cluster-private: each CTA converts 1/8 of the fp32 weights (about 0.4 \u00b5s of issue) to hi/lo into a per-cluster scratch region, then cluster barrier + fence.proxy.async, then bulk reads. This replaces the phase-0 grid barrier, the gsum zeroing by CTA 0, the global batch counters and their acquire spins. Rows covered: 8,14,14 (8x4=32 CTAs), 16,14,14 (64), 32,14,14 (128), 1,28,28, 4,28,28, 16,28,28 (128). Others use persistent cluster rounds. Estimated 8,14,14 chain: launch 3 + ingest 1.2 + convert 1.7 + GEMM1/GELU 2.5 + cluster barrier 0.5 + pass 2 1 + GEMM2 1.6 + reduce/store 1 = about 12-13 \u00b5s rented against 22.1 now.",
+   "p_expert": 0.2,
+   "effect": "S/M rows with HW 196/784: -30..-45% (8,14,14 22 -> about 13; 32,14,14 28 -> about 16; 16,28,28 32 -> about 18 rented). Worth +0.02..+0.03 by the dMean table (these rows have 4-7e-4 per \u00b5s).",
+   "risk": "Quantisation of cluster rounds for 64 batches on 18 cluster slots (about 10% waste); the non-portable size 16 may not be needed; the 2-5% clustered-grid penalty on the portal; M=64 half-lane layouts if h per CTA must be reduced.",
+   "test": "Probe: launch 18 clusters of 8 and measure cluster barrier + DSMEM 512-float reduce latency (stamps) against the global counter chain (atomicAdd + ld.acquire spin over 148 CTAs). Expect about 0.5 \u00b5s vs 2-4 \u00b5s."
+  },
+  {
+   "id": "I20",
+   "title": "GELU slot rebalance: MUFU vs FMA pipes",
+   "family": "epilogue slots",
+   "design": "The A&S gelu2 costs 2 MUFU (rcp + ex2) per element. MUFU runs at 16/clk/SM, so 64 clk/token is the binding pipe against about 48 clk of issue. Move about 25% of elements to FMA-pipe forms: exp2 via cvt.rni + degree-5 FMA + shift/add (about 9 slots) and rcp via integer-magic seed + 2 Newton steps (about 5 slots), run as pairs in f32x2. Give each thread a fixed mixed batch of 16 elements (12 via MUFU, 4 via FMA) so no divergence. Re-fit the erfc polynomial to an absolute h error of about 5e-6 (budget: max h error per element about 1e-5 for out error <= 1e-3, see the 0.8 ship gate). Dropping one coefficient saves 1 FMA2 per pair. Fold b1 into the GEMM as an extra K=16 augment: +6 clk of MMA, -1 slot of 14. Target about 40-44 clk/token for the epilogue against 64+, at 64,56,56 = 1356 tokens x 22 clk / 1.5 GHz = about 20 \u00b5s saved if epilogue-bound after ideas 1/4, nothing if not.",
+   "p_expert": 0.35,
+   "effect": "L: -5..-10% by itself (serial), -15..-20% once overlapped (binding pipe). Also helps A-path S/M by about 1 \u00b5s. +0.01..+0.02.",
+   "risk": "Exp2-via-FMA mantissa edge cases (denormals clamp), integer-magic rcp accuracy near t=1, precision gate on err/tol per row. The pair interleaving can raise registers over 112.",
+   "test": "Microbench on the rented B200: 128 threads x 16 warps run gelu2 over TMEM-sized data with 0/25/50% FMA-path mix, in cycles (clock64), in isolation and co-running with an MMA loop. Check abs error of h vs fp64 erf GELU."
+  },
+  {
+   "id": "I21",
+   "title": "Replicated weight images: CTA i streams replica i mod R",
+   "family": "weight stream",
+   "design": "Keep lineage A's token-stationary kernels (e1 at S/M, e4 at L) but have phase 0 write R=8..16 copies of the 512 KB hi/lo weight image (4-8 MB, L2-resident, <1 us of extra writes spread over 148 CTAs); the ring of CTA i bulk-copies from replica i mod R. Nothing else changes. Removes the lock-step hot-spot where 148 SMs request the same 256 lines of each 32 KB unit at the same moment (about 300 requests per slice-line, 38 KB per slice per unit, 0.4-0.8 us per unit at 64-128 B/clk per slice; 16 units per round).",
+   "p_expert": 0.2,
+   "effect": "If the hot-spot is real: M rows on e1 (6272/12544 tokens) lose 6-10 us of the 19 us chain (-25..-35%); L rounds drop from ~24 to ~17 us rented (-25%); S rows run the fan-out (28-32 CTAs per slice) so -0..-5%. If per-unit latency is pure L2 trip, no gain.",
+   "risk": "The chain may be MMA-commit-to-refill latency (ring depth) rather than slice contention; then the pending e1-ring variant captures it and replicas add nothing.",
+   "test": "148-CTA probe, one per SM: 16 serial 32 KB bulk copies through a 3-stage ring with no MMAs, (a) all CTAs reading one image, (b) each reading replica cta%16, (c) each a private copy; globaltimer per unit. Belief moves if (a)-(b) > 0.3 us per unit."
+  },
+  {
+   "id": "I22",
+   "title": "Cross-round overlap through freed TMEM columns (L)",
+   "family": "round overlap",
+   "design": "A cheaper alternative to idea 1 on the existing e4 layout. After pass 2 converts hidden blocks 0/1, GEMM2's main and cross accumulators occupy TMEM columns 0-255; blocks 2/3 (columns 256-511) are free once their pass-2 conversion is done. Start the NEXT round's X' hi/lo conversion and GEMM1 for hidden blocks 2 and 3 into columns 256-511, with their GELU, while the current round's GEMM2 MMAs, output epilogue and its tail run. The next round's blocks 0/1 start when the accumulators drain. Re-split h' staging into 32 KB (64-channel) granules, use a 2-stage 32 KB weight ring (64 KB) and a 64 KB X' buffer. This should still fit in 227 KB. Per round that hides about half of GEMM1 MMA (2k clk) + GELU of 2 blocks (about 4k clk) behind GEMM2 (6.1k clk) + store. A saving of 4-6 \u00b5s of about 22-25 per round.",
+   "p_expert": 0.3,
+   "effect": "L: -15..-22% (64,56,56 326 -> about 265 portal). About +0.015..+0.02.",
+   "risk": "smem budget, mbarrier phase bookkeeping across rounds, the per-batch counter wait of round r+1 now overlaps round r's tail so order violations must be avoided. Gain is smaller if pass 2 is the larger serial term.",
+   "test": "Stamp e4 at 64,56,56: start to GEMM1 done, GELU done, counter released, pass 2 done, GEMM2 done, out stored. The idea needs (GEMM2 + out) >= 5 \u00b5s per round of otherwise idle MUFU."
+  },
+  {
+   "id": "I23",
+   "title": "Fan-out for the 6272-token rows: TT=196 x 4 slices = 128 CTAs, W2 slice streamed into W1's space, GEMM2 in two N-halves",
+   "family": "fan-out",
+   "design": "Extend e2 to 2,56,56 and 32,14,14 (both run e1 at 25-28 us rented): tile of 196 tokens (divides 784 and 3136; 196-token tiles never straddle a batch at HW=196/784/3136), 4 hidden slices, 128 CTAs. smem: x hi/lo 100 KB + W1 slice hi/lo 64 KB; after GEMM1 commits, bulk-copy the W2 slice hi/lo (64 KB) over the W1 image; x2 split reuses the x buffer. TMEM: D1 128 x 208 = 208 cols, h kept in registers as e2 does (52 floats/thread; 16 warps), GEMM2 in two token halves of 104 so D2 main+cross = 2 x 104 = 208 cols reuse D1's. Reduction by red.add as e2 (6272 x 4 x 512 B = 12.8 MB, ~3 us) or by the cluster-4 DSMEM path.",
+   "p_expert": 0.4,
+   "effect": "Per CTA: ingest 164 KB (1.2 us + DRAM latency), GEMM1+GEMM2 48 MMAs at N=208 tensor-bound 104 clk = 3.3 us, GELU 49 elem/thread 0.4 us, barrier 1.5, split 0.5, red.add 2-3 us: ~12-14 us rented vs 25.3/28.3 (-45..-55% on the two 6272 rows, which the cheapest allocation prices at -23% and -50%). 12544 tokens does not fit (x 100 KB + 2-slice W1 128 KB) and stays token-stationary.",
+   "risk": "Register pressure at 512 threads (h 52 + x2 split temporaries) may spill (e2 at TT=98 is 125 regs); red.add volume at 4 slices x 6272 tokens is 12.8 MB and may cost 3+ us unless replaced by DSMEM or bulk reduce.",
+   "test": "Compile e2 with TT=196 for sm_100a and read regs/spills; then run_tests on 2,56,56 only with globaltimer stamps at barrier entry and after red.add."
+  },
+  {
+   "id": "I24",
+   "title": "Tail-form GELU: relu(u) - exp2(-t^2/2)*P(t), packed f32x2 epilogue",
+   "family": "epilogue issue diet",
+   "design": "Replace erff GELU in every lineage by GELU(u) = max(u,0) - c(|u|). Here c(t) = t*Phi(-t) = exp2(-t^2*log2e/2) * g(min(t,5.75)), and g(t) = t*Mills(t)/sqrt(2pi) is smooth, monotone, from 0 to 0.399. Fit g with a weighted minimax polynomial of degree 7-9; the weight exp(-t^2/2) relaxes the fit fast for t > 3. Beyond 5.75, c < 1.3e-7, so GELU = relu exactly. u ~ N(0, 11.3^2), so 66% of elements sit in the relu regime, and the error there is nil. Cost: 1 MUFU.EX2 plus about 9 FMA-pipe ops per element, issued as fma/mul/add .f32x2 (inline PTX), which halves them. Also packed: the bias add, the sumsq FFMA2, and cvt.rn.f16x2.f32 plus a packed sub for the hi/lo split. The epilogue drops from about 40 to about 10-12 issue slots per element. MUFU then floors at 65536/16 = 4.1k clk per 128x512 tile (2.7 us). If the FMA side drops below that, emulate exp2 on the FMA pipe for about 1/4 of the elements.",
+   "p_expert": 0.18,
+   "effect": "L (e4 rounds): epilogue per 128-token round 13.7 -> ~3.5 us, so the round becomes MMA-bound at about 11-15 us instead of 29.7 portal. 64,56,56: 326 -> ~170 us (-45%); 32,56,56: 184 -> ~100. M (A path, 85-96 tokens per CTA, GELU ~9 us of 30-36 rented): -15..-25%. S (B fan-out, GELU ~2 us of 11.6-16.7): -8..-12%. predict_score at S -10 / M -20 / L -45: 0.797 (+0.075).",
+   "risk": "Polynomial accuracy. h needs |dh| <= ~2e-6, because out error is about 190*dh_max after 512-term sums with |s| up to 4 against atol 2.8e-3. A degree high enough to get there may cost more than budgeted. nvcc may not emit FFMA2 from intrinsics. MUFU becomes the binder.",
+   "test": "10 min numpy: fit g on [0,5.75] in fp64 with weight exp(-t^2/2), then evaluate the float32 Horner times exp2 (2^-22 rel) on a dense u grid in [-60,60]. Report max |GELU - exact|; ship if <= 1e-6. Then compile a 32-element micro-epilogue for sm_100a and count SASS issue slots per element."
+  },
+  {
+   "id": "I25",
+   "title": "Pre-barrier operand finalisation in token-stationary rounds: folded W2'_b plus GEMM2 A from TMEM",
+   "family": "algebraic fold + TMEM-A",
+   "design": "In e4 rounds, the post-barrier pass re-reads h from TMEM, forms x2 = h*s + gb, splits it and stages it through two 64 KB smem buffers with pfree waits. Fold s_b into W2 and gb into the bias (b2' = W2 gb + b2, fp32, once per call). GEMM2's A operand then becomes h itself, so the GELU pass converts it at once: blocks 0-1 to SW128 hi/lo in smem (128 KB), blocks 2-3 in place in TMEM as packed fp16 hi/lo (same 128 columns per block), used through the tcgen05.mma A-from-TMEM form. The last arriver of each batch writes the W2'_b hi/lo image into L2 (256 KB per batch, 16 MB at B=64). After the wait, GEMM2 is pure MMA streaming W2'_b. Use 112-token tiles (M=128) for HW=784/3136 so tiles are batch-pure; keep the unfolded path for HW=196.",
+   "p_expert": 0.12,
+   "effect": "Removes about 65536 x 5 issue slots per round after the barrier (2.6k clk, 1.7 us), the second TMEM read and the pfree serialisation of blocks 2/3. The serial chain per round becomes wait -> 4.1 us MMA -> drain. On top of idea 1, L -10..-15% (64,56,56 ~170 -> ~145 us); 112-token tiles cost 12.5% of the MMA, so this pays only where the wait plus post-pass exceeds ~1.5 us.",
+   "risk": "The A-from-TMEM layout for kind::f16 (packed fp16 pairs per column) has not been verified. The 12.5% padding may eat the gain. Idea 2 supersedes this if it works.",
+   "test": "A 10-min B200 unit test: one 128x128x64 tcgen05 MMA with A from TMEM (packed fp16 via tcgen05.st) against a reference, plus a numpy check that the folded W2'_b split gives err/tol <= 0.5 on 3 shapes."
+  },
+  {
+   "id": "I26",
+   "title": "Recompute pipeline: stats launch then fused GEMM1-GELU-scale-GEMM2 launch, no grid barrier, no TMEM retention",
+   "family": "recompute",
+   "design": "Launch 1 (persistent, 1-2 CTAs/SM): GEMM1 swap-AB block by block with two 128-column accumulators in ping-pong, GELU+sumsq epilogue on block b overlapping MMA of block b+1, red.add of per-batch sumsq, nothing retained. Launch 2 with PDL: each CTA computes the GRN scale for its batch in the prologue (512 sqrt + mean, 2 KB from L2), then per 128-token tile GEMM1 block -> GELU -> scale -> h' hi/lo into smem (one 64 KB block buffer) -> GEMM2 K-chunk accumulate into D2 main/cross (256 cols) while GEMM1 of the next block runs in the other D1 accumulator (TMEM 2 x 128 + 256 = 512). Weight ring 3 x 32 KB; both launches read weights from the hi/lo image produced in launch 1's phase 0. Revives H5 with the issue arithmetic: exact GELU is 136 issue slots per token over 4 SMSPs = 34 SM-clk per token = 31 us per pass at 64,56,56, under the 43 us MMA of one GEMM1 pass.",
+   "p_expert": 0.3,
+   "effect": "64,56,56: MMA 9 passes = 130 us, GELU 2 x 31 us overlapped, weights 6 KB/token = 58 us overlapped, launch gap ~3 us: 150-190 us rented vs 260 (-30..-45% at L, portal 326 -> ~200-235). M: two launches cost 3-5 us of a 25-36 us row; roughly neutral unless the e1 chain stays at 19 us. S: not used.",
+   "risk": "MUFU-heavy epilogue warps slow the MMA/producer warps sharing their SMSP by 30-40% (#129 K), pushing 130 us toward 180; the weight hot-spot (idea 1) applies twice; two launches on the portal run at ratio 1.40-1.55 on small rows (#129 A).",
+   "test": "Build launch 1 alone (it is half of e4) and time it at 64,56,56 and 16,28,28 with stamps; go if <= 60 us at 64,56,56 (43 us MMA ideal)."
+  },
+  {
+   "id": "I27",
+   "title": "Half-tile TMEM ping-pong at L: GEMM1 of tile i+1 overlaps GRN wait, split and GEMM2 of tile i",
+   "family": "token-stationary overlap",
+   "design": "Mutate e4: 64-token half-tiles, two independent TMEM halves (4 x 64 h columns each plus GEMM2 main/cross accumulators placed in freed h columns as e4 already does). Warp roles: MMA warp alternates halves; epilogue warp-groups 0-1 own half A, 2-3 own half B; the per-batch counter wait of half A hides under GEMM1 of half B. smem: ring 4 x 32 KB + x 32 KB + h' 2 x 32 KB = 224 KB. Weight traffic doubles (512 KB per 64 tokens), so pair with replicas/multicast.",
+   "p_expert": 0.45,
+   "effect": "Round-equivalent (128 tokens) goes from ~24 us serial to max(MMA at N=64 port-bound 192 x 50 clk x 2 = 12.8 us, weight ingest 2 x 512 KB at 93 B/clk = 7.4 us, SIMT epilogues 5.4 us) = 13-15 us: -40% at L (326 -> ~195 portal). If smem read and write ports are shared, operand reads 1.15 MB + writes 0.5 MB per 64 tokens = 8.8 us per 64 tokens: only -20%.",
+   "risk": "N=64 MMAs are 56% less efficient (port bound) and weight bytes per token double; if the smem port is shared between bulk writes and MMA reads the design nets little. The e4 base kernel's round time is itself unmeasured (no stamps).",
+   "test": "e4 with t=64 and no overlap, stamped: per-round MMA time and weight-ring stall at 64,56,56. If MMA+ring per 64 tokens < 9 us the overlap version is worth building."
+  },
+  {
+   "id": "I28",
+   "title": "M-row hidden-slice items, weights-stationary, bulk reduce-add",
+   "family": "slice items",
+   "design": "For N <= 12544 tokens (the 7 M rows and 3136-token S rows), use a persistent cooperative grid of 148 CTAs over items = (token tile, 128-channel hidden slice). Swap-AB: hidden channels on lanes, tokens on columns, tile N = 128 (12544 tokens) or 64 (6272 tokens), giving 392 items = 2.65 per CTA. Each CTA keeps one hidden slice for its whole life: W1 slice and W2 slice hi/lo = 128 KB resident in smem, built once from 128 KB of fp32 (1.1 \u00b5s ingest plus about 1.7 \u00b5s convert, overlapped with the first x tiles). No 512 KB per-CTA weight ring, no weight-image phase 0, no grid barrier for the images. h for up to 3 items sits in TMEM (3 x 128 columns). Per-channel sumsq is complete per lane over the items of one batch. There is one grid barrier for G and m. After pass 2 each item's GEMM2 partial (128 out x tokens, K=128 slice) is added into out with cp.reduce.async.bulk.add.f32 from smem (L2-side reduce, no per-thread red.add). The slice-0 CTA prefills out with b2 + W2.gb before the barrier. MMA per SM = 392 items x 3k clk / 148 = 7.9k clk = 5.3 \u00b5s. Estimated 12544 tokens: launch 3 + weights 1.7 + GEMM1/GELU 4 + barrier 2 + GEMM2/pass 2 3 + reduce/store 1.5 = about 15-17 \u00b5s rented against 30-36 now.",
+   "p_expert": 0.25,
+   "effect": "M: 64,14,14 / 4,56,56 / 16,28,28: 30-36 -> about 16-18 rented (-45%); 6272-token rows 25-28 -> about 14-16. 3136-token S rows possibly 16.5 -> about 13. Worth about +0.03 on M.",
+   "risk": "Out reduce traffic is 4x the output bytes (25 MB at 12544 tokens; not viable at L); bulk reduce ordering against the prefill needs a fence and the barrier; 227 KB smem is tight with resident weights + x tile + h' staging; uneven 2/3 items per CTA (makespan = 3 items).",
+   "test": "Probe: 148 CTAs, each issues 3 x 64 KB cp.reduce.async.bulk.add.f32 into one 6.4 MB out region (4 slices race on the same tiles) after a 2xL2 zero fill. Time against red.global.add.v4.f32 per thread. Pass if under 2 \u00b5s."
+  },
+  {
+   "id": "I29",
+   "title": "Use the register file as a third h store so the next round's GEMM1 overlaps the stats wait",
+   "family": "register-resident h",
+   "design": "Per SM the register file is 256 KB, the same as TMEM. In e4 rounds, the GELU epilogue warps (say 8 warps x 32 threads x 128 regs) keep GELU'd h for blocks 0-1 (128 KB) in registers instead of writing it back to TMEM. That frees 256 TMEM columns, so round r+1's GEMM1 for blocks 0-1 starts while round r waits for its batch statistics. After the wait, the register-held h is scaled, split and written straight into the SW128 smem staging (no TMEM round trip). Blocks 2-3 follow the existing path. The register budget is about 64K = 8 epilogue warps x 128 regs plus 4 lean warps for TMA, MMA and the remaining epilogue, using setmaxnreg to rebalance (sm_90+).",
+   "p_expert": 0.05,
+   "effect": "Hides the GELU tail and the grid wait (about 3-5 us of the 29.7 us portal round, more after idea 1 shortens the round) and removes one TMEM st/ld per element for half of h. L -10..-20% on top of idea 1.",
+   "risk": "Spills (there is no headroom: a single extra register per thread spills). setmaxnreg semantics with tcgen05 warps. Dynamic indexing into a register-resident array forces local memory, so the code must be fully unrolled.",
+   "test": "Compile a mock epilogue for sm_100a holding 128 floats per thread across a spin-wait with setmaxnreg.inc 232 / dec 40; check 0 spill bytes and the SASS for LDL/STL."
+  },
+  {
+   "id": "I30",
+   "title": "TMA multicast of weight units across clusters of 8",
+   "family": "weight stream",
+   "design": "Launch the persistent token-stationary grid as 18 clusters of 8 (144 CTAs, 4 SMs idle) with cooperative + cluster attributes. Each weight unit (32 KB) is fetched by the 8 CTAs as 8 x 4 KB slices with cp.async.bulk .multicast::cluster, each slice landing in all 8 CTAs' smem and signalling each CTA's full barrier via complete_tx. Per-SM ingest is unchanged (512 KB per tile) but L2 read traffic per round falls from 76 MB to 9.5 MB and request count by 8x, and each CTA issues 1/8 of the copies so the ring can be deeper at the same issue cost.",
+   "p_expert": 0.3,
+   "effect": "Same target term as the replicas (hot-spot and L2 bandwidth, 3.6 us per round of pure L2 time at L): -15..-25% at L, -20..-30% on e1 M rows. 2-5% cluster launch penalty on the portal (tricks.md) and 2.7% idle SMs eat part of it.",
+   "risk": "Cluster-8 co-scheduling of 224 KB CTAs may fail or serialise on B200 GPCs (18.5 SMs per GPC); the cluster constraint allows it only because the grid is one wave; multicast complete_tx accounting across 8 barriers is easy to get wrong (hang).",
+   "test": "Same probe as replicas with a cluster-8 multicast variant; compare per-unit latency and the launch-to-first-copy time against the plain cooperative launch."
+  }
+ ],
+ "leader_stories": [
+  {
+   "story": "Stored-h bandwidth design. K1 runs GEMM1 FP16x3, GELU and a split, writes h as fp16 hi/lo (2 KB/token) and accumulates sumsq. K2 is a pure TMA-fed FP16x3 GEMM2 with the GRN scale folded into a per-batch W2 (or applied on load). DRAM traffic is about 5 KB/token: 1.03 GB at 64,56,56, about 146 us at 7.05 TB/s plus about 8 us of ramps, matching the implied 153.8 us. Two small launches at about 5 us each match the implied 10.5 us at 1,28,28.",
+   "consistent_with": "The implied L times scale almost linearly with tokens (0.72-0.77 ns/token, a bandwidth signature rather than an MMA one). Lineage C's own note puts this exact traffic at about 145 us. Our compute-bound kernels are 2x slower because the erff epilogue (about 145 us of issue at 64,56,56) is serialised with the MMA, which a streaming K2 never has.",
+   "test": "Time a memory-only skeleton on the rented B200 at 64,56,56 and 32,56,56: K1 reads x and writes 2 KB/token, K2 reads it and writes out, with no maths. If it lands at 145-160 us and 75-85 us, this story is achievable and sets a floor that idea 2 must beat."
+  },
+  {
+   "story": "MMA-efficient in-TMEM design with a cheap GELU. FP16x3 at 65-80% tcgen05 utilisation at L: GELU via a polynomial/exp form at about 10 issue slots per element, overlapped with the MMA by warp specialisation. 64,56,56 then runs about 110-130 us (score about 0.90). The S/M rows are mediocre, like ours (about 0.80), and the mean of 0.854 comes from L rows near 0.9.",
+   "consistent_with": "The equal-S assumption is only an assumption (ledger note). Mean 0.854 = (5 L rows x 0.90 + 5 M x 0.85 + 4 S x 0.80)/14 fits. The MMA floor of 87 us makes about 110 us plausible, and our 326 us is about 2.2x the GELU-issue bound, which they would have removed.",
+   "test": "Idea 1's 10-min numpy and SASS count: if the epilogue reaches <= 12 issue slots per element, e4 plus idea 1 projects about 150-170 us. Also back out the leader's per-workload profile, if the board ever shows rows, from geomean latency vs mean score: an L-heavy profile gives a lower geomean than equal-S."
+  },
+  {
+   "story": "Fan-out everywhere with batch-local or cheap GRN synchronisation. Hidden slices across SMs (or clusters) with resident weights, so no SM ever streams 512 KB per tile. The rows with HW=196/784 (9 of 14) never cross a grid barrier, and S/M rows reach about 6-12 us (scores 0.88-0.93). L rows are only moderately better than ours (about 0.72-0.78), and the S/M rows carry the mean.",
+   "consistent_with": "Our worst rows are the many-batch HW=196 ones (32,14,14 at 0.69; 64,14,14 at 0.70). Their small batches are exactly what cluster-local GRN handles. B's fan-out already showed -88..-92% at S from removing weight ingest. dMean/dT is 3.5-8 x 1e-4 per us there, so cutting 25-30 us from those rows is worth about +0.06.",
+   "test": "Build the critic-style skeleton of idea 3 at 64,14,14 (cluster of 8, loads, DSMEM stats, DSMEM reduce, stores, no MMA) and time it. If the empty pipeline is <= 8 us vs 46.8 us now, the S/M-heavy story is reachable."
+  },
+  {
+   "story": "The leader runs the same FP16x3, fp32-h-in-TMEM engine as lineage A, but with the epilogue and MMA fully overlapped (two tiles in flight, MMA at about 1.8x its floor), and a fan-out kernel for S. Its L time is about 170 clk/token against our 326.",
+   "consistent_with": "MMA floor 96 clk/token = 87 \u00b5s at 64,56,56. The leader's implied 153.8 \u00b5s is 1.77x that. e4's serial round (about 25-28 \u00b5s against 8.2 \u00b5s of MMA) leaves 2.5-3x unexplained, which the overlap would recover. 11.6 \u00b5s for B at 1,28,28 is within 10% of the leader's implied 10.5 \u00b5s.",
+   "test": "Stamp e4 at 64,56,56 with globaltimer per phase. If the serial fraction (non-MMA-overlapped time) is more than 50% of the round, the leader's number is reachable by overlap alone (ideas 1 and 4)."
+  },
+  {
+   "story": "The leader avoids the TMEM-full stall by splitting the GRN into a cheap stats pass and a fully streaming main pass (flash-style hidden chunks, s_b folded in registers), paying 7 MMA passes but no batch wait, no h round trip and no pass 2. Its time is then 112 clk/token of MMA at about 70% utilisation.",
+   "consistent_with": "153.8 \u00b5s at 64,56,56 = 170 clk/token = 1.5x of 112. Fixed costs are two phases, which fits the leader's S rows (10.5-12 \u00b5s) being at least as good as a single fused pass. The 1-pass stats error estimate at HW=3136 is 7e-6 relative on G, near the gate.",
+   "test": "Emulate 1-pass FP16 stats (idea 7) at HW=196/784/3136 and compute err/tol. If it passes the 0.8 gate at HW=3136 only, the leader could use it for large HW (the board shows equal S per row, which does not separate the HW terms)."
+  },
+  {
+   "story": "The leader cuts the epilogue, not the MMA: a cheaper GELU (packed f16x2 or a tanh form) accepted by the 99% matched ratio, on a pipelined FP16x3 engine, so its epilogue is about 40 clk/token and MMA binds at about 100-110 clk/token plus 1.5x overhead.",
+   "consistent_with": "1.77x of the MMA floor is typical for an MMA-bound kernel with imperfect overlap. A rejected-by-us precision shortcut would explain why we find the epilogue so expensive (64 clk/token MUFU) while the leader does not.",
+   "test": "Emulate a tanh-form GELU (error about 1e-3) and an f16x2 polynomial GELU in the harness check; report err/tol and fail% over 10 rounds. If the fail% stays under 1% only through the 99% rule, treat it as a rule risk (the ship gate forbids relying on it), and use idea 5 instead."
+  },
+  {
+   "story": "A recompute pipeline on FP16-split tensor cores: launch 1 = GEMM1 + exact GELU + per-batch sumsq with nothing retained (plain pipelined GEMM, 2 CTAs/SM), launch 2 = GEMM1 again + GELU + scale + GEMM2 with per-block overlap, PDL between them. 9 MMA passes = 130 us at 64,56,56 at the port-bound rate, GELU and weights hidden, 15-20% pipeline loss gives ~154 us. The S rows at 10.5-12.8 us are two short launches with no grid barrier and tiny tiles.",
+   "consistent_with": "The leader's L times sit at 1.7x our FP16x3 single-pass MMA floor (87 us) and below any 3xTF32 recompute (260 us); fp32 SIMT or cuBLAS emulation are 2-6x too slow (r0 probe: 592/500 us per GEMM, BF16x9 289/390 us). The S rows match a two-launch chain of ~4-5 us each plus a launch gap.",
+   "test": "Build launch 1 alone (half of e4's code) and time it: if it runs <= 60 us at 64,56,56 and <= 6 us at 1,28,28, a 2-launch recompute reaches ~150 us and ~11 us, i.e. the leader's numbers, with our engine."
+  },
+  {
+   "story": "A stored-h two-launch design: launch 1 writes h (fp32, or fp16 hi/lo at the same 2 KB/token) plus per-batch sumsq; launch 2 reads h back, scales, and runs GEMM2. DRAM traffic is 5 KB/token (x 0.5, h 2+2, out 0.5): 1.0 GB at 64,56,56 = 145 us at 7 TB/s, 72 us at 32,56,56, with MMA (6 passes, 87 us) hidden under the stream. Small rows are latency-dominated at 8-12 us.",
+   "consistent_with": "The implied L times are within 6% of 0.72 ns/token (145 us at 64,56,56, 81 vs 72+fixed at 32,56,56, 44 vs 36+fixed at 64,28,28), which is exactly the stored-h byte floor; the GRN cross-token dependency is crossed through memory, so no grid barrier and standard GEMM pipelining apply.",
+   "test": "Lineage C's H10 probe plus a byte-stream check: time a kernel that writes 2 KB/token with evict_last and reads it back after a counter, at 51.9 and 206 MB, after the 2xL2 flush. If read-back of the 76 MB ring stays in L2 (> 10 TB/s) the stored-h floor at L is ~100 us and the story is even cheaper than the leader; if it streams from DRAM the 145 us matches the leader exactly."
+  },
+  {
+   "story": "A single persistent token-stationary kernel like lineage A, but with the weight path fixed: weights fetched once per cluster by TMA multicast (or resident W1 slices in cluster pairs), a deep ring, and two half-tiles in TMEM so GEMM1 of the next tile hides the GRN wait. Rounds at ~14 us instead of our ~24 (11 rounds -> 154 us), and the S rows at 10.5 us are one launch with a ~8 us fixed chain (weights 64-128 KB per SM, one counter).",
+   "consistent_with": "Our e1 fixed chain of 19 us and e4's ~24 us rounds against 8.2 us of MMA are both explained by the serial weight ring (16 units x ~1.2 us) that a multicast/replica path removes; the leader's S rows (10.5-12.8 us) are what the critic's fan-out skeleton (6.8 us without MMAs) plus 2-3 us of GEMM and GELU gives, i.e. a single launch.",
+   "test": "The replica/multicast ring probe (idea 1/2): 148 CTAs x 16 units of 32 KB from a shared image vs private replicas, with and without a 3-stage ring. If per-unit time falls from ~1.2 us to < 0.5 us, lineage A's rounds drop to ~14 us without any new dataflow, and the leader's L numbers are reachable from e4 directly."
+  }
+ ],
+ "premises": [
+  {
+   "claim": "37 clusters of 4 (148 SMs) / 18 clusters of 8 / 16-CTA clusters at 6-8 fit with ~180-216 KB smem per CTA",
+   "where": "pool I3, I13, I30, I19, I2",
+   "verdict": "wrong",
+   "why": "cuOccupancyMaxActiveClusters on B200: cluster4 = 33 (132 SMs), cluster8 = 15 (120 SMs), cluster16 = 7 (112 SMs) at 180-216 KB; cluster2 = 74 (148 SMs)",
+   "if_wrong": "cluster lineages lose 11-24% of SMs at L/M; per-SM estimates scale by 148/132 or 148/120; cluster-2 pairs are the only lossless cluster shape",
+   "test": "done (probe); recheck with exact smem and 1-CTA/SM TMEM before building"
+  },
+  {
+   "claim": "Exact GELU at 136 issue slots/token over 4 SMSPs = 34 SM-clk/token, so ~31 us per pass at 64,56,56, hidden under the MMA",
+   "where": "pool I26 (recompute revival of H5)",
+   "verdict": "wrong",
+   "why": "H5's 136 issue-clk/token is already per SM (it is compared with the 96-clk/SM MMA); dividing by 4 again is a 4x error. 200704 tok x 136 clk / 148 / 1.5 GHz = 123 us per GELU pass",
+   "if_wrong": "two-launch recompute pays 2 x 123 us of GELU issue unless the GELU is also cut; 150-190 us projection does not hold",
+   "test": "arithmetic; already settled"
+  },
+  {
+   "claim": "Packed f32x2 epilogue drops GELU to ~10-12 issue slots per element, ~40 clk/token, -45% at L",
+   "where": "pool I24, leader story 'MMA-efficient in-TMEM design'",
+   "verdict": "overstated",
+   "why": "FFMA2 halves issue but measured FMA-pipe throughput is ~120 lanes/clk/SM (FFMA ~100): no 2x. The <=1e-6 fit needs degree 9 (9.3e-7; deg 8 = 2.8e-6), so ~15-17 FMA-pipe lane-ops/elem + bias/sumsq/split = ~65-70 clk/token, about equal to the current gelu2 MUFU bound (64)",
+   "if_wrong": "I24 alone moves the binding pipe from MUFU to FMA with little net gain; the L lever is overlapping the epilogue with the MMA (I22/I27/I10), not packing",
+   "test": "compile the full epilogue (TMEM ld, bias, GELU, sumsq, split, st) both ways for sm_100a and time it in cycles over TMEM-sized data"
+  },
+  {
+   "claim": "Split-K red.add costs ~2 us at 3136 tokens; cp.reduce.async.bulk cuts it below 0.5 us",
+   "where": "pool I1, I28, I5(4)",
+   "verdict": "wrong",
+   "why": "harness_time, 4-way: store 2.91, red.add v1 3.17, red.add v4 3.23, bulk 3.87 us at 1.6 MB out; 5.94 / 7.81 / 7.78 / 8.48 at 6.2 MB out. red.add adds about 0.3 us over plain stores at the S size; bulk is slower",
+   "if_wrong": "keep red.add (v4) in fan-out designs; drop bulk-reduce variants; the M-row items design (I28) remains viable with red.add (~+1.9 us at 6.2 MB)",
+   "test": "done (probe)"
+  },
+  {
+   "claim": "Global counter chain costs 2-4 us vs ~0.5 us cluster barrier, worth -30..-45% on HW 196/784 rows",
+   "where": "pool I19, I2",
+   "verdict": "overstated",
+   "why": "measured 1.20-1.22 us per global red.release/ld.acquire barrier at 128-148 CTAs vs 0.45 us for cluster-8 barrier + 2 KB DSMEM; saves ~0.75 us per crossing. I19's bigger gains must come from removing weight ingest and phase 0, not from the barrier",
+   "if_wrong": "re-attribute I19's projected 9 us saving; the barrier part is <1 us",
+   "test": "done (probe); stamps on B fan-out would split the rest"
+  },
+  {
+   "claim": "evict_last workspace stays in L2 and re-reads >10 TB/s; evict_last is what keeps it resident",
+   "where": "ledger H10, lineage C, I16",
+   "verdict": "overstated",
+   "why": "after a 2xL2 zero_: re-read of a just-written 76 MB region 7.0 (EL) / 7.3 (EN) TB/s vs 3.6 cold with the same naive kernel; 100 MB drops to 4.8. Residency is real up to ~76 MB, but the hint is irrelevant and >10 TB/s is unshown",
+   "if_wrong": "stored-h ring designs work at the ~76 MB scale without hints; budget L2 read at ~7 TB/s until a better reader shows more",
+   "test": "same probe with a deeper-MLP reader (8 float4/thread, 1 wave) to find the L2 hit ceiling"
+  },
+  {
+   "claim": "Leader stores h (or uses bandwidth) because implied L times are linear at 0.72 ns/token",
+   "where": "leader stories (stored-h, two-launch)",
+   "verdict": "unsupported",
+   "why": "ledger note: implied per-workload times are the equal-S formula's output; the linearity is an artefact",
+   "if_wrong": "stories rest only on mean score; no design is favoured by it",
+   "test": "none needed; drop the 'fits' line"
+  },
+  {
+   "claim": "r1-merge meets the precision ship gate (err/tol <= 0.8 per row)",
+   "where": "ledger notes ship gate; r1 findings (log NOT collected)",
+   "verdict": "unsupported",
+   "why": "only harness pass/fail at ~3e-3 atol exists; critic emulation had single-accumulator GEMM2 at 0.78, near the gate",
+   "if_wrong": "a seed could fail a row (scores 0) on the portal",
+   "test": "run r1-merge per row over 10 seeds against an fp64 reference and log max err/tol"
+  },
+  {
+   "claim": "e1's ~19 us fixed chain is the serial weight ring / L2 hot-spot",
+   "where": "r1 finding r1-a-e1-ts-fp16x3-m, pool I4/I21/I30",
+   "verdict": "unsupported",
+   "why": "no phase stamps; hot-spot probe not run (budget)",
+   "if_wrong": "replica/multicast work is wasted if the chain is phase 0 + grid counter",
+   "test": "globaltimer stamps in e1 at 1,28,28; the 148-CTA shared vs replica vs private bulk-ring probe (written, not run)"
+  }
+ ],
+ "probes": [
+  {
+   "idea": "I3/I13/I30/I19/I2 cluster capacity",
+   "test": "cuOccupancyMaxActiveClusters, 512 threads, 100/180/216 KB dyn smem, cluster 2/4/8/16",
+   "result": "c2: 74 (148 SMs) at >=180K; c4: 33 (132); c8: 15 (120); c16: 7 (112); at 100K c4 71, c8 33, c16 14",
+   "verdict": "fails",
+   "note": "1-CTA/SM cluster designs idle 16-36 SMs; only cluster-2 pairs are lossless"
+  },
+  {
+   "idea": "I24 tail-form GELU accuracy",
+   "test": "fp64 weighted minimax fit of g on [0,5.75], fp32 Horner x exp2 with 2^-22 error, u in [-60,60]",
+   "result": "max |err|: deg7 9.8e-6, deg8 2.8e-6, deg9 9.3e-7, deg10 4.2e-7; A&S 7.1.26 GELU 3.3e-7; fp32 rounding floor 2.4e-7",
+   "verdict": "holds",
+   "note": "accurate at degree 9-10, so ~15-17 FMA-pipe ops per element, not ~9"
+  },
+  {
+   "idea": "I24/I20/H8 pipe rates",
+   "test": "all SMs, wall-time-based lanes/clk/SM",
+   "result": "FFMA ~100, FFMA2 ~120 lanes/clk/SM; MUFU.EX2 15.8, MUFU.RCP 15.8 per clk per SM",
+   "verdict": "unclear",
+   "note": "MUFU = 16/clk/SM confirmed; f32x2 does not double FMA throughput, so packing only relieves issue"
+  },
+  {
+   "idea": "I1/I28 bulk reduce-add",
+   "test": "harness_time, 4-way split-K into 1.6 MB and 6.2 MB outputs, 512-thread CTAs",
+   "result": "1.6 MB: store 2.91, red.add 3.17, red.v4 3.23, bulk 3.87 us; 6.2 MB: 5.94/7.81/7.78/8.48 us",
+   "verdict": "fails",
+   "note": "red.add is cheap; bulk reduce adds smem staging and is slower"
+  },
+  {
+   "idea": "I19/I2/I12 barrier cost",
+   "test": "20 back-to-back global counter barriers (red.release + ld.acquire spin) vs cluster-8 barrier with 2 KB DSMEM stores, globaltimer",
+   "result": "global 1.20 us (128 CTAs), 1.22 us (148); cluster-8 0.45 us; start spread 0.03-0.06 us",
+   "verdict": "fails",
+   "note": "global crossing is ~1.2 us not 2-4; cluster saves ~0.75 us per crossing; I12's skew saving likely small"
+  },
+  {
+   "idea": "H10 / lineage C / I16 L2-resident h ring",
+   "test": "2xL2 zero_, write N MB with EL/EN/EF policy, re-read; globaltimer span",
+   "result": "76 MB: EL 7.0, EN 7.3, EF 3.7, cold 3.6 TB/s; 38 MB: 5.5/5.7/3.3/3.1; 100 MB: 4.8/4.8/3.5/3.5",
+   "verdict": "unclear",
+   "note": "residency holds to ~76 MB regardless of hint; >10 TB/s not shown with this reader"
+  },
+  {
+   "idea": "I21/I30/I4 weight-ring hot-spot",
+   "test": "148 CTAs x 64 serial 32 KB bulk copies, S=1/3/6, shared vs 16 replicas vs private",
+   "result": "not run: probe budget exhausted",
+   "verdict": "unclear",
+   "note": "script is ready; run it first next round before building replicas or multicast"
+  }
+ ],
+ "sources": {
+  "I1": "ideas2-fable",
+  "I2": "ideas0-opus",
+  "I3": "ideas0-opus",
+  "I4": "ideas0-opus",
+  "I5": "ideas1-sonnet",
+  "I6": "ideas0-opus",
+  "I7": "ideas2-fable",
+  "I8": "ideas0-opus",
+  "I9": "ideas0-opus",
+  "I10": "ideas1-sonnet",
+  "I11": "ideas2-fable",
+  "I12": "ideas2-fable",
+  "I13": "ideas2-fable",
+  "I14": "ideas1-sonnet",
+  "I15": "ideas1-sonnet",
+  "I16": "ideas0-opus",
+  "I17": "ideas1-sonnet",
+  "I18": "ideas1-sonnet",
+  "I19": "ideas1-sonnet",
+  "I20": "ideas1-sonnet",
+  "I21": "ideas2-fable",
+  "I22": "ideas1-sonnet",
+  "I23": "ideas2-fable",
+  "I24": "ideas0-opus",
+  "I25": "ideas0-opus",
+  "I26": "ideas2-fable",
+  "I27": "ideas2-fable",
+  "I28": "ideas1-sonnet",
+  "I29": "ideas0-opus",
+  "I30": "ideas2-fable"
+ }
+}

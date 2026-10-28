@@ -1,0 +1,85 @@
+id: r2-d-e4-storedh-fp16x3
+parents: []
+operation: new_design
+language: cuda_cpp
+niche:
+  mem: tma-tensor
+  st: direct
+  grid: persistent
+  launch: split
+  tile: rows128
+  red: cta
+  cache: default
+  spec: L
+hypothesis: >-
+  Lineage D, H20. Crossing GRN through memory with two plain tcgen05 FP16x3 launches puts the L rows near the
+  stored-h DRAM floor (x 0.5 + h 2 + h 2 + out 0.5 KB/token, ~146 us at 64,56,56 at 7.05 TB/s). Weight halves stay
+  resident in smem (K1: W1 hidden half by CTA parity; K2: per-batch folded W2'_b output half). The 87 us of MMA and
+  the ~58 us gelu2 epilogue overlap the stream through double-buffered TMEM. K2 reads h newest-first, so the tail
+  of K1's h may still be in L2 (rows up to 32,28,28 almost entirely).
+  UNCOMPILED AND UNMEASURED: the round's B200 budget ran out before any compile, probe or test ran.
+expected_effect:
+  S:
+    pct: 0
+    confidence: low
+  M:
+    pct: 0
+    confidence: low
+  L:
+    pct: -30
+    confidence: low
+resources_sm100a:
+  regs_per_thread: 120
+  smem_per_cta_bytes: 232448
+  threads_per_cta: 576
+  ctas_per_sm: 1
+  bytes_in_flight_per_sm: 98304
+  launches_per_call: 2
+knobs:
+  tile_tokens: 128
+  K1_threads: 544
+  K2_threads: 576
+  K2_ring_stages: 3
+  stage_bytes: 32768
+  grid: 148
+  route_min_tokens: 25088
+dispatch:
+  - {max_tokens: 25087, kernel: r0 k_stats/k_grn/k_main, meta: {TM: 64}}
+  - {max_tokens: null, kernel: sh k1_gemm1 + k2_gemm2, meta: {tile: 128, grid: 148}}
+tests: [H20]
+findings:
+  - "infrastructure: the step-0 skeleton probe (K1 x->h 2 KB/token, K2 h->out, 4 L shapes) got no response for 1800 s; that wait used up the round's 20-min B200 budget. The retried probe and compile_b200 both returned 'B200 budget used up'. Nothing in this card was compiled, run or timed; the H20 kill line (skeleton > 200 us at 64,56,56) is still untested [probe_b200, compile_b200]"
+  - "rules: the task asked for K2 via PDL, but the operator note forbids PDL, so K2 is a plain second launch on the same stream; expect one kernel-to-kernel gap plus a second ramp (~2-5 us) [INFERRED]"
+  - "design: batch-aligned 128-token tiles (TB = ceil(HW/128) per batch) remove straddling tiles. Sumsq partials are per (tile, 64-token column half, channel), written with plain stores, so no atomics, counters or zero-fill are needed. MMA waste is 2% at HW 3136 and 12.5% at HW 784; K2's 3-D tensor map ([B][HW][512] fp16) zero-fills rows past HW, so no h bytes are wasted [INFERRED]"
+  - "design: K1 swap-AB with W1 rows permuted (M block 0 = even, block 1 = odd channels of the CTA's half) gives each epilogue thread an adjacent channel pair. h hi/lo then go out as packed half2 STG.32 with full 128-B lines per warp, and gelu2's packed ss2 is the per-channel sumsq directly [INFERRED]"
+  - "design: h stored as fp16 hi + 2^11-scaled lo of unscaled h (same 2 KB/token as fp32). The GRN scale s_b is folded into W2'_b = W2 (.) s_b (hi + 2^11 lo, 128 KB per output half) and gb into bias' = b2 + W2.gb, so K2's hot loop is pure TMA -> MMA with separate main and cross accumulators [INFERRED]"
+  - "design arithmetic: smem K1 = W1 hi/lo 128 KB + x hi/lo 64 KB (x is converted from a register prefetch; there is no room for a 64 KB fp32 staging tile); K2 = W2' 128 KB + 3 x 32 KB ring + 2.3 KB = 231.9 KB of the 232448 B maximum, which requires a 1024-aligned dynamic smem base (a trap guards it) [INFERRED]"
+  - "cost of the out-half split: both CTAs of a pair read the same h tile (4 KB/token of L2->SM, 2 KB/token of DRAM if L2 dedups) and each batch change costs a ~2-3 us W2' rebuild (1-2 per CTA at HW 3136, up to 3-4 at HW 784). cta_group::2 pairs (M=256, each SM holding half of W2') are the natural next step to halve h ingest and give full 128-out rows [INFERRED]"
+  - "owed before shipping: compile_b200 (regs, cuobjdump STACK 0, SASS), run_tests on all rows interleaved with r1-merge, the 10-round fp64 err/tol log for the L rows (gate <= 0.8), and the step-0 skeleton timing [none]"
+paths:
+  - {max_tokens: 25087, lang: cuda, width: 128, threads: 256, rows: 64, grid: oneshot, mem: ldg, launches: 3, st: none}
+  - {max_tokens: null, lang: cuda, width: 128, threads: 576, rows: 128, grid: persistent, mem: tma, wstat: true, launches: 2, prefetch: true, x: none, w: none, st: none, cluster: 1}
+runs_on:
+  H200:
+    runs: false
+    representative: false
+    note: "tcgen05/TMEM are sm_100a-only"
+  A100:
+    runs: false
+    representative: false
+  L40S:
+    runs: false
+    representative: false
+risks:
+  - "Never compiled: PTX syntax (mbarrier.arrive.relaxed, 3-D TMA), descriptor or idesc errors, or register overflow at 544/576 threads (cap 120/112 regs) may need a repair pass"
+  - "K2 smem leaves only 576 B of slack: if the dynamic smem base is not 1024-aligned the kernel traps (it does not corrupt memory)"
+  - "Correctness hazards: TMEM double-buffer parities, the segment and W2' rebuild handshake (wfull/wfree), and the K1 converter's single x buffer; any deadlock shows as a timeout on the L rows"
+  - "Epilogue-bound K1: gelu2 is MUFU-bound at ~4.1k clk per 128x256 unit vs ~6.5k clk per unit at the DRAM rate; any extra epilogue cost goes straight onto the critical path"
+  - "Precision: GEMM1 uses one fp32 accumulator with unscaled lo (critic err/tol 0.25); GEMM2 uses a separate 2^11-scaled cross accumulator (0.44). The fold of s into W2' is untested on hardware"
+measure_first: [B200]
+compliance:
+  single_stream: true
+  no_cross_call_state: true
+  fp32_math: true
+  no_threads_or_fork: true
+  no_precompiled_binaries: true

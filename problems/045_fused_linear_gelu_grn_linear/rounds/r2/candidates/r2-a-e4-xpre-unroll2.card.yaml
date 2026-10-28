@@ -1,0 +1,110 @@
+id: r2-a-e4-xpre-unroll2
+parents:
+  - r1-a-e4-rounds-tmem-v2
+operation: knob_mutation
+language: cuda_cpp
+niche:
+  mem: bulk1d
+  st: direct
+  grid: persistent
+  launch: fused
+  tile: rows128
+  red: cta
+  cache: default
+  spec: L
+hypothesis: >-
+  Stamps show an e4 round at 64,56,56 takes 21.8 us with the MMA busy 9.3 us (57% idle). The GELU epilogue warps take
+  4-6 us each, and the next-round x prefetch was issued just before the counter release. Moving the prefetch to right
+  after the X write (so it lands during GELU) and unrolling the GELU loop by 2 cuts the serial chain: 64,56,56 drops
+  from 247.3 to 225.8 us in probes and from 251.4 to 233.8 us in run_tests. This does not test E2's pair design; H19
+  stays open.
+expected_effect:
+  S:
+    pct: 0
+    confidence: medium
+  M:
+    pct: -2
+    confidence: medium
+  L:
+    pct: -5
+    confidence: medium
+resources_sm100a:
+  regs_per_thread: 94
+  smem_per_cta_bytes: 230912
+  threads_per_cta: 576
+  ctas_per_sm: 1
+  bytes_in_flight_per_sm: 98304
+  launches_per_call: 1
+knobs:
+  TILE: 128
+  NSTAGE: 3
+  STAGE_BYTES: 32768
+  gelu_unroll: 2
+  x_prefetch: after_xwrite
+tests:
+  - H19
+  - H13
+  - H8
+findings:
+  - "step 0 stamps at 64,56,56, steady round (us from round start): X written 0.5, GEMM1 blocks committed 1.8/2.8/3.8/4.9 (GEMM1 ~4.4 us, near the 4.1 us ideal), counter released 11.5, wait done 12.8, pass 2 done 15.1, GEMM2 committed 20.0, out stored 21.5; period 21.8 us; MMA busy ~9.3 us = 43%, idle 57%, so the overlap premise of H19 holds (idle >> 25%) [probe_b200, globaltimer, 0.256 us resolution]"
+  - "16,56,56: round period 21.3-22 us, first round 22.3 us including about 2.6 us of phase-0 weight conversion and barrier; rented e4 is 72.2 us at 16,56,56 and 247.5 us at 64,56,56 [probe_b200]"
+  - "MMA starvation on the weight ring (bar_full waits) is only about 0.8 us per round, so the 3 x 32 KB L2 ring keeps up with the MMA [probe_b200 stamps]"
+  - "per-warp stamps: GELU warps of hidden blocks 0..3 finish at 7.7/9.0/10.0/10.2 us after starting at 1.8/2.8/3.8/4.9 us, i.e. 4-6 us per warp for 128 tokens x 32 channels, latency-bound (one TMEM ld/st pair per 16 tokens, 4 warps per SMSP). The GELU epilogue, not the GRN counter, is the main serial term (H8 supported) [probe_b200]"
+  - "dead end: replacing the gsum red.add with per-tile partial stores read back in fixed order made 64,56,56 slower (296.6 vs 247.9 us); the ~25 dependent L2 reads per channel in pass 2 cost more than the atomics [probe_b200]"
+  - "dead end: removing __threadfence before red.release (247.6 us) or removing the atomics entirely (timing-only, 254.6 us) did not move the release; the release delay was the slow GELU warps plus thread 0's pending x prefetch [probe_b200]"
+  - "win: issuing the next-round x prefetch right after the X write gives 64,56,56 232.3 us (-6%), 16,56,56 70.1, 32,28,28 52.5; adding GELU unroll 2 gives 225.8 / 68.1 / 51.3 us (-8.7% at 64,56,56); 94 regs, 0 spills [probe_b200, nvcc -Xptxas -v]"
+  - "run_tests 14/14 pass; vs current best r1-merge on the same GPU: 64,56,56 233.8 vs 251.4 (-7.0%), 32,56,56 131.9 vs 141.7 (-7.0%), 64,28,28 77.3 vs 80.6 (-4.1%), 16,56,56 71.8 vs 74.8 (-3.9%), 32,28,28 52.7 vs 53.9 (-2.2%); L band -4.8%; S rows are 72-166% slower (this kernel should serve L only) [run_tests]"
+  - "precision: err/tol (atol 2.8e-3) max 0.18 at 1,28,28, 0.23 at 64,14,14, 0.25 at 32,28,28, 0.30 at 16,56,56, 0.34 at 64,56,56, over 1-3 seeds per row (not the 10-seed log the operator rules ask for); the harness's 10 correctness rounds per row passed [probe_b200 fp64 reference; run_tests]"
+  - "not done: the cluster-2 hidden-split pair kernel (E2 step 1) and the I22 cross-round overlap were not built in this session's budget, so H19 is neither supported nor refuted; next step is to build the pair kernel, using these stamps as the baseline"
+paths:
+  - max_tokens: 2100
+    lang: cuda
+    width: 128
+    threads: 576
+    rows: 128
+    grid: persistent
+    mem: tma
+    wstat: false
+    launches: 1
+    prefetch: true
+    x: none
+    w: none
+    st: none
+    cluster: 1
+  - max_tokens: null
+    lang: cuda
+    width: 128
+    threads: 576
+    rows: 128
+    grid: persistent
+    mem: tma
+    wstat: false
+    launches: 1
+    prefetch: true
+    x: none
+    w: none
+    st: none
+    cluster: 1
+runs_on:
+  H200:
+    runs: false
+    representative: false
+    note: "tcgen05/TMEM are sm_100a only"
+  A100:
+    runs: false
+    representative: false
+  L40S:
+    runs: false
+    representative: false
+risks:
+  - "S rows are 72-166% slower than the current best; merge this kernel for L rows only"
+  - "The gain is in SM-side latency (GELU, prefetch placement); the portal's lower locked clock may stretch the GELU span, shrinking or growing the gain"
+  - "Precision was logged over 1-3 seeds, not the required 10-seed fp64 log"
+measure_first:
+  - B200
+compliance:
+  single_stream: true
+  no_cross_call_state: true
+  fp32_math: true
+  no_threads_or_fork: true
+  no_precompiled_binaries: true

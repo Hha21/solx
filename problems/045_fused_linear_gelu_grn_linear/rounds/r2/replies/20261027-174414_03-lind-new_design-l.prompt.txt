@@ -1,0 +1,301 @@
+=== TASK ===
+Round: r2   Operation: new_design
+Problem: L1/045_fused_linear_gelu_grn_linear   Target niche: lin:D:E4:H20   Target band: L
+Return 1 candidate(s). Each must follow OUTPUT CONTRACT exactly. Give every candidate a new unique id starting with 'r2-'.
+Experiment E4 (tests H20): New design: two-launch stored-h FP16x3 pipeline with resident weight halves (L rows). You may read the r0 baseline and read_example's #129 token-stationary tcgen05 kernel (SW128 descriptors, idesc kind::f16, elect.sync issue, packed A&S gelu2). Step 0 (hardware premise, 10 min): a memory-only skeleton under the harness flush (2xL2 zero_). K1 reads x and writes 2 KB/token; K2 is launched with PDL (griddepcontrol, same stream), reads that back and writes out; no maths. Time it at 64,56,56, 32,56,56, 16,56,56 and 32,28,28. Expect about 150 / 78 / 40 / 20 us rented. Step 1, K1 (persistent, 148 CTAs): each CTA owns a hidden half (CTA parity) and keeps its W1 half as SW128 hi/lo in smem (128 KB, built in the prologue from fp32 W1 while the first x tile loads). Per 128-token tile: x hi/lo, GEMM1 FP16x3 swap-AB into one of two TMEM accumulators (2 x 256 columns, double-buffered so the epilogue of tile i overlaps the MMA of tile i+1), then a gelu2 epilogue. Write per-tile per-channel sumsq partials with plain stores (two slots when a tile straddles a batch: no atomics, no zeroing, no state across calls), and store h (fp32, or fp16 hi/lo of unscaled h) at 2 KB/token through smem plus bulk stores. Step 2, K2 (PDL): its prologue reduces the partials of its batch(es) into G, nf and s. Per 128-token tile, choose between (a) folding s into a per-batch W2'_b out-half held resident in smem (rebuilt only when the CTA's batch changes; gb W2 + b2 as an fp32 bias), so K2 is a pure TMA->MMA GEMM on h hi/lo, and (b) loading fp32 h by TMA, with converter warps applying x2 = h*s + gb and the split. Use FP16x3 with a separate GEMM2 cross accumulator. A crude first version may use 1SM N=64 out-halves; note in findings whether cta_group::2 pairs (each SM loads half the operand) are the next step. Allocate the h workspace with torch.empty in the binding (no fills). The kernel must be correct for every shape; route only the rows where it wins. Step 3: run_tests on all rows interleaved with r1-merge, and log err/tol over 10 seeds for the L rows. Success: 64,56,56 <= 170 us rented and every L row >= 10% faster than e4 in the same container, err/tol <= 0.8; first-session gate: the full pipeline within 1.4x of its own step-0 skeleton time at 64,56,56 Refuted if: kill line (hardware premise): the step-0 memory-only skeleton at 64,56,56 takes > 200 us rented, i.e. the stored-h stream cannot beat e4 by 20% even with free maths; otherwise build and measure the best configuration reached This is an EXPLORATION task: the goal is to learn whether this idea can move some size band by 3% or more on the portal, not to edge out the current best by 0.1%. You may discard the parent's design entirely; it is given for reference. Test the idea's core assumption with probe_b200 first (seconds per probe). A missed gate or success line is not a reason to stop: switch to the best configuration your own probes found (or the experiment's next variant), build it into a full kernel and measure it with run_tests, and use the rest of the budget on it. Hand in a measured kernel that implements this experiment's design on at least one workload (others may fall back); the r0 baseline or the unchanged parent is not a valid candidate unless a measured hardware fact rules the design out (name it, with the probe's number). Record what you learned in the card's findings: negative results are valuable and go into the lab notebook for later rounds. CUDA C++ uses the two-file layout. Keep the kernel copy-like (memory-bound): the portal locks the SM clock lower than the test bench and penalises extra SM work per byte (the problem card). Set the card's tests: field to the hypothesis id(s). OPERATOR NOTE (rules): every red.add / atomic / bulk-reduce target is zeroed or prefilled inside this call before its first add (the workspace is torch.empty, uninitialised); any stored h or scratch is reused only within one call, never across calls; grid, cluster or per-batch counters live in a module-level __device__ buffer self-reset by the last arriver, never in the workspace; spins are plain ld.acquire loops. No PDL; stamps compiled out of the shipped build; target_hardware [B200] only; TMA descriptors encoded every call; no state kept between calls (no converted or split weights, no cached outputs) except shape-keyed attributes set to one maximal value; cache hints only on our own workspace buffers, never on hidden_states, the weights or the output; cuobjdump -res-usage STACK 0 on the shipped build; 10-round fp64 precision log (err/tol) on every shipped row.
+
+LINEAGE D: At L, cross the GRN through memory with two plain pipelined tcgen05 launches (GEMM1+GELU writes h at 2 KB/token plus per-tile sumsq partials; a PDL launch runs GEMM2), with weight halves resident in smem, so time sits at the stored-h DRAM floor (~5 KB/token, ~150 us at 64,56,56) instead of at serial on-chip steps.
+You develop this lineage. get_kernel reads only this lineage's kernels and the r0 baseline; other lineages share their conclusions, not their code. Stay with the thesis: if you find it cannot win, say so with numbers in the design card's findings rather than switching to another lineage's design.
+This lineage so far:
+- Seeded r2 from the stored-h leader stories and I16/I6; no grid barrier, no TMEM retention, no weight ring if weights are split hidden-half (K1) / out-half (K2) per CTA
+- Budget: DRAM ~7 TB/s for x + h write + h read + out (1.03 GB at 64,56,56); L2 residency up to ~76 MB is a bonus for 32,28,28 and below
+Other lineages (conclusions only):
+- A [active, started r1, best r1-a-e4-rounds-tmem]: The hidden h never leaves the SM. A cooperative tcgen05 FP16x3 launch, token-stationary, keeps fp32 h in TMEM across per-batch GRN counters; to scale at L it must overlap tiles and stop streaming 512 KB of weights per tile.
+    - e1 wins 2,56,56 / 32,14,14 / 64,14,14 (25-36 us rented); e4 wins every L row plus 4,56,56 and 16,28,28 in r1-merge (portal 0.7216)
+    - e1 has a ~19 us fixed chain that does not depend on work (784 tokens take 21 us with 0.3 us of MMA); not yet attributed between phase 0, grid counter and the weight ring
+    - e4 at 64,56,56 runs 11 rounds of ~29.7 us portal against 8.2 us of MMA: its steps run one after another because fp32 h fills the TMEM (H13 refuted)
+    - Precision: FP16x3 with a separate GEMM2 cross accumulator passes every row in 10 harness rounds; the err/tol log is still owed
+    - Only cluster-2 is free of SM loss at >=180 KB smem (c4 33, c8 15, c16 7 clusters): overlap designs should use pairs
+- B [active, started r1, best r1-b-e2-fanout]: S rows are a latency chain, not a FLOP problem. Fan each token tile out over hidden slices so every SM ingests at most 64 KB of weights, cross one grid barrier, and reduce the split-K GEMM2 with red.add into an output prefilled with the bias.
+    - Fan-out wins the 4 smallest rows: 11.6/13.7/16.5/16.7 us rented (-88..-92% vs r0); 1,28,28 misses the 9 us line
+    - 3136-token rows run ~5 us above 784: the cost grows with the token tile TT, not with the fixed chain (unstamped)
+    - red.add v4 costs ~0.3 us over plain stores at 1.6 MB; cp.reduce.async.bulk is slower (critic probe): keep red.add
+    - Global counter barrier costs 1.2 us at 128-148 CTAs, cluster-8 0.45 us: the barrier is worth at most ~0.75 us
+    - 256-wide slices do not fit (smem/TMEM); 6272-token rows need TT=196 x 4 slices with GEMM2 in token halves
+- C [retired, started r1, best r1-c-e3-l2ring-b]: At L the GRN dependency crosses through L2, not TMEM, via a per-CTA evict_last h ring re-read one round later in a single persistent launch.
+    - Retired at r2 under the measured-hardware exception: after the 2xL2 flush an L2 re-read runs at 7.0-7.3 TB/s whatever the hint (4.8 at 100 MB), not the >10 TB/s the thesis assumed
+    - r1-c-e3-l2ring-b passed but runs 159.8 us L geomean rented vs e4 104.3 (1.5x slower); its 4 KB/token per-tile weight re-stream is unmeasured
+    - The idea of crossing GRN through memory continues in lineage D, budgeted at the DRAM rate with two launches
+
+=== ARCHIVE (best per kernel; times are geomean µs per size band S/M/L; S = B·S ≤ 600, M ≤ 2100, L above) ===
+| id | niche (mem/grid/spec) | lang | rented B200 S/M/L | H200 S/M/L | A100 S/M/L | L40S S/M/L | portal B200 S/M/L | B200 score | B200 regs/smem/fit | status |
+|---|---|---|---|---|---|---|---|---|---|---|
+| r1-merge | ldg128/oneshot/dispatch:size | cuda_cpp | 14.5/30.1/102.4 | -/-/- | -/-/- | -/-/- | 18.3/38.7/134.0 | 0.721632 | - | passed |
+| r0-simt-3k | ldg128/oneshot/all | cuda_cpp | 137.9/184.7/785.0 | -/-/- | -/-/- | -/-/- | 176.5/237.6/1021.4 | 0.244198 | 128/1024/None; 32/1088/None | passed |
+| r1-a-e1-ts-fp16x3 [lineage A] | bulk1d/persistent/dispatch:size | cuda_cpp | 22.7/30.0/785.0 | -/-/- | -/-/- | -/-/- | -/-/- | pending | - | passed |
+| r1-a-e1-ts-fp16x3-m [lineage A] | bulk1d/persistent/dispatch:size | cuda_cpp | 22.7/30.0/785.0 | -/-/- | -/-/- | -/-/- | -/-/- | pending | - | passed |
+| r1-a-e4-rounds-tmem [lineage A] | bulk1d/persistent/all | cuda_cpp | 30.7/31.9/104.3 | -/-/- | -/-/- | -/-/- | -/-/- | pending | 95/1024/None | passed |
+| r1-a-e4-rounds-tmem-v2 [lineage A] | bulk1d/persistent/all | cuda_cpp | 30.7/31.8/104.3 | -/-/- | -/-/- | -/-/- | -/-/- | pending | 95/1024/None | passed |
+| r1-b-e2-fanout [lineage B] | ldg128/oneshot/dispatch:size | cuda_cpp | 14.5/184.9/790.4 | -/-/- | -/-/- | -/-/- | -/-/- | pending | - | passed |
+| r1-b-e2-fanout-v3 [lineage B] | ldg128/oneshot/dispatch:size | cuda_cpp | 14.5/184.9/790.4 | -/-/- | -/-/- | -/-/- | -/-/- | pending | - | passed |
+| r1-c-e3-l2ring [lineage C] | bulk1d/persistent/all | cuda_cpp | 44.1/44.3/159.8 | -/-/- | -/-/- | -/-/- | -/-/- | pending | 96/1024/None | passed |
+| r1-c-e3-l2ring-b [lineage C] | bulk1d/persistent/all | cuda_cpp | 44.2/44.2/159.8 | -/-/- | -/-/- | -/-/- | -/-/- | pending | 96/1024/None | passed |
+B200 results so far:
+- r0-simt-3k: B200 score 0.244, geomean 367.4 µs, B200 S/M/L 176.5/237.6/1021.4 µs
+- r1-merge: B200 score 0.722, geomean 48.7 µs, B200 S/M/L 18.3/38.7/134.0 µs
+
+=== HYPOTHESIS LEDGER ===
+constraints:
+- No deliberate delay before launch (CPU busy-wait, sleep, extra host work) and nothing else meant to change when our kernel
+  reaches the GPU relative to the harness's flush memset. It exploits the timing methodology, not kernel speed. Off-limits
+  unless NVIDIA approves.
+- 'No discard/invalidate of cache lines (discard.global.L2 etc.), even on our own inputs: it targets the harness''s measurement,
+  not kernel speed. Off-limits unless NVIDIA approves.'
+- Never touch memory we do not own; no state carried between calls except a scratch counter that is correct for every call.
+- 'No overlap with the harness''s own kernels (no PDL against the flush memset, no other streams): it hides work from the
+  timed window.'
+- Clusters only on small one-wave grids or where a GEMM tile needs them (2SM pairs).
+- Eviction-priority operations only on the current call's own input/output buffers, inside our kernel.
+- No environment variables set from the solution (e.g. CUBLAS_EMULATE_SINGLE_PRECISION) without operator approval.
+notes:
+- Leader-gap per-workload times are the equal-S formula's output (t = Tsol + 0.171 (Tb - Tsol)); the HW=3136 "penalty" and
+  the 0.723 ns/token slope are artefacts and say nothing about the leader's design (critic r1 algebra).
+- 'leader_gap.py has GFLOP = 0 for #45, so its "memory-bound, precision does not matter, ceiling 0.994" output is wrong. Tsol
+  recovered from the portal anchors is 0.334 ns/token at L (67.45 us at 64,56,56).'
+- 'Precision ship gate: per row, max over 10 rounds of max |err| / (atol + rtol |ref|) <= 0.8 with the row''s own tolerance,
+  logged in findings; never rely on the 99% matched ratio. Prefer a separate cross-term accumulator on GEMM2. r1-merge has
+  NO err/tol log yet: every r2 session logs err/tol for the rows its kernels serve (E1 also for every e1/e4 row in r1-merge).'
+- 'Engine template: #129 lineage-M kernel (read_example solx_129_token_stationary_tcgen05.cu) - SW128 descriptors, idesc kind::f16,
+  elect.sync issue, release/acquire counters with departure reset, packed A&S gelu2, cooperative launch.'
+- 'Portal noise: rows under ~40 us moved about +-1 us between identical submissions on #129. Merge thresholds: 3% projected
+  gain for a lineage with portal history, 10% for a new one.'
+- 'Cluster shapes: only cluster-2 keeps all 148 SMs at >=180 KB smem (H17); designs on c4/c8/c16 lose 11-24% of SMs (I2/I3/I13/I19/I30
+  parked on this).'
+- 'Modal B200 supply is intermittent (about two at a time; calls not scheduled within 15 min return an error): run the short
+  probes first, retry unscheduled calls later, never block a session on one call.'
+hypotheses:
+- id: H1
+  statement: Every size is compute-bound for any fp32-accurate engine; the GEMM engine (SIMT vs 3xTF32 vs FP16x3 tcgen05)
+    decides the score more than any memory-side tuning.
+  status: open
+  evidence:
+  - 'arithmetic: 262 kFLOP/token vs 1 KB/token; SIMT 0.93 ms vs 36 us copy at 64,56,56'
+  - 'r0-simt-3k: 2191 us at 64,56,56 (61x copy)'
+- id: H2
+  statement: Split-precision tensor-core GEMMs (FP16x3 with fp32 accumulation) meet the tolerance with zero failing elements
+    on real tcgen05 hardware; any 1- or 2-term scheme and BF16x3 fail.
+  status: supported
+  evidence:
+  - 'probe_b200 emulation: 3xTF32 and FP16x3 max err 1.8-2.3e-3, 0% fail; BF16x3 0.8-2.2% fail; TF32 96% fail'
+  - 'critic r1, hardware Triton tl.dot FP16x3 on both GEMMs, 7 shapes x 1-3 seeds: worst err/tol 0.78 single accumulator (cross-first
+    ordering the same), 0.44 with a separate GEMM2 cross-term accumulator, 0.29 with a per-k-block fp32 add; GEMM2 alone 0.70,
+    GEMM1 alone 0.25; 0 failing elements in 19 runs'
+  - raw max err 5.7e-3 is above atol but err/tol is what counts, because rtol*|ref| grows with |ref|
+- id: H3
+  statement: FP16x3 on kind::f16 beats 3xTF32 on kind::tf32; FP16x3 is the engine for every lineage.
+  status: supported
+  evidence:
+  - 'critic r1 hardware probe: TF32x3 max err 9.2e-3 (rounded hi) and 1.1e-2 (raw hi), against 5.7e-3 for FP16x3, so TF32
+    is also worse for accuracy'
+  - rate (2x) not measured; it follows from the spec
+- id: H4
+  statement: For N <= 18944 tokens (all S and M rows) one cooperative launch that keeps fp32 h in TMEM across per-batch counters
+    beats recompute and multi-launch designs; target 12544 tokens <= 21 us rented.
+  status: open
+  evidence:
+  - 'arithmetic: 148 x (256 KB TMEM) ~ 37.9 MB vs h = N x 2 KB'
+  - r1 E1 tests it
+- id: H5
+  statement: At L, recomputing GEMM1 beats storing h once GEMMs run on tensor cores.
+  status: parked
+  evidence:
+  - 'arithmetic at 64,56,56: recompute ~+44-88 us of MMA vs store ~+100 us at 8 TB/s'
+  - 'critic r1 SASS count: exact erff GELU is 1 MUFU + ~28 ALU per element, ~136 issue-clk/token with bias, sumsq and split,
+    above the 96-clk FP16x3 MMA; recompute repeats this GELU'
+  - 'critic r2: the 136 clk/token is already per SM; I26''s division by 4 SMSPs is a 4x error, so a second GELU pass costs
+    ~123 us at 64,56,56 (gelu2 form: ~64 clk/token MUFU-bound, ~58 us). Recompute stays parked'
+- id: H6
+  statement: At S the first kernel is limited by too few CTAs (13-49) running long serial chunk loops; splitting work over
+    hidden chunks or smaller token tiles to fill 148 SMs gives >5x at S.
+  status: open
+  evidence:
+  - 'r0-simt-3k: 137-143 us flat from 784 to 6272 tokens'
+- id: H7
+  statement: Folding s_b = 1 + gw*nf into a per-batch W2 (and gb into the bias) is within tolerance and removes the per-element
+    affine from the hot loop.
+  status: open
+  evidence:
+  - algebra exact; rounding difference ~1 ulp of x2
+- id: H8
+  statement: In on-chip and stored-h designs the CUDA-core epilogue (bias, GELU, sumsq, hi/lo split, TMEM round trip) binds
+    at L rather than the MMA, unless it is overlapped with the MMA; packing alone cannot cut it to ~10 issue slots per element.
+  status: open
+  evidence:
+  - 'critic r1: erff 1 MUFU + ~28 ALU; normcdff 3 MUFU + ~60; erfcf 3 MUFU + ~45 (sm_100a SASS)'
+  - '#129 K: co-running epilogue and MMA warps keep 54-70% of their solo rates'
+  - 'critic r2 pipe probe (rented B200, all SMs): MUFU.EX2/RCP 15.8/clk/SM; FFMA ~100, FFMA2 ~120 lanes/clk/SM, so f32x2 does
+    not double FMA throughput'
+  - 'critic r2 fit: tail-form GELU needs degree 9 (max err 9.3e-7; degree 8 2.8e-6), ~15-17 FMA-pipe ops per element, ~65-70
+    clk/token, about equal to gelu2''s MUFU bound of 64 clk/token'
+- id: H10
+  statement: A per-CTA workspace ring of h (2 KB/token, at most 2 rounds, about 76 MB) written with evict_last and re-read
+    by the same CTA one round later stays in L2 under the harness's dirty-L2 flush, so read-back runs above 10 TB/s aggregate.
+  status: refuted
+  evidence:
+  - 'critic r2 probe (2xL2 zero_, write then re-read, globaltimer): 76 MB re-read 7.0 TB/s (evict_last) / 7.3 (normal) / 3.7
+    (evict_first) vs 3.6 cold; 38 MB 5.5/5.7; 100 MB 4.8/4.8. Residency holds to ~76 MB but the hint does not matter and >10
+    TB/s is not shown'
+  - 'r1-c-e3-l2ring-b: 159.8 us L geomean rented vs e4 104.3'
+- id: H11
+  statement: For N <= 6272, a hidden-slice fan-out (token tiles x hidden slices, at most 64 KB of weights per CTA, one grid
+    barrier, red.add split-K) reaches 1,28,28 in <= 9 us rented and 3136-token rows in <= 11 us.
+  status: open
+  evidence:
+  - 'critic r1 skeleton at 1,28,28, 128 CTAs, rented: empty 1.63 us, loads and stores 4.80, plus barrier 6.27, plus 16-way
+    red.add 6.82'
+  - 'r1-b-e2-fanout-v3 run_tests: 1,28,28 11.6, 8,14,14 13.7, 4,28,28 16.5, 16,14,14 16.7 us rented; both success lines missed,
+    the 12 us refutation line not reached; portal 14.7/17.0/21.0/21.4'
+  - 'critic r2: red.add v4 adds ~0.3 us over plain stores at 1.6 MB; global barrier 1.2 us'
+- id: H12
+  statement: For token-stationary designs at S, ingesting the 512 KB of hi/lo weight images per CTA (about 4 us at ~120 GB/s/SM)
+    is the largest term on the S critical path.
+  status: open
+  evidence:
+  - '#129 C: one-shot cp.async.bulk into smem after the flush runs at about 120 GB/s/SM'
+  - r1 E1 phase stamps at 1,28,28 test it
+- id: H13
+  statement: At L, persistent rounds aligned to whole batches, with fp32 h in TMEM and per-batch counters, run at <= 15 us
+    per 128-token round (about 165 us at 64,56,56) despite the full TMEM preventing overlap.
+  status: refuted
+  evidence:
+  - 'arithmetic: 8.2 us of MMA per round'
+  - 'r1-merge portal: e4 at 64,56,56 = 326.4 us over 11 rounds = ~29.7 us per round (~23 rented); 16,56,56 97.4, 64,28,28
+    104.3. Steps run one after another; the split between weight ring, epilogue, wait and pass 2 is unmeasured (E2 stamps
+    it)'
+- id: H15
+  statement: 'Split-K output reduction: per-thread red.global.add (v1 or v4) costs only ~0.3 us over plain stores at 1.6 MB
+    out (4-way); cp.reduce.async.bulk.add.f32 from smem is slower and should not be used.'
+  status: supported
+  evidence:
+  - 'critic r2 probe, harness_time, 512-thread CTAs: 1.6 MB store 2.91, red.add 3.17, red.v4 3.23, bulk 3.87 us; 6.2 MB 5.94
+    / 7.81 / 7.78 / 8.48 us'
+- id: H16
+  statement: 'Cross-CTA sync costs: a global red.release + ld.acquire barrier over 128-148 CTAs costs ~1.2 us; a cluster-8
+    barrier with a 2 KB DSMEM exchange ~0.45 us. Moving a GRN crossing into a cluster saves <= ~0.75 us per crossing.'
+  status: supported
+  evidence:
+  - 'critic r2 probe: 20 back-to-back barriers, globaltimer: 1.20 us (128 CTAs), 1.22 us (148), cluster-8 0.45 us; start spread
+    0.03-0.06 us'
+- id: H17
+  statement: 'Cluster capacity on B200 at 512 threads and >=180 KB dynamic smem: cluster-2 74 (148 SMs), cluster-4 33 (132),
+    cluster-8 15 (120), cluster-16 7 (112). Only pairs are free of SM loss for 1-CTA/SM designs.'
+  status: supported
+  evidence:
+  - critic r2 probe, cuOccupancyMaxActiveClusters at 100/180/216 KB; at 100 KB c4 71, c8 33, c16 14
+- id: H18
+  statement: e1's ~19 us work-independent chain is mostly the weight path (phase-0 image build + grid counter + 16 serial
+    32 KB ring units, each refill gated by the previous unit's commit, possibly an L2 hot-spot when 148 SMs read the same
+    lines); fixing it (replicas, deeper or finer ring, entry L2 prefetch, or no phase-0 barrier) cuts the e1 M rows by >=
+    20% rented.
+  status: open
+  evidence:
+  - 'r1-a-e1-ts-fp16x3-m: 784 tokens 21.0 us with ~0.3 us of MMA; t=16 -> t=96 adds only 9-15 us'
+  - hot-spot probe (148 CTAs x 64 serial 32 KB bulk copies, shared vs 16 replicas vs private, S=1/3/6) written by the critic,
+    not run
+  - r2 E1 tests it
+- id: H19
+  statement: A cluster-2 pair that splits the 512 hidden channels 256/256 holds two 128-token tiles of fp32 h per SM (2 x
+    256 TMEM columns), so GEMM1+GELU of tile i+1 overlaps the GRN wait, pass 2 and GEMM2 of tile i; partial GEMM2 outputs
+    are summed through DSMEM; L rows drop >= 35% vs e4 rented.
+  status: open
+  evidence:
+  - 'arithmetic: per SM per tile 6.1k clk MMA (half the hidden), GELU 32768 elements = 4.1k MUFU clk; 64,56,56 = 21.2 tiles
+    per pair -> ~86 us of MMA'
+  - 'H17: 74 pairs fit at >=180 KB smem'
+  - r2 E2 tests it
+- id: H20
+  statement: 'A two-launch stored-h design (K1: GEMM1 FP16x3 + GELU, writes h at 2 KB/token plus per-tile sumsq partials with
+    plain stores; K2 via PDL: GRN scale, x2 split or per-batch folded W2, GEMM2 FP16x3) with weight halves resident in smem
+    runs near the stored-h DRAM floor: 64,56,56 <= 170 us rented, and beats e4 by >= 10% on every L row.'
+  status: open
+  evidence:
+  - 'arithmetic: x 0.5 + h 2 + h 2 + out 0.5 KB/token = 1.03 GB at 64,56,56, ~146 us at 7.05 TB/s; MMA 6 passes 87 us and
+    epilogue ~58-65 us overlap the stream'
+  - 'H10 refuted: budget h at DRAM rate; L2 residency up to ~76 MB helps rows up to 32,28,28'
+  - r2 E4 tests it
+- id: H21
+  statement: 'The B fan-out extends to 6272-token rows with TT=196 x 4 hidden slices (128 CTAs, one wave): W2 slice bulk-copied
+    over W1 after GEMM1 commits, GEMM2 in two token halves of 104; 2,56,56 and 32,14,14 <= 19 us rented (vs e1 25.3/28.3).'
+  status: open
+  evidence:
+  - 196-token tiles never straddle a batch at HW 196/784/3136; ingest 164 KB per CTA; 48 MMAs at N=208 ~3.3 us
+  - r2 E3 tests it
+
+
+=== LAB NOTEBOOK ===
+Portal outcomes vs the bench (change vs the current best, same kernel pair):
+- r0-simt-3k (portal 0.2442) vs r1-merge: S bench +848.6% / portal +864.1%; M bench +514.6% / portal +513.8%; L bench +666.5% / portal +662.1%
+Findings recorded by design sessions, newest round first:
+Round r1:
+- [r1-a-e1-ts-fp16x3] tooling: probe_b200 timed out twice (1800 s, no response), even on a trivial inspect script; compile_b200 was cut off when the session ended. Nothing in this card is measured [probe_b200, compile_b200]
+- [r1-a-e1-ts-fp16x3] design arithmetic: at t=96, TMEM holds h as 4x96 columns plus a 96-column GEMM2 main accumulator (480 of 512), so the cross-term accumulator must reuse h block 0's columns after block 0 is converted to h' [INFERRED]
+- [r1-a-e1-ts-fp16x3] design arithmetic: an MN-major SW128 h' tile pads t=96 to 128 tokens (64 KB per hidden block), and two buffers do not fit next to a 3-stage ring; SW32 (16-token atoms) gives 48 KB per block, 211 KB smem in total [INFERRED]
+- [r1-a-e1-ts-fp16x3] design arithmetic: per CTA at t=96, MMA is about 4.6k clk per GEMM, while the GELU+sumsq epilogue is about 2.4k issue clk per hidden block against 1.15k clk of MMA, so the epilogue binds GEMM1 (H8) [INFERRED]
+- [r1-a-e1-ts-fp16x3] risk to check first: SW32 MN-major descriptor encoding (layout code 6, LBO = 2048 atom stride, SBO = 256) has never run; fallback is HSW=128 with NST=2 [INFERRED]
+- [r1-a-e1-ts-fp16x3-m] run_tests (rented B200): 14/14 pass. Fused path us vs r0: 1,28,28 21.0 vs 139.5; 8,14,14 22.1 vs 137.6; 4,28,28 23.3 vs 137.6; 16,14,14 24.7 vs 137.4; 2,56,56 25.3 vs 144.0; 32,14,14 28.3 vs 139.1; 4,56,56 30.0 vs 220.6; 16,28,28 31.6 vs 219.6; 64,14,14 36.0 vs 219.5. L rows unchanged on the r0 path. Bands: S -83.5%, M -83.7%. Projected portal score 0.5325 +- 0.007 (r0: 0.244) [run_tests]
+- [r1-a-e1-ts-fp16x3-m] H4 success line missed: 784 tokens 21.0 us (target 13), 12544 tokens 30.0-36.0 us (target 21), 6272 tokens 25.3-28.3 us (target 15). Refutation (>30 us at 12544 with weights plus batch wait >50%) could not be judged without phase stamps; 64,14,14 at 36.0 us is above 30 [run_tests]
+- [r1-a-e1-ts-fp16x3-m] fixed cost dominates: 784 tokens (t=16, 49 CTAs, about 0.3 us of MMA) takes 21 us, and going from t=16 to t=96 adds only about 9-15 us. So about 19 us is chain latency that does not depend on work: the 16 serial 32 KB weight units through a 3-stage ring (each refill waits on the previous unit's MMA commit, then an L2 round trip), plus the phase-0 W conversion and grid counter. This supports H12 in spirit; the exact split is unmeasured [run_tests, INFERRED]
+- [r1-a-e1-ts-fp16x3-m] hardware facts confirmed by the passing run: a SW32 MN-major UMMA B descriptor (layout code 6, LBO = 2048 between 16-token atoms, SBO = 256 between 8-row k groups, +512 B per K=16 step) is correct; tcgen05 32x32b.x8 ld/st round trips of fp32 h in TMEM work; at t=96, putting the GEMM2 cross accumulator in h block 0's freed columns works [run_tests]
+- [r1-a-e1-ts-fp16x3-m] precision: all 10 rounds passed on every fused row with FP16x3 (GEMM1 single accumulator, GEMM2 hi*hi plus a separate 2^11-scaled cross accumulator). The per-row err/tol log was NOT collected: probe_b200 hung (1800 s, no response, twice) [run_tests, probe_b200]
+- [r1-a-e1-ts-fp16x3-m] untested follow-up: ring depth computed from t (nst = (227 KB - 2*t*512 - 13 KB)/32 KB, i.e. 6 stages at t=16, 5 at t=32/48, 3 at t=96, with h' buffers sized t*512 B) written as r1-a-e1-ts-fp16x3-ring. Both run_tests calls timed out because Modal had no B200 capacity, so it is unmeasured. It is the next experiment; expect the S rows to move if the ring is the chain [run_tests timeout]
+- [r1-a-e1-ts-fp16x3-m] tooling: probe_b200 timed out twice, and compile_b200 lost its connection twice; only run_tests worked, once. No SASS/register counts or STACK check were collected for the shipped build [probe_b200, compile_b200]
+- [r1-a-e1-ts-fp16x3-m] phase stamps were not built because there was no working probe channel to read them; rerun with globaltimer stamps to split the 19 us fixed cost between phase 0, the grid wait, the ring and the batch wait [none]
+- [r1-a-e4-rounds-tmem] tooling: probe_b200 and get_kernel each went 1800 s without a response, and the session ended before compile_b200 returned; this kernel is NOT compiled, NOT correctness-tested and NOT timed [session log]
+- [r1-a-e4-rounds-tmem] arithmetic: 18816 = 96*196 = 24*784 = 6*3136 = 147*128, so batch-aligned rounds have no partial tile except in the last round, at every workload HW, and every tile touches at most 2 batches (HW >= 196 > 128) [inferred]
+- [r1-a-e4-rounds-tmem] design: the GEMM1 epilogue is split by hidden block (warp group hb owns block hb, all 128 tokens), so each thread owns one hidden channel: sumsq needs no cross-thread reduction (1-2 red.add per thread per round), and block hb's GELU overlaps the MMAs of blocks hb+1.. [inferred]
+- [r1-a-e4-rounds-tmem] design: the TMEM budget is met by placing the GEMM2 main (cols 0-127) and cross (cols 128-255) accumulators over h blocks 0/1 once they are converted to smem hi/lo; blocks 2/3 reuse the two 64 KB h' buffers after commit-tracked pfree barriers [inferred]
+- [r1-a-e4-rounds-tmem] smem: X hi/lo 64 KB (reused as h' buffer 0) + h' buffer 1 64 KB + 3 x 32 KB weight ring = 224 KB; per round 16 bulk copies of 32 KB = 512 KB of L2 weight reads per CTA, about 3.7 us at ~140 GB/s/SM, hidden under 8.2 us of MMA only if the ring keeps up [inferred]
+- [r1-a-e4-rounds-tmem] risk to measure first: the GELU tail after the last GEMM1 block plus the grid-wide per-batch wait are serial in every round (TMEM is full, so the next round's GEMM1 cannot overlap); refuted if > 22 us per round [inferred]
+- [r1-a-e4-rounds-tmem-v2] tooling: before the interruption, probe_b200 and get_kernel each went 1800 s without a response and the first compile_b200 was interrupted; after the resume, compile_b200 closed its connection once and then went 1800 s without a response. The kernel is NOT compiled, NOT correctness-tested and NOT timed [session log]
+- [r1-a-e4-rounds-tmem-v2] arithmetic: 18816 = 96*196 = 24*784 = 6*3136 = 147*128, so full batch-aligned rounds have no partial tile at any workload HW, and a tile touches at most 2 batches (HW >= 196 > 128) [inferred]
+- [r1-a-e4-rounds-tmem-v2] design: the GEMM1 epilogue is split by hidden block (warp group hb owns block hb, all 128 tokens), so each thread owns one hidden channel; sumsq needs no cross-thread reduction (1-2 red.add per thread per round), and block hb's GELU overlaps the MMAs of blocks hb+1.. [inferred]
+- [r1-a-e4-rounds-tmem-v2] design: the TMEM budget is met by placing the GEMM2 main (cols 0-127) and cross (cols 128-255) accumulators over h blocks 0/1 once they are converted to smem hi/lo; blocks 2/3 reuse the two 64 KB h' buffers after commit-tracked pfree barriers [inferred]
+- [r1-a-e4-rounds-tmem-v2] smem: X hi/lo 64 KB (reused as h' buffer 0) + h' buffer 1 64 KB + 3 x 32 KB weight ring = 224 KB; per round 16 bulk copies of 32 KB = 512 KB of L2 weight reads per CTA, about 3.7 us at ~140 GB/s/SM, which must hide under 8.2 us of MMA [inferred]
+- [r1-a-e4-rounds-tmem-v2] risk to measure first: the GELU tail after the last GEMM1 block plus the grid-wide per-batch wait are serial each round (TMEM is full, so the next round's GEMM1 cannot overlap); refuted if a round takes > 22 us [inferred]
+- [r1-b-e2-fanout] tooling: both probe_b200 calls (an API inspection of b200probe) gave no response for 1800 s and were aborted; the session ended before compile_b200 returned, so this kernel has NOT been compiled, run or timed [probe_b200, compile_b200]
+- [r1-b-e2-fanout] design arithmetic: S=256 slices (the brief's 6272 = 56 x 2 of 256) do not fit: hi/lo W1 + x + W2 + x2 images need 256-320 KB of smem against 227 KB, and the D1 + 2 x D2 TMEM need is 588 columns at 196 tokens. So a 6272-token row needs either 256 CTAs (two waves, which breaks the grid barrier) or GEMM2 done in K halves; 6272 stays on r0 for now [INFERRED]
+- [r1-b-e2-fanout] design arithmetic: with S=128 swap-AB, per-CTA weight ingest is a fixed 128 KB (W1 + W2 slices, fp32) plus TT x 512 B of x; the hi/lo conversion costs about 3.5 issue slots per float, so about 1.4 us of issue at 512 threads; S=64 would halve both, but swap-AB with M=128 leaves half the TMEM lanes idle [INFERRED]
+- [r1-b-e2-fanout] design choice: gb folded into x2 before the hi/lo split, so b2' = W2.gb is never needed and the slice-0 prefill stores only b2; the hi/lo split keeps gb to about 2^-22 relative, unlike #129's failed fold of gb into a single fp16 hidden [INFERRED]
+- [r1-b-e2-fanout] untested: phase stamps, err/tol precision log and STACK check were not run; the first test must run run_tests on all 14 workloads and log max err/tol per E2 row (gate <= 0.8)
+- [r1-b-e2-fanout-v3] run_tests (rented B200): 14/14 pass on the first build; E2 rows 1,28,28 11.6 us, 8,14,14 13.7, 4,28,28 16.5, 16,14,14 16.7, against 136.8-139.0 for r0 in the same container (-88% to -92%); r0-routed rows unchanged within 0.7%; emulator predicts portal 0.397 +- 0.007 vs 0.244 [run_tests]
+- [r1-b-e2-fanout-v3] H11 verdict: partly supported. 1,28,28 at 11.6 us misses the <= 9 us success line but sits under the 12 us refutation line; the 3136-token rows at 16.5-16.7 us miss <= 11 us. The ~5 us gap between 28-token and 98-token tiles grows with TT (x ingest, GELU, x2 split with scalar 2-byte smem stores, 4x red.add volume), not with the fixed chain [run_tests; attribution INFERRED, stamps not run]
+- [r1-b-e2-fanout-v3] compile sm_100a: e2_kernel<28/49/98> 120/126/125 regs at 512 threads, 0 spills; 202 KB dynamic smem forces 1 CTA/SM, so a 512-column TMEM allocation is safe [compile_b200]
+- [r1-b-e2-fanout-v3] engine facts (first-try correct): K-major-A and K-major-B tcgen05 kind::f16 (idesc bit 16 = 0) with SW128 descriptors and +32 B K-steps; N = 32/64/112 with padded token rows; tcgen05.ld 32x32b.x4 chains made safe with an empty asm '+r' after wait::ld; flag-zeroed gsum plus a single arrival counter with departure reset, correct over all harness rounds [run_tests]
+- [r1-b-e2-fanout-v3] design: gb folded into x2 before the hi/lo split, so no b2' = W2.gb is needed and the prefill stores only b2 [run_tests pass]
+- [r1-b-e2-fanout-v3] dead end (arithmetic): 256-wide slices (brief's 6272 = 56 x 2) need 256-320 KB of smem and 588 TMEM columns; 6272 rows need GEMM2 in K halves or 2-CTA clusters to get onto this path [INFERRED]
+- [r1-b-e2-fanout-v3] not done: 10-round fp64/err-tol precision log and globaltimer phase stamps; the instrumented build probe timed out twice (Modal could not schedule a B200 for 15 min), and earlier probe calls hung for 1800 s; the harness pass at atol ~3e-3 over 10 random rounds is the only precision evidence [probe_b200]
+- [r1-b-e2-fanout-v3] next: stamp the phases; try 2-way slices with GEMM2 K-split for 6272; vectorise the x2 split (pack 2 tokens per 32-bit STS via a transposed TMEM read) and try 8 slices of 64 at 3136 to halve per-CTA GELU [INFERRED]
+- [r1-c-e3-l2ring] infrastructure: probe_b200 hung for 1800 s twice (the L2 residency probe and an API-introspection probe) and a trivial print probe was cut off at session end; no compile_b200 or run_tests ran, so this candidate is untested [probe_b200]
+- [r1-c-e3-l2ring] H10 probe still to run: 148 CTAs x 1024 threads; write 38 / 76 MB with createpolicy evict_last vs evict_normal after a 2xL2 zero_; grid counter; re-read own bytes; time each phase with %globaltimer; control = read of an unwritten region (DRAM) [design only]
+- [r1-c-e3-l2ring] design: hidden-by-token GEMM1 (W1 as the K-major A operand, x^T as the MN-major B operand) makes GRN sumsq a per-thread sum over TMEM columns; a 128-token tile spans at most 2 batches (HW >= 196), handled by one column split cb [design]
+- [r1-c-e3-l2ring] design: the hi/lo weight images (512 KB) do not fit in smem next to the operand tiles, so they are re-streamed from L2 for every tile (4 KB/token of L2 reads, about 800 MB at 64,56,56); a cost of this lineage, unmeasured [design]
+- [r1-c-e3-l2ring] design: no overlap of GEMM2 MMAs with the GEMM1 epilogue (x tile and h' buffers share 64 KB of smem); if stamps show MMA idle during the epilogue, the next variant should split the region or shrink the ring [design]
+- [r1-c-e3-l2ring-b] infrastructure, part 1: probe_b200 hung to the 1800 s MCP timeout twice (the L2 residency probe and an API probe); a trivial print probe was cut off at session end [probe_b200]
+- [r1-c-e3-l2ring-b] infrastructure, part 2: one probe printed 'alive'; then compile_b200 returned 'Connection closed', the H10 probe was interrupted, run_tests and a later probe timed out at 15 min (Modal did not schedule a B200), and the next probe reported the round's 20-min B200 budget used up [compile_b200, run_tests, probe_b200]
+- [r1-c-e3-l2ring-b] result: this exact code was never compiled, run, timed or precision-logged; the first action for this lineage is run_tests of this build
+- [r1-c-e3-l2ring-b] H10 probe written but never run: 148 CTAs x 1024 threads write 38 / 76 MB with createpolicy evict_last vs evict_normal after a 2xL2 zero_; grid counter; each CTA re-reads its own bytes with ld.global.cg; %globaltimer per phase; control re-reads an unwritten region (DRAM) [design only]
+- [r1-c-e3-l2ring-b] design: hidden-by-token GEMM1 (W1 as the K-major A operand, x^T as the MN-major B operand) makes GRN sumsq a per-thread sum over TMEM columns; a 128-token tile spans at most 2 batches (HW >= 196), handled with one column split cb [design]
+- [r1-c-e3-l2ring-b] design: the 512 KB of hi/lo weight images do not fit in smem next to the operand tiles, so they are re-streamed from L2 for every tile: 4 KB/token of L2 reads, about 800 MB at 64,56,56; unmeasured cost of this lineage [design]
+- [r1-c-e3-l2ring-b] design: GEMM2 MMAs do not overlap the GEMM1 epilogue, because the x tile and the h' buffers share 64 KB of smem; if stamps show MMA idle during the epilogue, split that region or shrink the ring [design]
+Round r0:
+- [r0-simt-3k] run_tests: 14/14 pass; 137-143 us flat for 784-6272 tokens, 220 us at 12544, 2191 us at 200704 tokens (61x copy) [run_tests]
+- [r0-simt-3k] precision: TF32 fails 96% of elements, TF32 with only W split 95%, BF16x3 0.8-2.2% (fails), 3xTF32 and FP16x3 0% with max err 1.8-2.3e-3 vs atol ~3e-3 [probe_b200]
+- [r0-simt-3k] fp32 torch reference vs fp64: max err 1.3-1.5e-3, half the atol budget [probe_b200]
+- [r0-simt-3k] cuBLAS fp32 GEMM1 at M=200704: 592 us; GEMM2 500 us; TF32 GEMM1 85 us; cuBLAS BF16x9 emulation 289/390 us (more accurate than fp32) [probe_b200]
+- [r0-simt-3k] compile sm_100a: k_main 128 regs, k_stats 80 regs, k_grn 32 regs, 0 spills [compile_b200]
+
+=== PARENTS ===
+none
+
+=== FEEDBACK FROM LAST ATTEMPT ===
+none

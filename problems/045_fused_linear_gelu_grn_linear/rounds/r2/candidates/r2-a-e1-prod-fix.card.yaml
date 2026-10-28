@@ -1,0 +1,86 @@
+id: r2-a-e1-prod-fix
+parents:
+  - r1-a-e1-ts-fp16x3-m
+  - r1-merge
+operation: structural_mutation
+language: cuda_cpp
+niche:
+  mem: bulk1d
+  st: direct
+  grid: persistent
+  launch: fused
+  tile: rows96
+  red: cta
+  cache: default
+  spec: dispatch:size
+hypothesis: >-
+  The weight-path chain in r1's e1 path was neither L2 ingest nor an L2 hot spot. The MMA warp also refilled the ring,
+  and it waited for the previous unit's MMA commit before every refill, so at most two units of MMAs were ever queued.
+  A dedicated producer warp removes that coupling. In probes on the rented B200 this cut 2.6-3.6 us (8-15%) from every
+  S/M row tested. The same kernel also fixes the r1 bug where a partial last CTA's padded tokens corrupted the last
+  batch's GRN statistics.
+expected_effect:
+  S:
+    pct: -13
+    confidence: medium
+  M:
+    pct: -10
+    confidence: medium
+  L:
+    pct: 0
+    confidence: high
+resources_sm100a:
+  regs_per_thread: 96
+  smem_per_cta_bytes: 210944
+  threads_per_cta: 576
+  ctas_per_sm: 1
+  bytes_in_flight_per_sm: 98304
+  launches_per_call: 1
+knobs:
+  TMAX: 96
+  NST: 3
+  NTH: 576
+  h_swizzle: SW32
+  lo_scale_gemm2: 2048
+dispatch:
+  - {max_tokens: 14208, kernel: f_kernel, meta: {t: "min(96, ceil16(N/148))", grid: "ceil(N/t)", cooperative: true, producer_warp: 17, mma_warp: 16}}
+  - {max_tokens: null, kernel: r0 k_stats+k_grn+k_main, meta: {TM: 64}}
+tests: [H18]
+findings:
+  - "CORRECTNESS BUG in r1-a-e1-ts-fp16x3(-m), also present in r1-merge for 64,14,14 and 2,56,56: in the slow sumsq path, padded tokens (j >= nv) of a partial last CTA were added to slot 0. Against an fp64 reference with randn gw/gb, err/tol was 444 at 64,14,14 (1.5% of elements fail) and 12.7 at 2,56,56 (22% fail): the whole last batch is wrong. Rows where N is a multiple of t (1,28,28; 4,28,28) were fine (0.18-0.27). r1's run_tests and the portal passed anyway, so the harness's GRN inputs probably make the GRN term small (e.g. gw ~ 0); do not rely on that. The fix is slot 0 iff j < min(bnd, nv), slot 1 iff bnd <= j < nv [probe_b200]"
+  - "precision after the fix (fp64 reference, atol 2.8e-3, rtol 1e-5, seed 0): 1,28,28 0.19; 64,14,14 0.20; 2,56,56 0.24; 32,14,14 0.25; 16,28,28 0.23; 4,56,56 0.22; 4,28,28 0.27 (seed 1). Only 1-2 seeds per row were run, not the full 10-seed gate; e4 on the L rows was not gated [probe_b200]"
+  - "stamps of r1 e1 at 64,14,14 (rented, median/max us from the first CTA's entry): phase 0 done 3.1/4.1, weight counter passed 5.6/5.9, unit 0 lands 6.4, unit 7 13.1, GEMM1 epilogue done 15.4/16.4, batch wait 18.2/19.5, GEMM2 start 20.5/28.2, GEMM2 done 27.9/35.3, store 29.2/36.6. At 1,28,28: phase 0 2.1, weight counter 4.6, units every ~0.7 us, store 20.5. Weight units plus phase 0 make up about 70% of the chain, so H18 is not refuted [probe_b200]"
+  - "L2 hot-spot probe (148 or 49 CTAs x 16 x 32 KB bulk copies after a 2xL2 flush): one shared image runs at 146-205 GB/s/SM (16 units in 2.6-3.6 us). 16 replicas are 5-30% slower and 148 private copies 30-40% slower. Replicas (step 4a) are a dead end [probe_b200]"
+  - "neither 16 warps polling mbarrier.try_wait (with or without a suspend hint or nanosleep) nor an image written in-kernel with scattered 8 B stores slows bulk ingest: both stay at 158-205 GB/s/SM [probe_b200]"
+  - "a deeper ring (6 stages at t=16, 5 at t=48) changes nothing (22.8 vs 22.4 us; 26.4 vs 26.3 us), so step 3's ring variant is a dead end [probe_b200]"
+  - "MMA issue cost on B200 (M=128, K=16, kind::f16, rented clocks): with a tight unrolled issue loop, 21 ns per instruction at N=16, 32 ns at N=96, 37 ns at N=128, 73 ns at N=256 (ideal at 1.9 GHz: 4/25/34/67). One accumulator vs 2-4 interleaved makes no difference, so dependent-accumulate latency is not a limit. A loop with runtime div/mod in its descriptor maths ran at 53-56 ns per MMA, so the issue code matters; elect.sync issue beats single-thread issue at N=16 (21 vs 33 ns) [probe_b200]"
+  - "in e1 the stamps mislabelled MMA completion as unit 'landing'. Six units issued at once land 0.77 us apart only because the MMA warp's loop waited on the previous unit's commit before refilling. Hoisting descriptors alone gained nothing (the compiler had already hoisted them). Moving the producer to warp 17 so the MMA warp never waits on completions measured (rented, harness_time, 3-stage ring): 1,28,28 23.3 -> 19.9 us; 64,14,14 38.9 -> 35.5; 2,56,56 26.9 -> 23.6; 32,14,14 31.2 -> 27.6; 16,28,28 34.3 -> 31.7; 4,56,56 28.2 [probe_b200]"
+  - "success line missed: 64,14,14 35.5 us (target <= 29) and 2,56,56 23.6 us (target <= 20). The largest remaining term at 64,14,14 is the CTA tail: median store 26.6 us, max 34.0, and some CTAs start GEMM2 8 us after their batch wait. Phase 0 plus the grid wait still costs about 5.6 us, and the batch wait about 3 us. The tail probe could not run (Modal capacity) [probe_b200]"
+  - "e4 (r1-a-e4-rounds-tmem) already uses a separate producer warp (16) and MMA warp (17), so step 5's producer change does not apply. e4 issues kdesc() per MMA, but hoisting did not matter in e1. Its partial-tile sumsq logic is correct by inspection (sp0 = min(nv, ...)) [get_kernel]"
+  - "tooling: this exact two-file build was NOT compiled or run_tests'd. Two run_tests calls timed out on Modal capacity and then the round's 20-minute B200 budget ran out. The device code matches the NVRTC probe build e1c.cu (96 regs, STACK 0, LOCAL 0 under NVRTC) except for compiled-out stamps and a constant NST=3 layout [run_tests]"
+paths:
+  - {max_tokens: 14208, lang: cuda, width: 128, threads: 576, rows: 96, grid: persistent, mem: tma, wstat: false, launches: 1, prefetch: true, x: none, w: none, st: none, cluster: 1}
+  - {max_tokens: null, lang: cuda, width: 128, threads: 256, rows: 64, grid: oneshot, mem: ldg, launches: 3, st: none}
+runs_on:
+  H200:
+    runs: false
+    representative: false
+    note: "tcgen05/TMEM are sm_100a only"
+  A100:
+    runs: false
+    representative: false
+  L40S:
+    runs: false
+    representative: false
+risks:
+  - "This two-file build was never compiled or run through run_tests; only its NVRTC probe twin was run (all checked rows correct, 1-2 seeds each)"
+  - "Cooperative launch with 211 KB smem at 1 CTA/SM; grid <= SM count is checked, occupancy is not queried"
+  - "Tail CTAs at HW=196 (up to +7 us over the median CTA) are not understood yet"
+  - "The 10-seed precision gate is incomplete (1-2 seeds per row); e4's L rows were not gated"
+measure_first: [B200]
+compliance:
+  single_stream: true
+  no_cross_call_state: true
+  fp32_math: true
+  no_threads_or_fork: true
+  no_precompiled_binaries: true

@@ -1,0 +1,1 @@
+{"mcpServers": {"solx": {"command": "/home/lain/execbench-test/.venv/bin/python", "args": ["/home/lain/execbench-test/loop/mcp_tools.py", "--name", "ideas2-fable", "--round", "r2", "--dir", "/home/lain/execbench-test/problems/045_fused_linear_gelu_grn_linear/rounds/r2/ideas", "--no-gpu"]}}}

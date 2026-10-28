@@ -1,36 +1,54 @@
 lineages:
 - id: A
-  thesis: The hidden h never leaves the SM. One cooperative tcgen05 FP16x3 launch, token-stationary, keeps fp32 h in TMEM
-    across per-batch GRN counters; one round at S/M, rounds aligned to whole batches at L.
+  thesis: The hidden h never leaves the SM. A cooperative tcgen05 FP16x3 launch, token-stationary, keeps fp32 h in TMEM across
+    per-batch GRN counters; to scale at L it must overlap tiles and stop streaming 512 KB of weights per tile.
   status: active
   started: r1
-  best: null
+  best: r1-a-e4-rounds-tmem
   conclusions:
-  - Seeded r1 from pool I1/I2/I5/I24; engine template is
-  - Precision (critic, hardware tl.dot) - single accumulator err/tol 0.78; a separate GEMM2 cross-term accumulator gives 0.44;
-    GEMM2 dominates.
-  - Known costs - 512 KB of hi/lo weights per CTA (about 4 us at 120 GB/s/SM bulk) hurts the S rows; TMEM is full at 128 tokens,
-    so GEMM2's accumulators must reuse freed h columns.
+  - e1 wins 2,56,56 / 32,14,14 / 64,14,14 (25-36 us rented); e4 wins every L row plus 4,56,56 and 16,28,28 in r1-merge (portal
+    0.7216)
+  - e1 has a ~19 us fixed chain that does not depend on work (784 tokens take 21 us with 0.3 us of MMA); not yet attributed
+    between phase 0, grid counter and the weight ring
+  - 'e4 at 64,56,56 runs 11 rounds of ~29.7 us portal against 8.2 us of MMA: its steps run one after another because fp32
+    h fills the TMEM (H13 refuted)'
+  - 'Precision: FP16x3 with a separate GEMM2 cross accumulator passes every row in 10 harness rounds; the err/tol log is still
+    owed'
+  - 'Only cluster-2 is free of SM loss at >=180 KB smem (c4 33, c8 15, c16 7 clusters): overlap designs should use pairs'
 - id: B
   thesis: S rows are a latency chain, not a FLOP problem. Fan each token tile out over hidden slices so every SM ingests at
     most 64 KB of weights, cross one grid barrier, and reduce the split-K GEMM2 with red.add into an output prefilled with
     the bias.
   status: active
   started: r1
-  best: null
+  best: r1-b-e2-fanout
   conclusions:
-  - Seeded r1 from pool I23/I29/I18.
-  - Critic skeleton at 1,28,28 (128 CTAs, rented) - empty 1.63 us, loads and stores 4.80, plus grid barrier 6.27, plus 16-way
-    red.add 6.82; projects about 8-9 us rented with MMAs against the leader's ~10.5.
+  - 'Fan-out wins the 4 smallest rows: 11.6/13.7/16.5/16.7 us rented (-88..-92% vs r0); 1,28,28 misses the 9 us line'
+  - '3136-token rows run ~5 us above 784: the cost grows with the token tile TT, not with the fixed chain (unstamped)'
+  - 'red.add v4 costs ~0.3 us over plain stores at 1.6 MB; cp.reduce.async.bulk is slower (critic probe): keep red.add'
+  - 'Global counter barrier costs 1.2 us at 128-148 CTAs, cluster-8 0.45 us: the barrier is worth at most ~0.75 us'
+  - 256-wide slices do not fit (smem/TMEM); 6272-token rows need TT=196 x 4 slices with GEMM2 in token halves
 - id: C
-  thesis: At L the GRN dependency crosses through L2, not TMEM. A persistent single launch stores each CTA's h tile in a per-CTA
-    workspace ring with evict_last and re-reads it one round later; only the 512-float statistics cross CTAs, and the wait
-    hides behind the next round's GEMM1.
-  status: active
+  thesis: At L the GRN dependency crosses through L2, not TMEM, via a per-CTA evict_last h ring re-read one round later in
+    a single persistent launch.
+  status: retired
   started: r1
+  best: r1-c-e3-l2ring-b
+  conclusions:
+  - 'Retired at r2 under the measured-hardware exception: after the 2xL2 flush an L2 re-read runs at 7.0-7.3 TB/s whatever
+    the hint (4.8 at 100 MB), not the >10 TB/s the thesis assumed'
+  - r1-c-e3-l2ring-b passed but runs 159.8 us L geomean rented vs e4 104.3 (1.5x slower); its 4 KB/token per-tile weight re-stream
+    is unmeasured
+  - The idea of crossing GRN through memory continues in lineage D, budgeted at the DRAM rate with two launches
+- id: D
+  thesis: At L, cross the GRN through memory with two plain pipelined tcgen05 launches (GEMM1+GELU writes h at 2 KB/token
+    plus per-tile sumsq partials; a PDL launch runs GEMM2), with weight halves resident in smem, so time sits at the stored-h
+    DRAM floor (~5 KB/token, ~150 us at 64,56,56) instead of at serial on-chip steps.
+  status: active
+  started: r2
   best: null
   conclusions:
-  - Seeded r1 from pool I26/I12/I3 (stored h with L2 reuse); recompute (I25/I30) parked because it doubles the GELU, which
-    already costs more issue than the MMA (H5, H8).
-  - Even with h fully in DRAM the traffic is about 5 KB/token, about 0.72 ns/token or 145 us at 64,56,56, which is a leader-class
-    floor.
+  - Seeded r2 from the stored-h leader stories and I16/I6; no grid barrier, no TMEM retention, no weight ring if weights are
+    split hidden-half (K1) / out-half (K2) per CTA
+  - 'Budget: DRAM ~7 TB/s for x + h write + h read + out (1.03 GB at 64,56,56); L2 residency up to ~76 MB is a bonus for 32,28,28
+    and below'
